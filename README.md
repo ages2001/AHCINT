@@ -58,7 +58,7 @@ Application Layer
 |---|---|---|---|
 | I/O model | Synchronous (polls `PxCI` in `HwStartIo`) | Asynchronous (`HwStartIo` returns pending, completion in `HwInterrupt`) | Asynchronous, same model as 2000/XP |
 | Max AHCI ports | 6 | 8 | 8 |
-| READ/WRITE(16), full LBA48 range | No — READ/WRITE(10) only, LBA48 *commands* used on the wire but SCSI layer only ever passes the low 32 bits | Yes | Yes |
+| READ/WRITE(16), full LBA48 range | Partial — READ/WRITE(10) only, LBA48 *commands* used on the wire but SCSI layer only ever passes the low 32 bits | Yes | Yes |
 | REQUEST SENSE | No | Yes | Yes |
 | ATAPI (PACKET) support | Yes | Yes | Yes |
 | 64-bit addressing (S64A / 64-bit BAR) | No — 32-bit DMA only | Yes | Yes, plus 64-bit BAR high-dword read |
