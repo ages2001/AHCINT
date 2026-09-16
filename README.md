@@ -1,6 +1,6 @@
-# AHCINT - AHCI SATA Driver for Windows NT/2000/XP
+# AHCINT - SATA AHCI Driver for Windows NT/2000/XP
 
-An AHCI (Advanced Host Controller Interface) SATA storage controller driver for the legacy Windows NT family, targeting operating systems from Windows NT 3.50 up through Windows XP x64 Edition / Server 2003 x64 — long before Microsoft shipped a native AHCI driver.
+An AHCI (Advanced Host Controller Interface) SATA storage controller driver for the Windows NT family, targeting operating systems from Windows NT 3.50 up through Windows XP x64 Edition / Server 2003 x64 — long before Microsoft shipped a native AHCI driver.
 
 ## Overview
 
@@ -8,7 +8,7 @@ AHCINT is a SCSI miniport driver built on the classic `ScsiPort` framework. It t
 
 ### Why?
 
-Because plenty of real hardware only exposes its SATA ports in AHCI mode, and NT4/2000/XP have no idea what that is.
+Because plenty of real hardware only exposes its SATA ports in AHCI mode, and NT/2000/XP have no idea what that is.
 
 ## Features
 
@@ -60,7 +60,7 @@ Application Layer
 | Max AHCI ports | 6 | 8 | 8 |
 | READ/WRITE(16), full LBA48 range | No — READ/WRITE(10) only, LBA48 *commands* used on the wire but SCSI layer only ever passes the low 32 bits | Yes | Yes |
 | REQUEST SENSE | No | Yes | Yes |
-| ATAPI (PACKET) support | Yes | Yes (richer stub command set) | Yes |
+| ATAPI (PACKET) support | Yes | Yes | Yes |
 | 64-bit addressing (S64A / 64-bit BAR) | No — 32-bit DMA only | Yes | Yes, plus 64-bit BAR high-dword read |
 | Hot-plug / late device detection | No | No | Yes — re-checks `PxSSTS` on INQUIRY |
 | PRDT entries per command | 32 | 32 | 32 |
@@ -212,3 +212,10 @@ Copyright (c) 2026 ages2001. All rights reserved.
 
 - The AHCI 1.x and ATA/ATAPI-8 specifications
 - Windows NT4/2000/XP DDK documentation
+
+## Special Thanks
+
+- infuscomus for porting driver to x64
+- Testers
+- Windows 2000 Dev Community
+- And everyone which supports it
