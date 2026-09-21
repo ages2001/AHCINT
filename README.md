@@ -218,8 +218,8 @@ Copyright (c) 2026 ages2001. All rights reserved.
 
 - infuscomus for porting driver to x64
 - Dietmar for FAST_POLL idea
-- DominBear for (nvme2k project)[https://github.com/techomancer/nvme2k]
-- (UniATA project)[http://alter.org.ua/]
+- DominBear for [nvme2k project](https://github.com/techomancer/nvme2k)
+- [UniATA project](http://alter.org.ua/)
 - Windows 2000 Dev Community
 - Testers
 - And everyone which supports it
