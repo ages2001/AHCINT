@@ -1,4 +1,3 @@
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -7,12 +6,14 @@ extern "C" {
 
 // NOTE (x86->x64 port): the x86 build used to define its own inline-asm
 // KeMemoryBarrier() here (x86 MSVC doesn't compile __asm on x64, and there
-// is no portable replacement in inline asm form). On x64, ntddk.h/wdm.h
-// already provide a real KeMemoryBarrier() built on intrinsics, so this
-// driver no longer needs — or should have — its own definition. Do NOT
-// reintroduce an `#else -> #define KeMemoryBarrier()` no-op fallback here:
-// that would silently strip the SMP memory barrier used in AhciResetBus
-// instead of using the real one.
+// is no portable replacement in inline asm form). A real KeMemoryBarrier()
+// is normally available from ntddk.h/wdm.h; since this driver only includes
+// miniport.h/scsi.h (and this DDK's compiler has no intrin.h either),
+// ahcint.h declares a real x64 barrier itself via InterlockedExchange (see
+// ahcint.h) so it's never left undeclared. Do NOT reintroduce an
+// `#else -> #define KeMemoryBarrier()` no-op fallback here: that would
+// silently strip the SMP memory barrier used in AhciResetBus instead of
+// using the real one.
 
 BOOLEAN AhciHwInitialize(IN PVOID DeviceExtension);
 BOOLEAN AhciStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
@@ -20,6 +21,81 @@ BOOLEAN AhciInterrupt(IN PVOID DeviceExtension);
 BOOLEAN AhciResetBus(IN PVOID HwDeviceExtension, IN ULONG PathId);
 ULONG AhciFindAdapter(IN PVOID DeviceExtension, IN PVOID Context, IN PVOID BusInformation, IN PCHAR ArgumentString, IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo, OUT PBOOLEAN Again);
 BOOLEAN AhciSatlProcessSrb(IN PHW_DEVICE_EXTENSION DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
+
+/* Multi-controller support: SCSIport calls HwFindAdapter once per PCI
+   function it enumerates, so this table remembers which bus:slot each
+   instance has already claimed, letting a second/third AHCI controller
+   bind to its own DeviceExtension instead of re-finding the first one. */
+#define AHCI_MAX_CONTROLLERS 8
+
+typedef struct _AHCI_CLAIMED_DEVICE {
+    BOOLEAN InUse;
+    ULONG   Bus;
+    ULONG   Slot;
+} AHCI_CLAIMED_DEVICE, *PAHCI_CLAIMED_DEVICE;
+
+static AHCI_CLAIMED_DEVICE g_AhciClaimedDevices[AHCI_MAX_CONTROLLERS];
+
+static
+BOOLEAN
+AhciIsDeviceClaimed(
+    IN ULONG Bus,
+    IN ULONG Slot
+)
+{
+    ULONG i;
+    for (i = 0; i < AHCI_MAX_CONTROLLERS; i++) {
+        if (g_AhciClaimedDevices[i].InUse &&
+            g_AhciClaimedDevices[i].Bus == Bus &&
+            g_AhciClaimedDevices[i].Slot == Slot) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static
+VOID
+AhciClaimDevice(
+    IN ULONG Bus,
+    IN ULONG Slot
+)
+{
+    ULONG i;
+    for (i = 0; i < AHCI_MAX_CONTROLLERS; i++) {
+        if (!g_AhciClaimedDevices[i].InUse) {
+            g_AhciClaimedDevices[i].InUse = TRUE;
+            g_AhciClaimedDevices[i].Bus = Bus;
+            g_AhciClaimedDevices[i].Slot = Slot;
+            return;
+        }
+    }
+}
+
+/* True if this PCI function is an AHCI controller, either by the standard
+   class/subclass/prog-if or by one of the known vendor-specific IDs. */
+static
+BOOLEAN
+AhciPciConfigIsAhci(
+    IN PPCI_COMMON_CONFIG PciConfig
+)
+{
+    if (PciConfig->BaseClass == PCI_CLASS_MASS_STORAGE &&
+        PciConfig->SubClass == PCI_SUBCLASS_AHCI &&
+        PciConfig->ProgIf == PCI_PROGIF_AHCI) {
+        return TRUE;
+    }
+    if (PciConfig->VendorID == 0x1022 &&
+        (PciConfig->DeviceID == 0x7901 || PciConfig->DeviceID == 0x43EB || PciConfig->DeviceID == 0x43C8)) {
+        return TRUE;
+    }
+    if (PciConfig->VendorID == 0x8086 &&
+        (PciConfig->DeviceID == 0x2829 || PciConfig->DeviceID == 0x2828 ||
+         PciConfig->DeviceID == 0x2922 || PciConfig->DeviceID == 0x2681)) {
+        return TRUE;
+    }
+    return FALSE;
+}
 
 static
 BOOLEAN
@@ -67,7 +143,7 @@ AhciAllocateDma(
             virtPtr += pad;
             physPtr += pad;
         }
-        
+
         // Safety bounds check for ACPI memory protection.
         // (x86->x64 port: the pointer difference is ptrdiff_t, 64-bit on
         // x64 — use ULONG_PTR here instead of truncating to ULONG.)
@@ -89,7 +165,7 @@ AhciAllocateDma(
             virtPtr += pad;
             physPtr += pad;
         }
-        
+
         if ((ULONG_PTR)(virtPtr - (PUCHAR)HwInit->DmaArea) + 256 > uncachedSize) {
             AHCI_DBG_MSG("AhciAllocateDma: DMA buffer overflow at Received FIS!");
             return FALSE;
@@ -108,7 +184,7 @@ AhciAllocateDma(
             virtPtr += pad;
             physPtr += pad;
         }
-        
+
         if ((ULONG_PTR)(virtPtr - (PUCHAR)HwInit->DmaArea) + 2048 > uncachedSize) {
             AHCI_DBG_MSG("AhciAllocateDma: DMA buffer overflow at Command Table!");
             return FALSE;
@@ -127,7 +203,7 @@ AhciAllocateDma(
             virtPtr += pad;
             physPtr += pad;
         }
-        
+
         if ((ULONG_PTR)(virtPtr - (PUCHAR)HwInit->DmaArea) + 512 > uncachedSize) {
             AHCI_DBG_MSG("AhciAllocateDma: DMA buffer overflow at Identify Buffer!");
             return FALSE;
@@ -153,7 +229,7 @@ AhciStopPortEngines(
 	{
     ULONG cmd;
     ULONG timeout;
-    
+
     cmd = AHCI_READ_REG(portBase, AHCI_PORT_CMD);
     if (cmd & AHCI_PORT_CMD_ST) {
         cmd &= ~AHCI_PORT_CMD_ST;
@@ -171,7 +247,7 @@ AhciStopPortEngines(
             cmd = AHCI_READ_REG(portBase, AHCI_PORT_CMD);
             AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, cmd | AHCI_PORT_CMD_CLO);
             AHCI_READ_REG(portBase, AHCI_PORT_CMD); // Flush CLO write buffer
-            
+
             timeout = 5000;
             while ((AHCI_READ_REG(portBase, AHCI_PORT_CMD) & AHCI_PORT_CMD_CLO) && --timeout) {
                 ScsiPortStallExecution(10);
@@ -197,7 +273,7 @@ VOID
 AhciExecuteIdentify(
 	IN PHW_DEVICE_EXTENSION HwInit,
 	IN ULONG PortNumber
-	) 
+	)
 	{
     PUCHAR portBase;
     PAHCI_COMMAND_HEADER cmdHeader;
@@ -299,7 +375,7 @@ AhciInitializePort(
     AHCI_READ_REG(portBase, AHCI_PORT_CMD); // Flush write buffer
 
     // Extended power-stabilization delay for fast I/O APIC systems (50ms)
-    ScsiPortStallExecution(50000); 
+    ScsiPortStallExecution(50000);
 
     // Poll for initial PHY presence (DET != 0) to accommodate faster MP HAL execution
     timeout = 50;
@@ -320,11 +396,11 @@ AhciInitializePort(
         for (retry = 0; retry < 3; retry++) {
             AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
             AHCI_READ_REG(portBase, AHCI_PORT_SERR); // Flush SERR
-            
+
             AHCI_WRITE_REG(portBase, AHCI_PORT_SCTL, 0x301); // COMRESET
             AHCI_READ_REG(portBase, AHCI_PORT_SCTL); // Flush SCTL
             ScsiPortStallExecution(2000);
-            
+
             AHCI_WRITE_REG(portBase, AHCI_PORT_SCTL, 0x300); // Clear COMRESET
             AHCI_READ_REG(portBase, AHCI_PORT_SCTL); // Flush SCTL
 
@@ -377,9 +453,15 @@ AhciInitializePort(
     AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, cmd);
     AHCI_READ_REG(portBase, AHCI_PORT_CMD); // Flush ST write
 
-    // Enable interrupts ONLY AFTER engines are running (prevents I/O APIC level-triggered locks)
-    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, AHCI_PORT_IE_DEFAULT);
-    AHCI_READ_REG(portBase, AHCI_PORT_IE);
+    // Enable interrupts ONLY AFTER engines are running (prevents I/O APIC level-triggered locks),
+    // and only if we're actually running in interrupt mode rather than fast-poll mode.
+    if (HwInit->UseInterrupt) {
+        AHCI_WRITE_REG(portBase, AHCI_PORT_IE, AHCI_PORT_IE_DEFAULT);
+        AHCI_READ_REG(portBase, AHCI_PORT_IE);
+    } else {
+        AHCI_WRITE_REG(portBase, AHCI_PORT_IE, 0);
+        AHCI_READ_REG(portBase, AHCI_PORT_IE);
+    }
 
     // Post-start stabilization delay
     ScsiPortStallExecution(2000);
@@ -426,11 +508,11 @@ DriverEntry(
 
 ULONG
 AhciFindAdapter(
-    IN PVOID DeviceExtension, 
-    IN PVOID Context, 
-    IN PVOID BusInformation, 
-    IN PCHAR ArgumentString, 
-    IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo, 
+    IN PVOID DeviceExtension,
+    IN PVOID Context,
+    IN PVOID BusInformation,
+    IN PCHAR ArgumentString,
+    IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
     OUT PBOOLEAN Again
 	)
 {
@@ -455,17 +537,20 @@ AhciFindAdapter(
 
     basePhys.QuadPart = 0;
 
-    // 1. Check if the OS (PnP Manager / ACPI HAL) provided Bus and Slot numbers (Allow Slot 0)
-    if (ConfigInfo->SystemIoBusNumber != (ULONG)-1 && 
-        ConfigInfo->SlotNumber != (ULONG)-1) {
-        
+    // 1. Check if the OS (PnP Manager / ACPI HAL) provided Bus and Slot numbers,
+    // and that this particular device hasn't already been claimed by another
+    // instance of this driver (multi-controller support).
+    if (ConfigInfo->SystemIoBusNumber != (ULONG)-1 &&
+        ConfigInfo->SlotNumber != (ULONG)-1 &&
+        !AhciIsDeviceClaimed(ConfigInfo->SystemIoBusNumber, ConfigInfo->SlotNumber)) {
+
         targetBus = ConfigInfo->SystemIoBusNumber;
         targetSlot = ConfigInfo->SlotNumber;
 
         bytesRead = ScsiPortGetBusData(hwInit, PCIConfiguration, targetBus, targetSlot, &pciConfig, sizeof(PCI_COMMON_CONFIG));
         if (bytesRead == sizeof(PCI_COMMON_CONFIG) && pciConfig.VendorID != 0xFFFF && pciConfig.VendorID != 0x0000) {
             basePhys.LowPart = pciConfig.u.type0.BaseAddresses[barId] & 0xFFFFFFF0;
-            
+
             // Check if BAR is 64-bit memory (type bits 1-2 == 10b, represented by mask 0x06 == 0x04)
             if ((pciConfig.u.type0.BaseAddresses[barId] & 0x06) == 0x04) {
                 basePhys.HighPart = pciConfig.u.type0.BaseAddresses[barId + 1];
@@ -478,20 +563,27 @@ AhciFindAdapter(
 
     // 2. If not found via OS bus/slot, check AccessRanges provided by PnP
     if (!found && ConfigInfo->NumberOfAccessRanges > 0 && accessRanges != NULL) {
-        if (ConfigInfo->NumberOfAccessRanges > barId && accessRanges[barId].RangeStart.LowPart != 0) {
-            basePhys = accessRanges[barId].RangeStart;
-            found = TRUE;
-        } else if (accessRanges[0].RangeStart.LowPart != 0) {
-            basePhys = accessRanges[0].RangeStart;
-            barId = 0; // Fallback to BAR0 if BAR5 isn't populated in range
-            found = TRUE;
+        ULONG accBus = (ConfigInfo->SystemIoBusNumber != (ULONG)-1) ? ConfigInfo->SystemIoBusNumber : 0;
+        ULONG accSlot = (ConfigInfo->SlotNumber != (ULONG)-1) ? ConfigInfo->SlotNumber : 0;
+
+        if (!AhciIsDeviceClaimed(accBus, accSlot)) {
+            if (ConfigInfo->NumberOfAccessRanges > barId && accessRanges[barId].RangeStart.LowPart != 0) {
+                basePhys = accessRanges[barId].RangeStart;
+                found = TRUE;
+            } else if (accessRanges[0].RangeStart.LowPart != 0) {
+                basePhys = accessRanges[0].RangeStart;
+                barId = 0; // Fallback to BAR0 if BAR5 isn't populated in range
+                found = TRUE;
+            }
+
+            targetBus = accBus;
+            targetSlot = accSlot;
         }
-        
-        targetBus = (ConfigInfo->SystemIoBusNumber != (ULONG)-1) ? ConfigInfo->SystemIoBusNumber : 0;
-        targetSlot = (ConfigInfo->SlotNumber != (ULONG)-1) ? ConfigInfo->SlotNumber : 0;
     }
 
-    // 3. Last Resort: Manual full PCI bus scan (primarily for legacy Non-ACPI / Standard PC systems)
+    // 3. Last Resort: Manual full PCI bus scan (primarily for legacy Non-ACPI /
+    // Standard PC systems, and to pick up any remaining unclaimed AHCI
+    // controller when 2+ are present in the system).
     if (!found) {
         ULONG b, d, f;
         for (b = 0; b < 255; b++) {
@@ -499,27 +591,26 @@ AhciFindAdapter(
                 for (f = 0; f < 8; f++) {
                     ULONG s = (d << 3) | (f & 0x07);
 
+                    if (AhciIsDeviceClaimed(b, s)) {
+                        continue;
+                    }
+
                     bytesRead = ScsiPortGetBusData(hwInit, PCIConfiguration, b, s, &pciConfig, sizeof(PCI_COMMON_CONFIG));
                     if (bytesRead != sizeof(PCI_COMMON_CONFIG) || pciConfig.VendorID == 0xFFFF || pciConfig.VendorID == 0x0000) {
                         continue;
                     }
 
-                    if ((pciConfig.BaseClass == PCI_CLASS_MASS_STORAGE &&
-                         pciConfig.SubClass == PCI_SUBCLASS_AHCI &&
-                         pciConfig.ProgIf == PCI_PROGIF_AHCI) ||
-                        (pciConfig.VendorID == 0x1022 && (pciConfig.DeviceID == 0x7901 || pciConfig.DeviceID == 0x43EB || pciConfig.DeviceID == 0x43C8)) ||
-                        (pciConfig.VendorID == 0x8086 && (pciConfig.DeviceID == 0x2829 || pciConfig.DeviceID == 0x2828 || pciConfig.DeviceID == 0x2922 || pciConfig.DeviceID == 0x2681))) {
-                        
+                    if (AhciPciConfigIsAhci(&pciConfig)) {
                         targetBus = b;
                         targetSlot = s;
                         basePhys.LowPart = pciConfig.u.type0.BaseAddresses[barId] & 0xFFFFFFF0;
-                        
+
                         if ((pciConfig.u.type0.BaseAddresses[barId] & 0x06) == 0x04) {
                             basePhys.HighPart = pciConfig.u.type0.BaseAddresses[barId + 1];
                         } else {
                             basePhys.HighPart = 0;
                         }
-                        
+
                         found = TRUE;
                         break;
                     }
@@ -536,6 +627,7 @@ AhciFindAdapter(
 
     hwInit->PciBus = targetBus;
     hwInit->PciSlot = targetSlot;
+    AhciClaimDevice(targetBus, targetSlot);
 
     // Safely configure PCI command register with read-back barrier for ACPI synchronization
     bytesRead = ScsiPortGetBusData(hwInit, PCIConfiguration, targetBus, targetSlot, &pciConfig, sizeof(PCI_COMMON_CONFIG));
@@ -546,21 +638,21 @@ AhciFindAdapter(
     }
 
     hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(
-        hwInit, 
-        ConfigInfo->AdapterInterfaceType, 
-        targetBus, 
-        basePhys, 
-        0x10000, 
+        hwInit,
+        ConfigInfo->AdapterInterfaceType,
+        targetBus,
+        basePhys,
+        0x10000,
         FALSE
     );
 
     if (!hwInit->AbarMapped) {
         hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(
-            hwInit, 
-            PCIBus, 
-            targetBus, 
-            basePhys, 
-            0x10000, 
+            hwInit,
+            PCIBus,
+            targetBus,
+            basePhys,
+            0x10000,
             FALSE
         );
     }
@@ -576,11 +668,13 @@ AhciFindAdapter(
     ConfigInfo->SystemIoBusNumber = targetBus;
     ConfigInfo->SlotNumber = targetSlot;
 
-    if (ConfigInfo->BusInterruptLevel == 0 || ConfigInfo->BusInterruptLevel == 0xFFFFFFFF) {
-        ConfigInfo->BusInterruptLevel = pciConfig.u.type0.InterruptLine;
-        ConfigInfo->BusInterruptVector = pciConfig.u.type0.InterruptLine;
-    }
+    // IRQ assignment is left entirely to the HAL/PnP manager: ConfigInfo's
+    // BusInterruptLevel/Vector are already populated by the time we get here
+    // on a PnP-safe miniport, so we only read them back and decide whether
+    // we have a usable interrupt at all.
     hwInit->ActualIrq = (UCHAR)ConfigInfo->BusInterruptLevel;
+    hwInit->UseInterrupt =
+        (ConfigInfo->BusInterruptLevel != 0 && ConfigInfo->BusInterruptLevel != 0xFFFFFFFF) ? TRUE : FALSE;
 
     ConfigInfo->InterruptMode = LevelSensitive;
     ConfigInfo->Master = TRUE;
@@ -609,7 +703,7 @@ AhciFindAdapter(
 }
 
 
-BOOLEAN 
+BOOLEAN
 AhciHwInitialize(
 	IN PVOID DeviceExtension
 	)
@@ -628,7 +722,7 @@ AhciHwInitialize(
         bohc = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_BOHC);
         bohc |= AHCI_BOHC_OOS;
         AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_BOHC, bohc);
-        
+
         // Posting read to flush write buffers to the PCI device
         bohc = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_BOHC);
 
@@ -678,14 +772,14 @@ AhciHwInitialize(
     ScsiPortStallExecution(1000);
 
     pi = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_PI);
-    
+
     // Safety fallback if PI reads 0 due to ACPI power timing
     if (pi == 0) {
         ULONG cap = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_CAP);
         ULONG numPorts = (cap & 0x1F) + 1;
         pi = (1 << numPorts) - 1;
     }
-    
+
     hwInit->PortsImplemented = pi;
 
     // 5. Initialize active ports
@@ -695,7 +789,8 @@ AhciHwInitialize(
         }
     }
 
-    // 6. Clear pending status and set up port interrupts
+    // 6. Clear pending status and set up port interrupts (only meaningful
+    // when we have a real HAL-assigned IRQ; fast-poll mode leaves PxIE=0).
     for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
         if (pi & (1 << port)) {
             PUCHAR pb = AHCI_PORT_BASE(hwInit->AbarMapped, port);
@@ -703,19 +798,22 @@ AhciHwInitialize(
             AHCI_READ_REG(pb, AHCI_PORT_IS); // Flush
             AHCI_WRITE_REG(pb, AHCI_PORT_SERR, 0xFFFFFFFF);
             AHCI_READ_REG(pb, AHCI_PORT_SERR); // Flush
-            AHCI_WRITE_REG(pb, AHCI_PORT_IE, AHCI_PORT_IE_DEFAULT);
+            AHCI_WRITE_REG(pb, AHCI_PORT_IE, hwInit->UseInterrupt ? AHCI_PORT_IE_DEFAULT : 0);
             AHCI_READ_REG(pb, AHCI_PORT_IE); // Flush
         }
     }
-    
+
     AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_IS, 0xFFFFFFFF);
     AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_IS); // Flush
 
-    // 7. Enable Global Interrupts
-    ghc = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_GHC);
-    ghc |= AHCI_GHC_IE;
-    AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_GHC, ghc);
-    AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_GHC); // Final flush
+    // 7. Enable Global Interrupts only if we actually have a usable HAL IRQ;
+    // otherwise leave GHC.IE clear and rely on the StartIo fast-poll path.
+    if (hwInit->UseInterrupt) {
+        ghc = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_GHC);
+        ghc |= AHCI_GHC_IE;
+        AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_GHC, ghc);
+        AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_GHC); // Final flush
+    }
 
     return TRUE;
 }
@@ -725,8 +823,8 @@ AhciHwInitialize(
 /* Asynchronous StartIo model */
 // HwStartIo callback: reject re-entrant requests while one SRB is active,
 // otherwise hand the SRB to the SCSI-to-ATA translation layer. Completion
-// happens later from AhciInterrupt unless the SATL layer already finished
-// the request synchronously.
+// happens later from AhciInterrupt (or inline via fast-poll) unless the
+// SATL layer already finished the request synchronously.
 BOOLEAN
 AhciStartIo(
 	IN PVOID DeviceExtension,
@@ -757,6 +855,66 @@ AhciStartIo(
         ScsiPortNotification(NextRequest, hwInit, NULL);
     }
     return TRUE;
+}
+
+
+/* Fallback safety-net timer: only armed when UseInterrupt is TRUE, as a
+   backstop in case the real IRQ is lost or coalesced. Polls the active
+   port's CI/TFD exactly like AhciInterrupt would and completes the SRB
+   if the command has already finished. */
+VOID
+AhciFallbackTimer(
+    IN PVOID DeviceExtension
+)
+{
+    PHW_DEVICE_EXTENSION hwInit;
+    PSCSI_REQUEST_BLOCK srb;
+    PUCHAR portBase;
+    ULONG ci, tfd, portIs;
+
+    hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
+
+    srb = (PSCSI_REQUEST_BLOCK)*(volatile PVOID*)&hwInit->ActiveSrb;
+    if (srb == NULL) {
+        return;
+    }
+
+    portBase = AHCI_PORT_BASE(hwInit->AbarMapped, hwInit->ActivePort);
+    ci = AHCI_READ_REG(portBase, AHCI_PORT_CI);
+    tfd = AHCI_READ_REG(portBase, AHCI_PORT_TFD);
+    portIs = AHCI_READ_REG(portBase, AHCI_PORT_IS);
+
+    if ((ci & 1) && !(portIs & AHCI_PORT_IS_FATAL) && !(tfd & TFD_STS_ERR)) {
+        // Command is still running normally; re-arm and check again later.
+        ScsiPortNotification(RequestTimerCall, hwInit, AhciFallbackTimer, AHCI_FALLBACK_TIMER_USEC);
+        return;
+    }
+
+    AHCI_WRITE_REG(portBase, AHCI_PORT_IS, portIs);
+    AHCI_READ_REG(portBase, AHCI_PORT_IS);
+    AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
+    AHCI_READ_REG(portBase, AHCI_PORT_SERR);
+
+    if ((portIs & AHCI_PORT_IS_FATAL) || (tfd & TFD_STS_ERR)) {
+        srb->SrbStatus = SRB_STATUS_ERROR;
+        srb->ScsiStatus = SCSISTAT_CHECK_CONDITION;
+        AhciStopPortEngines(hwInit, portBase);
+
+        AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
+        AHCI_READ_REG(portBase, AHCI_PORT_CMD);
+        AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
+        AHCI_READ_REG(portBase, AHCI_PORT_CMD);
+    } else {
+        srb->SrbStatus = SRB_STATUS_SUCCESS;
+        srb->ScsiStatus = SCSISTAT_GOOD;
+        if (srb->DataTransferLength > hwInit->ActiveBytes) {
+            srb->DataTransferLength = hwInit->ActiveBytes;
+        }
+    }
+
+    *(volatile PVOID*)&hwInit->ActiveSrb = NULL;
+    ScsiPortNotification(RequestComplete, hwInit, srb);
+    ScsiPortNotification(NextRequest, hwInit, NULL);
 }
 
 
@@ -807,11 +965,11 @@ AhciInterrupt(
                 ci = AHCI_READ_REG(portBase, AHCI_PORT_CI);
                 tfd = AHCI_READ_REG(portBase, AHCI_PORT_TFD);
 
-                /* 
-                 * Under SMP I/O APIC environments, portIs firing combined with 
-                 * a fatal error or task file error is absolute proof of completion/failure. 
-                 * For normal completions, if portIs indicates a valid event (like D2H FIS or 
-                 * standard completion) but CI has a minor hardware delay, we rely on portIs 
+                /*
+                 * Under SMP I/O APIC environments, portIs firing combined with
+                 * a fatal error or task file error is absolute proof of completion/failure.
+                 * For normal completions, if portIs indicates a valid event (like D2H FIS or
+                 * standard completion) but CI has a minor hardware delay, we rely on portIs
                  * or allow a slightly relaxed check to prevent dropping completions.
                  */
                 if ((portIs & AHCI_PORT_IS_FATAL) || (tfd & 0x01) || !(ci & 1)) {
@@ -819,20 +977,23 @@ AhciInterrupt(
                         srb->SrbStatus = SRB_STATUS_ERROR;
                         srb->ScsiStatus = SCSISTAT_CHECK_CONDITION;
                         AhciStopPortEngines(hwInit, portBase);
-                        
+
                         AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
                         AHCI_READ_REG(portBase, AHCI_PORT_CMD);
-                        
+
                         AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
                         AHCI_READ_REG(portBase, AHCI_PORT_CMD);
                     } else {
                         srb->SrbStatus = SRB_STATUS_SUCCESS;
                         srb->ScsiStatus = SCSISTAT_GOOD;
+                        if (srb->DataTransferLength > hwInit->ActiveBytes) {
+                            srb->DataTransferLength = hwInit->ActiveBytes;
+                        }
                     }
 
                     // Safely clear ActiveSrb using volatile casting
                     *(volatile PVOID*)&hwInit->ActiveSrb = NULL;
-                    
+
                     ScsiPortNotification(RequestComplete, hwInit, srb);
                     ScsiPortNotification(NextRequest, hwInit, NULL);
                 }
@@ -848,7 +1009,7 @@ AhciInterrupt(
 }
 
 
-BOOLEAN 
+BOOLEAN
 AhciResetBus(
     IN PVOID HwDeviceExtension,
     IN ULONG PathId
@@ -865,16 +1026,16 @@ AhciResetBus(
     for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
         if (hwInit->Ports[port].Present) {
             PUCHAR portBase = AHCI_PORT_BASE(hwInit->AbarMapped, port);
-            
+
             // 1. Stop port engines securely
             AhciStopPortEngines(hwInit, portBase);
-            
+
             // 2. Clear any pending port interrupt status flags by writing 1s to them
             ScsiPortWriteRegisterUlong((PULONG)(portBase + AHCI_PORT_IS), 0xFFFFFFFF);
-            
+
             // 3. Clear any SATA error (SERR) status flags by writing 1s
             ScsiPortWriteRegisterUlong((PULONG)(portBase + AHCI_PORT_SERR), 0xFFFFFFFF);
-            
+
             // Read back to flush the write buffer across SMP/I/O APIC buses
             ScsiPortReadRegisterUlong((PULONG)(portBase + AHCI_PORT_SERR));
 
@@ -904,7 +1065,7 @@ AhciResetBus(
     if (srb != NULL) {
         *(volatile PVOID*)&hwInit->ActiveSrb = NULL;
         KeMemoryBarrier();
-        
+
         srb->SrbStatus = SRB_STATUS_BUS_RESET;
         ScsiPortNotification(RequestComplete, hwInit, srb);
         ScsiPortNotification(NextRequest, hwInit, NULL);

@@ -10,6 +10,22 @@ extern "C" {
 #include <miniport.h>
 #include <scsi.h>
 
+// KeMemoryBarrier: on this DDK, miniport.h/scsi.h don't pull in wdm.h/ntddk.h,
+// so the compiler never sees its declaration (C4013) even though x64 has a
+// real intrinsic-backed implementation. This DDK's compiler also has no
+// intrin.h, so use InterlockedExchange on a dummy local instead: it has
+// existed since the NT4 DDK, and on x64 MSVC always compiles to a locked
+// xchg (an implicit full fence, never reordered or optimized away), giving
+// a genuine SMP memory barrier without inline asm (which x64 MSVC can't
+// compile) or intrin.h.
+#if !defined(_WDMDDK_) && !defined(_NTDDK_H_) && !defined(_NTIFS_)
+static __inline VOID KeMemoryBarrier(VOID)
+{
+    LONG barrierDummy;
+    InterlockedExchange(&barrierDummy, 0);
+}
+#endif
+
 
 
 #define PCI_CLASS_MASS_STORAGE          0x01
@@ -95,6 +111,19 @@ extern "C" {
 #define IDE_COMMAND_WRITE_DMA           0xCA
 #define IDE_COMMAND_PACKET              0xA0
 
+/* Task File Data (PxTFD) status bits used by the fast-poll completion check */
+#define TFD_STS_ERR                     0x01
+#define TFD_STS_DF                      0x20
+
+/* Fallback safety-net timer period when running under a real HAL interrupt (~10ms) */
+#define AHCI_FALLBACK_TIMER_USEC        10000
+
+/* Synchronous tight-poll interval/timeout used when the HAL gives no usable IRQ
+   (e.g. text-mode Setup), so StartIo completes the command inline instead of
+   waiting on the ~10ms RequestTimerCall resolution. */
+#define AHCI_FAST_POLL_INTERVAL_USEC    10
+#define AHCI_FAST_POLL_TIMEOUT_USEC     3000000
+
 #define AHCI_READ_REG(base, off)        ScsiPortReadRegisterUlong((PULONG)((PUCHAR)(base) + (off)))
 #define AHCI_WRITE_REG(base, off, val)  ScsiPortWriteRegisterUlong((PULONG)((PUCHAR)(base) + (off)), (ULONG)(val))
 #define AHCI_PORT_BASE(abar, port)      ((PUCHAR)(abar) + 0x100 + ((port) * 0x80))
@@ -179,6 +208,12 @@ typedef struct _HW_DEVICE_EXTENSION {
     AHCI_PORT_INFO          Ports[MAX_SUPPORTED_PORTS];
     PSCSI_REQUEST_BLOCK     ActiveSrb;
 
+    /* TRUE when the HAL handed us a real IRQ (BusInterruptLevel/Vector != 0);
+       FALSE means we fast-poll synchronously inside StartIo instead. */
+    BOOLEAN                 UseInterrupt;
+    ULONG                   ActivePort;
+    ULONG                   ActiveBytes;
+
     PAHCI_DMA_RESOURCES     DmaArea;
     SCSI_PHYSICAL_ADDRESS   DmaAreaPhysical;
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
@@ -204,6 +239,9 @@ static __inline void * __cdecl memset(void *dst, int val, size_t count) {
 
 VOID
 AhciStopPortEngines(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR portBase);
+
+VOID
+AhciFallbackTimer(IN PVOID DeviceExtension);
 
 #endif
 

@@ -1,7 +1,5 @@
 #include "ahcint.h"
 
-// Convert an ATA IDENTIFY string field (byte-swapped 16-bit words) into a
-// left-justified, space-padded ASCII buffer of OutBufferMax bytes.
 static VOID
 AhciExtractAtaString(
     IN PUSHORT IdentifyWords,
@@ -30,8 +28,6 @@ AhciExtractAtaString(
     }
 }
 
-// Return total addressable sector count from IDENTIFY data, preferring
-// 48-bit LBA, then 28-bit LBA, then legacy CHS as a fallback.
 static ULONG
 AhciGetTotalSectors(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -59,8 +55,6 @@ AhciGetTotalSectors(
     return 0;
 }
 
-// Build SCSI INQUIRY response data from cached IDENTIFY data, or a generic
-// fallback string set if IDENTIFY never completed successfully.
 static VOID
 AhciHandleInquiry(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -93,10 +87,6 @@ AhciHandleInquiry(
         PUCHAR v = isCd ? "ATAPI   " : "ATA     ";
         PUCHAR p = isCd ? "SATA CD-ROM     " : "SATA HARDDISK   ";
         ULONG i;
-
-        // No valid IDENTIFY data cached — report generic strings instead
-        AHCI_DBG_LOG("[AHCINT] AhciHandleInquiry: port %u has no valid IDENTIFY data, using generic strings\n", port);
-
         for (i = 0; i < 8; i++) inq->VendorId[i] = v[i];
         for (i = 0; i < 16; i++) inq->ProductId[i] = p[i];
         inq->ProductRevisionLevel[0] = '1';
@@ -109,9 +99,6 @@ AhciHandleInquiry(
     Srb->ScsiStatus = SCSISTAT_GOOD;
 }
 
-// Build a minimal MODE SENSE(6) response: block descriptor plus, when
-// requested, the Rigid Disk Geometry (page 0x04) page derived from
-// IDENTIFY data or a synthesized 255/63 geometry.
 static VOID
 AhciHandleModeSense(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -180,9 +167,6 @@ AhciHandleModeSense(
     Srb->ScsiStatus = SCSISTAT_GOOD;
 }
 
-// Walk the SRB's data buffer and fill the port's PRDT, splitting each
-// scatter-gather segment at 4 KB physical page boundaries. Fails if more
-// than MAX_PRDT_ENTRIES entries would be needed.
 static BOOLEAN
 AhciBuildPrdt(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -219,19 +203,12 @@ AhciBuildPrdt(
         entryIndex++;
     }
 
-    if (bytesLeft > 0) {
-        AHCI_DBG_LOG("[AHCINT] AhciBuildPrdt: ran out of PRDT entries (%u left)\n", bytesLeft);
-        return FALSE;
-    }
+    if (bytesLeft > 0) return FALSE;
 
     *PrdtEntriesCount = entryIndex;
     return TRUE;
 }
 
-// Build and issue a single H2D FIS (ATA read/write DMA EXT, or an ATAPI
-// PACKET command) on the port, then poll CI until completion or timeout.
-// Always returns FALSE (command runs to completion synchronously; no
-// asynchronous/interrupt-driven completion is used here).
 static BOOLEAN
 AhciExecuteTransferEngine(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -254,7 +231,6 @@ AhciExecuteTransferEngine(
 
     if (Req->DataBufferLen > 0) {
         if (!AhciBuildPrdt(HwInit, portNumber, Req, &prdtEntries)) {
-            AHCI_DBG_LOG("[AHCINT] AhciExecuteTransferEngine: port %u PRDT build failed\n", portNumber);
             if (HwInit->ActiveSrb) HwInit->ActiveSrb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
             return FALSE;
         }
@@ -331,12 +307,7 @@ AhciExecuteTransferEngine(
     AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << portNumber));
 
     if ((AHCI_READ_REG(portBase, AHCI_PORT_CI) & 1) || (portIs & AHCI_PORT_IS_FATAL) || (tfd & 0x01)) {
-        AHCI_DBG_LOG("[AHCINT] AhciExecuteTransferEngine: port %u command failed (IS=0x%x, TFD=0x%x)\n",
-                     portNumber, portIs, tfd);
-
         if (Req->IsAtapi) {
-            // Fatal error on an ATAPI command — restart the engines so the
-            // next request has a clean port to work with
             AhciStopPortEngines(portBase);
             AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
             AHCI_WRITE_REG(portBase, AHCI_PORT_IS, 0xFFFFFFFF);
@@ -357,8 +328,6 @@ AhciExecuteTransferEngine(
     return FALSE;
 }
 
-// SCSI-to-ATA translation layer (SATL) entry point: validates the target,
-// then dispatches the SRB's CDB opcode to the matching handler.
 BOOLEAN
 AhciSatlProcessSrb(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -373,7 +342,6 @@ AhciSatlProcessSrb(
     port = Srb->TargetId;
 
     if (port >= MAX_AHCI_PORTS || !HwInit->Ports[port].Present) {
-        AHCI_DBG_LOG("[AHCINT] AhciSatlProcessSrb: target %u not present\n", port);
         Srb->SrbStatus = SRB_STATUS_SELECTION_TIMEOUT;
         return FALSE;
     }
@@ -464,7 +432,6 @@ AhciSatlProcessSrb(
 
     default:
         if (HwInit->Ports[port].IsAtapi) {
-            // Pass any other CDB straight through as an ATAPI PACKET command
             ataReq.DataBuffer = Srb->DataBuffer;
             ataReq.DataBufferLen = Srb->DataTransferLength;
             ataReq.IsAtapi = TRUE;
@@ -472,8 +439,6 @@ AhciSatlProcessSrb(
             return AhciExecuteTransferEngine(HwInit, &ataReq);
         }
 
-        AHCI_DBG_LOG("[AHCINT] AhciSatlProcessSrb: unsupported opcode 0x%x on port %u\n",
-                     cdb->CDB6GENERIC.OperationCode, port);
         Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
         return FALSE;
     }

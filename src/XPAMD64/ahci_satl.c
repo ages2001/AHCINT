@@ -1,5 +1,3 @@
-
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -39,7 +37,7 @@ AhciExtractAtaString(
     while (outIndex > 0 && (OutBuffer[outIndex - 1] == ' ' || OutBuffer[outIndex - 1] == '\0')) {
         outIndex--;
     }
-    
+
     // Fill remaining space with padding safely, leaving room for null termination
     while (outIndex < (OutBufferMax - 1)) {
         OutBuffer[outIndex++] = ' ';
@@ -155,7 +153,7 @@ AhciHandleInquiry(
 
     // ACPI Safety: Force a synchronized hardware register read barrier for PxSSTS
     ssts = AHCI_READ_REG(portBase, AHCI_PORT_SSTS);
-    
+
     // If the hardware detects a device now (DET == 3, IPM == 1), ensure port is marked present
     if ((ssts & 0x0F) == 0x03) {
         HwInit->Ports[port].Present = TRUE;
@@ -216,7 +214,7 @@ AhciHandleRequestSense(
     }
 
     sense = (PSENSE_DATA)Srb->DataBuffer;
-    
+
     // Safely zero memory up to the available transfer length or sense data size
     ZeroMemoryBytes(sense, Srb->DataTransferLength < sizeof(SENSE_DATA) ? Srb->DataTransferLength : sizeof(SENSE_DATA));
 
@@ -260,7 +258,7 @@ AhciHandleModeSense(
 
     buf = (PUCHAR)Srb->DataBuffer;
     cdb = (PCDB)Srb->Cdb;
-    
+
     if (cdb == NULL) {
         Srb->SrbStatus = SRB_STATUS_ERROR;
         Srb->ScsiStatus = SCSISTAT_CHECK_CONDITION;
@@ -396,10 +394,85 @@ AhciBuildPrdt(
 }
 
 
-/* Non-polling, asynchronous command execution engine */
-// Build and issue a single H2D FIS (ATA/ATAPI, DMA or PIO opcode family
-// depending on Req->ForcePio and LBA range) on the port's command slot 0,
-// then return immediately — completion is handled later by AhciInterrupt.
+// Synchronous tight-poll completion path used when the HAL gave us no
+// usable interrupt (UseInterrupt == FALSE), e.g. text-mode Setup. Polls
+// PxCI/PxIS/PxTFD at ~10us intervals from inside StartIo instead of going
+// through the ~10ms RequestTimerCall resolution, which is what keeps
+// "Examining Disk 0..." fast under a non-PnP or interrupt-less HAL.
+static
+BOOLEAN
+AhciFastPollComplete(
+    IN PHW_DEVICE_EXTENSION HwInit,
+    IN PSCSI_REQUEST_BLOCK Srb,
+    IN PUCHAR PortBase,
+    IN ULONG PortNumber
+)
+{
+    ULONG elapsedUsec;
+    ULONG ci, portIs, tfd;
+    BOOLEAN error;
+
+    elapsedUsec = 0;
+    error = FALSE;
+
+    for (;;) {
+        ci = AHCI_READ_REG(PortBase, AHCI_PORT_CI);
+        portIs = AHCI_READ_REG(PortBase, AHCI_PORT_IS);
+        tfd = AHCI_READ_REG(PortBase, AHCI_PORT_TFD);
+
+        if ((portIs & AHCI_PORT_IS_FATAL) || (tfd & TFD_STS_ERR)) {
+            error = TRUE;
+            break;
+        }
+        if (!(ci & 1)) {
+            break;
+        }
+        if (elapsedUsec >= AHCI_FAST_POLL_TIMEOUT_USEC) {
+            error = TRUE;
+            break;
+        }
+
+        ScsiPortStallExecution(AHCI_FAST_POLL_INTERVAL_USEC);
+        elapsedUsec += AHCI_FAST_POLL_INTERVAL_USEC;
+    }
+
+    AHCI_WRITE_REG(PortBase, AHCI_PORT_IS, portIs);
+    AHCI_READ_REG(PortBase, AHCI_PORT_IS);
+    AHCI_WRITE_REG(PortBase, AHCI_PORT_SERR, 0xFFFFFFFF);
+    AHCI_READ_REG(PortBase, AHCI_PORT_SERR);
+
+    if (error) {
+        if (Srb != NULL) {
+            Srb->SrbStatus = SRB_STATUS_ERROR;
+            Srb->ScsiStatus = SCSISTAT_CHECK_CONDITION;
+        }
+        AhciStopPortEngines(HwInit, PortBase);
+
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
+        AHCI_READ_REG(PortBase, AHCI_PORT_CMD);
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
+        AHCI_READ_REG(PortBase, AHCI_PORT_CMD);
+    } else if (Srb != NULL) {
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        Srb->ScsiStatus = SCSISTAT_GOOD;
+        if (Srb->DataTransferLength > HwInit->ActiveBytes) {
+            Srb->DataTransferLength = HwInit->ActiveBytes;
+        }
+    }
+
+    *(volatile PVOID*)&HwInit->ActiveSrb = NULL;
+
+    /* Completed synchronously right here; caller (AhciStartIo) will notify. */
+    return FALSE;
+}
+
+
+/* Command execution engine: builds and issues a single H2D FIS (ATA/ATAPI,
+   DMA or PIO opcode family depending on Req->ForcePio and LBA range) on
+   the port's command slot 0. If a real HAL interrupt is available it
+   returns immediately and lets AhciInterrupt (with an AhciFallbackTimer
+   safety net) complete the request; otherwise it fast-polls to completion
+   synchronously before returning. */
 static
 BOOLEAN
 AhciExecuteTransferEngineAsync(
@@ -453,7 +526,7 @@ AhciExecuteTransferEngineAsync(
         fis->FisType = 0x27;
         fis->PmPortControl = 0x80;
         fis->Command = IDE_COMMAND_PACKET;
-        
+
         if (Req->DataBufferLen > 0 && !Req->ForcePio) {
             fis->FeaturesLow = 0x01;
             fis->Lba1 = 0;
@@ -522,16 +595,30 @@ AhciExecuteTransferEngineAsync(
     AHCI_READ_REG(portBase, AHCI_PORT_IS);
     AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
     AHCI_READ_REG(portBase, AHCI_PORT_SERR);
-    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, AHCI_PORT_IE_DEFAULT);
+    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, HwInit->UseInterrupt ? AHCI_PORT_IE_DEFAULT : 0);
     AHCI_READ_REG(portBase, AHCI_PORT_IE);
     AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << portNumber));
     AHCI_READ_REG(HwInit->AbarMapped, AHCI_GEN_IS);
+
+    HwInit->ActivePort = portNumber;
+    HwInit->ActiveBytes = Req->DataBufferLen;
 
     /* Kick off the command slot, with write-flushing and memory barrier fencing */
     AHCI_WRITE_REG(portBase, AHCI_PORT_CI, 1);
     AHCI_READ_REG(portBase, AHCI_PORT_CI); // Forces write buffer flush and acts as a hardware barrier
 
-    /* Return immediately without waiting; completion arrives via interrupt */
+    if (!HwInit->UseInterrupt) {
+        /* No usable HAL interrupt: fast-poll to completion synchronously
+           right here instead of returning pending and waiting on a timer. */
+        if (HwInit->ActiveSrb == NULL) {
+            return FALSE;
+        }
+        return AhciFastPollComplete(HwInit, HwInit->ActiveSrb, portBase, portNumber);
+    }
+
+    /* Real IRQ available: arm the fallback safety-net timer and return
+       pending; completion normally arrives via AhciInterrupt. */
+    ScsiPortNotification(RequestTimerCall, HwInit, AhciFallbackTimer, AHCI_FALLBACK_TIMER_USEC);
     return TRUE;
 }
 
@@ -600,7 +687,7 @@ AhciSatlProcessSrb(
             cdb->CDB6GENERIC.OperationCode == 0x46 ||
             cdb->CDB6GENERIC.OperationCode == 0x4A ||
             cdb->CDB6GENERIC.OperationCode == 0xA4 ||
-            cdb->CDB6GENERIC.OperationCode == SCSIOP_SYNCHRONIZE_CACHE) 
+            cdb->CDB6GENERIC.OperationCode == SCSIOP_SYNCHRONIZE_CACHE)
         {
             Srb->SrbStatus = SRB_STATUS_SUCCESS;
             Srb->ScsiStatus = SCSISTAT_GOOD;
@@ -608,7 +695,7 @@ AhciSatlProcessSrb(
         }
 
         if (cdb->CDB6GENERIC.OperationCode == SCSIOP_MODE_SENSE ||
-            cdb->CDB6GENERIC.OperationCode == 0x5A) 
+            cdb->CDB6GENERIC.OperationCode == 0x5A)
         {
             AhciHandleModeSense(HwInit, Srb);
             return FALSE;
@@ -654,13 +741,13 @@ AhciSatlProcessSrb(
         if (tot > 0) tot--;
         tot32 = (tot > 0xFFFFFFFF) ? 0xFFFFFFFF : (ULONG)tot;
 
-        cap->LogicalBlockAddress = 
+        cap->LogicalBlockAddress =
             ((tot32 & 0xFF000000) >> 24) |
             ((tot32 & 0x00FF0000) >> 8)  |
             ((tot32 & 0x0000FF00) << 8)  |
             ((tot32 & 0x000000FF) << 24);
 
-        cap->BytesPerBlock = 
+        cap->BytesPerBlock =
             ((sectorSize & 0xFF000000) >> 24) |
             ((sectorSize & 0x00FF0000) >> 8)  |
             ((sectorSize & 0x0000FF00) << 8)  |

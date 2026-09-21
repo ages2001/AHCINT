@@ -1,11 +1,9 @@
-// AHCI SCSI miniport driver — shared definitions for Windows 2000 / XP (x86)
 #ifndef _AHCINT_H_
 #define _AHCINT_H_
 
 #include <miniport.h>
 #include <scsi.h>
 
-// PCI class/subclass/prog-if identifying an AHCI HBA
 #define PCI_CLASS_MASS_STORAGE          0x01
 #define PCI_SUBCLASS_AHCI               0x06
 #define PCI_PROGIF_AHCI                 0x01
@@ -22,16 +20,13 @@
 #define AHCI_GEN_CAP2                   0x24
 #define AHCI_GEN_BOHC                   0x28
 
-// GHC bits
 #define AHCI_GHC_AE                     (1UL << 31)
 #define AHCI_GHC_IE                     (1UL << 1)
 #define AHCI_GHC_HR                     (1UL << 0)
 
-// CAP bits
 #define AHCI_CAP_SCLO                   (1UL << 24)
 #define AHCI_CAP_S64A                   (1UL << 31)
 
-// BOHC (BIOS/OS Handoff Control) bits
 #define AHCI_BOHC_BB                    0x00000001
 #define AHCI_BOHC_OOS                   0x00000002
 #define AHCI_BOHC_SOOE                  0x00000004
@@ -53,7 +48,6 @@
 #define AHCI_PORT_SACT                  0x34
 #define AHCI_PORT_CI                    0x38
 
-// PxCMD bits
 #define AHCI_PORT_CMD_ST                (1UL << 0)
 #define AHCI_PORT_CMD_SUD               (1UL << 1)
 #define AHCI_PORT_CMD_POD               (1UL << 2)
@@ -63,7 +57,6 @@
 #define AHCI_PORT_CMD_CR                (1UL << 15)
 #define AHCI_PORT_CMD_ATAPI             (1UL << 24)
 
-// PxIS bits
 #define AHCI_PORT_IS_DHRS               (1UL << 0)
 #define AHCI_PORT_IS_PSS                (1UL << 1)
 #define AHCI_PORT_IS_DSS                (1UL << 2)
@@ -75,15 +68,26 @@
 #define AHCI_PORT_IS_IFS                (1UL << 27)
 #define AHCI_PORT_IS_FATAL              (AHCI_PORT_IS_TFES | AHCI_PORT_IS_HBFS | AHCI_PORT_IS_HBDS | AHCI_PORT_IS_IFS)
 
-/* Default port interrupt-enable mask */
+/* UniATA default port interrupt-enable mask */
 #define AHCI_PORT_IE_DEFAULT            (AHCI_PORT_IS_DHRS | AHCI_PORT_IS_PSS | AHCI_PORT_IS_DSS | \
                                          AHCI_PORT_IS_SDBS | AHCI_PORT_IS_DPS | AHCI_PORT_IS_FATAL)
 
-// PxSIG values identifying device type after COMRESET
+/* nvme2k-style safety net: if the real IRQ never arrives, this timer
+   polls CI/TFD/IS and completes the command anyway. */
+#define AHCI_FALLBACK_TIMER_USEC        10000
+
+/* FAST-POLL mode (no HAL-assigned IRQ, e.g. text-mode Setup): tight
+   synchronous poll loop instead of the ~10ms system timer. */
+#define AHCI_FAST_POLL_INTERVAL_USEC    10
+/* Upper bound for one command's tight-poll wait, in microseconds. */
+#define AHCI_FAST_POLL_TIMEOUT_USEC     3000000
+
+#define TFD_STS_ERR                     0x01
+#define TFD_STS_DF                      0x20
+
 #define SATA_SIG_ATA                    0x00000101
 #define SATA_SIG_ATAPI                  0xEB140101
 
-// ATA/ATAPI command opcodes used by this driver
 #define IDE_COMMAND_IDENTIFY_DEVICE     0xEC
 #define IDE_COMMAND_IDENTIFY_PACKET     0xA1
 #define IDE_COMMAND_READ_DMA_EXT        0x25
@@ -96,22 +100,16 @@
 #define IDE_COMMAND_WRITE_DMA           0xCA
 #define IDE_COMMAND_PACKET              0xA0
 
-// MMIO register access helpers and per-port base address
 #define AHCI_READ_REG(base, off)        ScsiPortReadRegisterUlong((PULONG)((PUCHAR)(base) + (off)))
 #define AHCI_WRITE_REG(base, off, val)  ScsiPortWriteRegisterUlong((PULONG)((PUCHAR)(base) + (off)), (ULONG)(val))
 #define AHCI_PORT_BASE(abar, port)      ((PUCHAR)(abar) + 0x100 + ((port) * 0x80))
 
-// Debug print helpers. AHCI_DBG_LOG is a printf-style variadic macro (C99);
-// AHCI_DBG_MSG takes a plain string literal with no format arguments.
 ULONG __cdecl DbgPrint(PCH Format, ...);
 #define AHCI_DBG_LOG(fmt, ...) DbgPrint("[AHCINT] " fmt "\n", __VA_ARGS__)
 #define AHCI_DBG_MSG(msg)      DbgPrint("[AHCINT] " msg "\n")
 
-// AHCI on-adapter DMA structures must be byte-packed (no compiler padding)
 #pragma pack(push, 1)
 
-// One entry in a port's command list (32 entries per port in AHCI, but this
-// driver only ever uses slot 0 at a time)
 typedef struct _AHCI_COMMAND_HEADER {
     USHORT Flags;
     USHORT PrdtLength;
@@ -121,7 +119,6 @@ typedef struct _AHCI_COMMAND_HEADER {
     ULONG  Reserved[4];
 } AHCI_COMMAND_HEADER, *PAHCI_COMMAND_HEADER;
 
-// Physical Region Descriptor Table entry — one scatter-gather segment
 typedef struct _AHCI_PRDT_ENTRY {
     ULONG DataBaseAddress;
     ULONG DataBaseAddressUpper;
@@ -129,7 +126,6 @@ typedef struct _AHCI_PRDT_ENTRY {
     ULONG ByteCountInterrupt;
 } AHCI_PRDT_ENTRY, *PAHCI_PRDT_ENTRY;
 
-// Host-to-Device Register FIS, as written into the command table
 typedef struct _FIS_REG_H2D {
     UCHAR FisType;
     UCHAR PmPortControl;
@@ -151,14 +147,10 @@ typedef struct _FIS_REG_H2D {
 
 #pragma pack(pop)
 
-// Single uncached DMA allocation backing all ports' command lists, FIS
-// receive areas, command tables and IDENTIFY buffers (see AhciAllocateDma)
 typedef struct _AHCI_DMA_RESOURCES {
     UCHAR RawBuffer[65536];
 } AHCI_DMA_RESOURCES, *PAHCI_DMA_RESOURCES;
 
-// Per-port state: device presence/type, cached IDENTIFY data, and the
-// virtual/physical addresses of that port's DMA regions
 typedef struct _AHCI_PORT_INFO {
     BOOLEAN                 Present;
     BOOLEAN                 IsAtapi;
@@ -182,7 +174,6 @@ typedef struct _AHCI_PORT_INFO {
     ULONG                   IdentifyDmaPhysicalUpper;
 } AHCI_PORT_INFO, *PAHCI_PORT_INFO;
 
-// ScsiPort miniport device extension for this adapter instance
 typedef struct _HW_DEVICE_EXTENSION {
     PUCHAR                  AbarMapped;
     ULONG                   PciBus;
@@ -193,12 +184,16 @@ typedef struct _HW_DEVICE_EXTENSION {
     AHCI_PORT_INFO          Ports[MAX_SUPPORTED_PORTS];
     PSCSI_REQUEST_BLOCK     ActiveSrb;
 
+    /* TRUE if the HAL assigned a real IRQ (see AhciFindAdapter);
+       FALSE means FAST-POLL/fallback-timer is the only completion path. */
+    BOOLEAN                 UseInterrupt;
+    ULONG                   ActivePort;
+    ULONG                   ActiveBytes;
+
     PAHCI_DMA_RESOURCES     DmaArea;
     SCSI_PHYSICAL_ADDRESS   DmaAreaPhysical;
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
 
-// Normalized request passed from the SATL layer to the transfer engine.
-// ForcePio selects the legacy PIO opcode family instead of DMA.
 typedef struct _ATA_REQUEST {
     PVOID     DataBuffer;
     ULONG     DataBufferLen;
@@ -209,7 +204,6 @@ typedef struct _ATA_REQUEST {
     USHORT    SectorCount;
 } ATA_REQUEST, *PATA_REQUEST;
 
-// Freestanding-environment memset (no CRT available in a kernel miniport)
 #pragma function(memset)
 static __inline void * __cdecl memset(void *dst, int val, size_t count) {
     char *p = (char *)dst;
@@ -220,5 +214,6 @@ static __inline void * __cdecl memset(void *dst, int val, size_t count) {
 #define ZeroMemoryBytes(dst, len) memset((dst), 0, (len))
 
 VOID AhciStopPortEngines(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR portBase);
+VOID AhciFallbackTimer(IN PVOID DeviceExtension);
 
 #endif

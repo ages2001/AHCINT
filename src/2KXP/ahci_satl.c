@@ -1,7 +1,5 @@
 #include "ahcint.h"
 
-// Convert an ATA IDENTIFY string field (byte-swapped 16-bit words) into a
-// left-justified, space-padded ASCII buffer of OutBufferMax bytes.
 static VOID
 AhciExtractAtaString(
     IN PUSHORT IdentifyWords,
@@ -32,8 +30,6 @@ AhciExtractAtaString(
     }
 }
 
-// Return total addressable sector count from IDENTIFY data, preferring
-// 48-bit LBA, then 28-bit LBA, then legacy CHS as a fallback.
 static ULONGLONG
 AhciGetTotalSectors64(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -66,8 +62,6 @@ AhciGetTotalSectors64(
     return 0;
 }
 
-// Build SCSI INQUIRY response data from cached IDENTIFY data, or a generic
-// fallback string set if IDENTIFY never completed successfully.
 static VOID
 AhciHandleInquiry(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -100,8 +94,6 @@ AhciHandleInquiry(
         AhciExtractAtaString(id, 31, 8, inq->ProductId, 16);
         AhciExtractAtaString(id, 23, 2, inq->ProductRevisionLevel, 4);
     } else {
-        // No valid IDENTIFY data cached — report generic strings instead
-        AHCI_DBG_LOG("AhciHandleInquiry: port %d has no valid IDENTIFY data, using generic strings", port);
         v = isCd ? "ATAPI   " : "ATA     ";
         p = isCd ? "SATA CD-ROM     " : "SATA HARDDISK   ";
         for (i = 0; i < 8; i++) inq->VendorId[i] = v[i];
@@ -116,8 +108,6 @@ AhciHandleInquiry(
     Srb->ScsiStatus = SCSISTAT_GOOD;
 }
 
-// Return a minimal "no sense" REQUEST SENSE response, used after every
-// command that already reported its status directly in the SRB.
 static VOID
 AhciHandleRequestSense(
     IN PSCSI_REQUEST_BLOCK Srb
@@ -139,9 +129,6 @@ AhciHandleRequestSense(
     Srb->ScsiStatus = SCSISTAT_GOOD;
 }
 
-// Build a minimal MODE SENSE(6) response: block descriptor plus, when
-// requested, the Rigid Disk Geometry (page 0x04) page derived from
-// IDENTIFY data or a synthesized 255/63 geometry.
 static VOID
 AhciHandleModeSense(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -212,9 +199,6 @@ AhciHandleModeSense(
     Srb->ScsiStatus = SCSISTAT_GOOD;
 }
 
-// Walk the SRB's data buffer and fill the port's PRDT, splitting each
-// scatter-gather segment at 4 KB physical page boundaries. Fails if more
-// than MAX_PRDT_ENTRIES entries would be needed.
 static BOOLEAN
 AhciBuildPrdt(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -256,19 +240,81 @@ AhciBuildPrdt(
         entryIndex++;
     }
 
-    if (bytesLeft > 0) {
-        AHCI_DBG_LOG("AhciBuildPrdt: ran out of PRDT entries (%u bytes left)", bytesLeft);
-        return FALSE;
-    }
+    if (bytesLeft > 0) return FALSE;
 
     *PrdtEntriesCount = entryIndex;
     return TRUE;
 }
 
-/* Non-polling, asynchronous command execution engine */
-// Build and issue a single H2D FIS (ATA/ATAPI, DMA or PIO opcode family
-// depending on Req->ForcePio and LBA range) on the port's command slot 0,
-// then return immediately — completion is handled later by AhciInterrupt.
+/* FAST-POLL: no real IRQ (UseInterrupt == FALSE), so instead of the HAL's
+   ~10ms RequestTimerCall we spin here inside StartIo, polling PxCI/PxIS/
+   PxTFD every ~10us until the command completes or times out. */
+static BOOLEAN
+AhciFastPollComplete(
+    IN PHW_DEVICE_EXTENSION HwInit,
+    IN PSCSI_REQUEST_BLOCK Srb,
+    IN PUCHAR PortBase,
+    IN ULONG PortNumber
+)
+{
+    ULONG elapsedUsec;
+    ULONG ci;
+    ULONG portIs;
+    ULONG tfd;
+    BOOLEAN error;
+
+    elapsedUsec = 0;
+    error = FALSE;
+
+    for (;;) {
+        ci = AHCI_READ_REG(PortBase, AHCI_PORT_CI);
+        portIs = AHCI_READ_REG(PortBase, AHCI_PORT_IS);
+        tfd = AHCI_READ_REG(PortBase, AHCI_PORT_TFD);
+
+        if ((portIs & AHCI_PORT_IS_FATAL) || (tfd & TFD_STS_ERR)) {
+            error = TRUE;
+            break;
+        }
+
+        if (!(ci & 1)) {
+            break;
+        }
+
+        if (elapsedUsec >= AHCI_FAST_POLL_TIMEOUT_USEC) {
+            error = TRUE;
+            break;
+        }
+
+        ScsiPortStallExecution(AHCI_FAST_POLL_INTERVAL_USEC);
+        elapsedUsec += AHCI_FAST_POLL_INTERVAL_USEC;
+    }
+
+    if (portIs != 0) {
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_IS, portIs);
+    }
+    if (portIs & AHCI_PORT_IS_FATAL) {
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_SERR, 0xFFFFFFFF);
+    }
+    AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << PortNumber));
+
+    HwInit->ActiveBytes = 0;
+
+    if (error) {
+        Srb->SrbStatus = SRB_STATUS_ERROR;
+        Srb->ScsiStatus = SCSISTAT_CHECK_CONDITION;
+        AhciStopPortEngines(HwInit, PortBase);
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
+        AHCI_DBG_LOG("FastPoll: port %lu command error/timeout (TFD=0x%08X IS=0x%08X)", PortNumber, tfd, portIs);
+    } else {
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        Srb->ScsiStatus = SCSISTAT_GOOD;
+    }
+
+    /* FALSE = completed synchronously; AhciStartIo finishes the SRB. */
+    return FALSE;
+}
+
 static BOOLEAN
 AhciExecuteTransferEngineAsync(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -291,7 +337,6 @@ AhciExecuteTransferEngineAsync(
 
     if (Req->DataBufferLen > 0) {
         if (!AhciBuildPrdt(HwInit, portNumber, Req, &prdtEntries)) {
-            AHCI_DBG_LOG("AhciExecuteTransferEngineAsync: port %d PRDT build failed", portNumber);
             if (HwInit->ActiveSrb) HwInit->ActiveSrb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
             return FALSE;
         }
@@ -388,21 +433,31 @@ AhciExecuteTransferEngineAsync(
 
     AHCI_WRITE_REG(portBase, AHCI_PORT_IS, 0xFFFFFFFF);
     AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
-    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, AHCI_PORT_IE_DEFAULT);
+    /* No real IRQ: leave port IE off, FAST-POLL below handles completion. */
+    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, HwInit->UseInterrupt ? AHCI_PORT_IE_DEFAULT : 0);
     AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << portNumber));
 
-    /* Kick off the command slot */
+    HwInit->ActivePort = portNumber;
+    HwInit->ActiveBytes = Req->DataBufferLen;
+
     AHCI_WRITE_REG(portBase, AHCI_PORT_CI, 1);
 
-    /* Return immediately without waiting; completion arrives via interrupt */
+    if (!HwInit->UseInterrupt) {
+        /* No HAL-assigned IRQ (e.g. text-mode Setup): tight-poll here
+           instead of the ~10ms RequestTimerCall grid. */
+        if (HwInit->ActiveSrb == NULL) {
+            return FALSE;
+        }
+        return AhciFastPollComplete(HwInit, HwInit->ActiveSrb, portBase, portNumber);
+    }
+
+    /* Safety net: complete via polling if the IRQ never arrives. */
+    ScsiPortNotification(RequestTimerCall, HwInit, AhciFallbackTimer,
+                         AHCI_FALLBACK_TIMER_USEC);
+
     return TRUE;
 }
 
-// SCSI-to-ATA translation layer (SATL) entry point: validates the target,
-// then dispatches the SRB's CDB opcode to the matching handler. ATAPI
-// devices get their own dispatch branch (pass-through PACKET for anything
-// not handled directly); ATA devices are dispatched by SCSI opcode,
-// including READ16/WRITE16 (0x88/0x8A) for full 64-bit LBA support.
 BOOLEAN
 AhciSatlProcessSrb(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -421,7 +476,6 @@ AhciSatlProcessSrb(
     port = Srb->TargetId;
 
     if (port >= MAX_SUPPORTED_PORTS || !HwInit->Ports[port].Present) {
-        AHCI_DBG_LOG("AhciSatlProcessSrb: target %d not present", port);
         Srb->SrbStatus = SRB_STATUS_NO_DEVICE;
         return FALSE;
     }
@@ -566,7 +620,6 @@ AhciSatlProcessSrb(
         return AhciExecuteTransferEngineAsync(HwInit, &ataReq);
 
     default:
-        AHCI_DBG_LOG("AhciSatlProcessSrb: unsupported opcode 0x%02X on port %d", cdb->CDB6GENERIC.OperationCode, port);
         Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
         return FALSE;
     }
