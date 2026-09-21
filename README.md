@@ -56,8 +56,9 @@ Application Layer
 
 | | NT 3.50/3.51/4.0 (x86) | 2000/XP (x86) | XP x64/Server 2003 x64 (amd64) |
 |---|---|---|---|
-| I/O model | Synchronous (polls `PxCI` in `HwStartIo`) | Asynchronous (`HwStartIo` returns pending, completion in `HwInterrupt`) | Asynchronous, same model as 2000/XP |
-| Max AHCI ports | 6 | 8 | 8 |
+| I/O model | Synchronous (polls `PxCI` in `HwStartIo`) | Asynchronous (`HwStartIo` returns pending, completion in `HwInterrupt`. And FAST_POLL fallback) | Asynchronous, same model as 2000/XP |
+| Max AHCI ports | 8 | 8 | 8 |
+| Max AHCI controllers | 8 | 8 | 8 |
 | READ/WRITE(16), full LBA48 range | Partial — READ/WRITE(10) only, LBA48 *commands* used on the wire but SCSI layer only ever passes the low 32 bits | Yes | Yes |
 | REQUEST SENSE | No | Yes | Yes |
 | ATAPI (PACKET) support | Yes | Yes | Yes |
@@ -216,6 +217,9 @@ Copyright (c) 2026 ages2001. All rights reserved.
 ## Special Thanks
 
 - infuscomus for porting driver to x64
-- Testers
+- Dietmar for FAST_POLL idea
+- DominBear for (nvme2k project)[https://github.com/techomancer/nvme2k]
+- (UniATA project)[http://alter.org.ua/]
 - Windows 2000 Dev Community
+- Testers
 - And everyone which supports it
