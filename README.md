@@ -93,7 +93,7 @@ Application Layer
 #### For NT 3.50 / 3.51 / NT 4.0 (x86)
 
 ```bat
-cd DRIVERPATH
+cd <path-to-AHCINT>\src\NT
 
 set MSVCDIR=C:\MSDEV
 set DDKDIR=C:\NT4DDK
@@ -107,7 +107,7 @@ cl -nologo -c -Gz -Ox -W3 -Zp8 -Zi -D_X86_=1 -Di386=1 -DCONDITION_HANDLING=1 -DN
 link -nologo -debug -debugtype:both -subsystem:native,3.50 -entry:DriverEntry@8 -driver -base:0x10000 -align:0x200 -out:ahcint.sys ahci_main.obj ahci_satl.obj scsiport.lib ntoskrnl.lib
 ```
 
-Replace `DRIVERPATH` with the path to `src\NT`. Output: `ahcint.sys`, targeting NT 3.50 and later (`-subsystem:native,3.50`).
+Output: `ahcint.sys`, targeting NT 3.50 and later (`-subsystem:native,3.50`).
 
 #### For Windows 2000 / XP (x86)
 
