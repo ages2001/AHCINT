@@ -1,5 +1,18 @@
 #include "ahcint.h"
 
+/* Forward declaration: AhciHandleRequestSense and AhciHandleModeSense
+   (below) need this synchronous admin-command helper, but it is
+   defined later in this file because it shares AhciBuildPrdt's and
+   AhciFastPollComplete's neighborhood. */
+static BOOLEAN
+AhciExecuteAdminCommandSync(
+    IN PHW_DEVICE_EXTENSION HwInit,
+    IN ULONG PortNumber,
+    IN PUCHAR Cdb12,
+    IN PVOID DataBuffer,
+    IN ULONG DataBufferLen
+);
+
 static VOID
 AhciExtractAtaString(
     IN PUSHORT IdentifyWords,
@@ -24,7 +37,7 @@ AhciExtractAtaString(
     while (outIndex > 0 && (OutBuffer[outIndex - 1] == ' ' || OutBuffer[outIndex - 1] == '\0')) {
         outIndex--;
     }
-    
+
     while (outIndex < OutBufferMax) {
         OutBuffer[outIndex++] = ' ';
     }
@@ -110,10 +123,48 @@ AhciHandleInquiry(
 
 static VOID
 AhciHandleRequestSense(
+    IN PHW_DEVICE_EXTENSION HwInit,
+    IN ULONG Port,
     IN PSCSI_REQUEST_BLOCK Srb
 )
 {
     PSENSE_DATA sense;
+
+    if (HwInit->Ports[Port].IsAtapi) {
+        UCHAR senseCdb[12];
+        UCHAR allocLen;
+        BOOLEAN ok;
+
+        allocLen = (UCHAR)Srb->DataTransferLength;
+        if (allocLen == 0 || allocLen > sizeof(SENSE_DATA)) {
+            allocLen = sizeof(SENSE_DATA);
+        }
+
+        ZeroMemoryBytes(senseCdb, sizeof(senseCdb));
+        senseCdb[0] = SCSIOP_REQUEST_SENSE;
+        senseCdb[4] = allocLen;
+
+        if (Srb->DataBuffer != NULL && Srb->DataTransferLength > 0) {
+            ZeroMemoryBytes(Srb->DataBuffer, Srb->DataTransferLength);
+        }
+
+        ok = AhciExecuteAdminCommandSync(HwInit, Port, senseCdb,
+                                          Srb->DataBuffer, Srb->DataTransferLength);
+
+        if (!ok && Srb->DataBuffer != NULL &&
+            Srb->DataTransferLength >= sizeof(SENSE_DATA)) {
+            /* The REQUEST SENSE itself failed -- nothing real to report,
+               so an honest, empty NO_SENSE reply is the correct answer,
+               not a fabricated specific error. */
+            sense = (PSENSE_DATA)Srb->DataBuffer;
+            ZeroMemoryBytes(sense, sizeof(SENSE_DATA));
+            sense->ErrorCode = 0x70;
+        }
+
+        Srb->SrbStatus = SRB_STATUS_SUCCESS;
+        Srb->ScsiStatus = SCSISTAT_GOOD;
+        return;
+    }
 
     sense = (PSENSE_DATA)Srb->DataBuffer;
     ZeroMemoryBytes(sense, Srb->DataTransferLength);
@@ -249,6 +300,65 @@ AhciBuildPrdt(
 /* FAST-POLL: no real IRQ (UseInterrupt == FALSE), so instead of the HAL's
    ~10ms RequestTimerCall we spin here inside StartIo, polling PxCI/PxIS/
    PxTFD every ~10us until the command completes or times out. */
+static VOID
+AhciFillAutoSenseFromTfd(
+    IN PSCSI_REQUEST_BLOCK Srb,
+    IN ULONG Tfd,
+    IN BOOLEAN IsAtapi
+)
+{
+    UCHAR errorByte;
+    UCHAR senseKey;
+    UCHAR addlCode;
+    PSENSE_DATA sense;
+
+    if (Srb->SenseInfoBuffer == NULL || Srb->SenseInfoBufferLength < sizeof(SENSE_DATA)) {
+        return;
+    }
+
+    errorByte = (UCHAR)((Tfd >> TFD_ERR_SHIFT) & 0xFF);
+
+    if (IsAtapi) {
+        senseKey = ATAPI_ERROR_SENSE_KEY(errorByte);
+
+        switch (senseKey) {
+        case SCSI_SENSE_NOT_READY:
+            addlCode = SCSI_ADSENSE_NO_MEDIA_IN_DEVICE;
+            break;
+        case SCSI_SENSE_UNIT_ATTENTION:
+            addlCode = SCSI_ADSENSE_MEDIUM_CHANGED;
+            break;
+        case SCSI_SENSE_NO_SENSE:
+            /* No real sense key reported -- nothing to add, leave the
+               SRB's existing bare CHECK_CONDITION alone rather than
+               fabricating a specific error that wasn't reported. */
+            return;
+        default:
+            addlCode = 0;
+            break;
+        }
+    } else {
+        if (errorByte & (IDE_ERROR_MEDIA_CHANGE | IDE_ERROR_MEDIA_CHANGE_REQ)) {
+            senseKey = SCSI_SENSE_UNIT_ATTENTION;
+            addlCode = SCSI_ADSENSE_MEDIUM_CHANGED;
+        } else {
+            return;
+        }
+    }
+
+    sense = (PSENSE_DATA)Srb->SenseInfoBuffer;
+    ZeroMemoryBytes(sense, sizeof(SENSE_DATA));
+    sense->ErrorCode = 0x70;
+    sense->Valid = 1;
+    sense->AdditionalSenseLength = 0x0B;
+    sense->SenseKey = senseKey;
+    sense->AdditionalSenseCode = addlCode;
+    sense->AdditionalSenseCodeQualifier = 0;
+
+    Srb->SrbStatus = (UCHAR)(SRB_STATUS_ERROR | SRB_STATUS_AUTOSENSE_VALID);
+    Srb->ScsiStatus = SCSISTAT_CHECK_CONDITION;
+}
+
 static BOOLEAN
 AhciFastPollComplete(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -297,7 +407,15 @@ AhciFastPollComplete(
     }
     AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << PortNumber));
 
+    /* Every command (ATA and ATAPI alike) is now dispatched via fast-poll
+       -- see the comment in AhciExecuteTransferEngineAsync. PxIE is never
+       turned on anywhere any more, exactly like the NT driver, so there
+       is nothing to restore here; this just keeps it explicitly at 0
+       rather than relying on it having already been 0 going in. */
+    AHCI_WRITE_REG(PortBase, AHCI_PORT_IE, 0);
+
     HwInit->ActiveBytes = 0;
+    HwInit->Ports[PortNumber].LastTfd = tfd;
 
     if (error) {
         Srb->SrbStatus = SRB_STATUS_ERROR;
@@ -305,6 +423,7 @@ AhciFastPollComplete(
         AhciStopPortEngines(HwInit, PortBase);
         AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
         AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
+        AhciFillAutoSenseFromTfd(Srb, tfd, HwInit->Ports[PortNumber].IsAtapi);
         AHCI_DBG_LOG("FastPoll: port %lu command error/timeout (TFD=0x%08X IS=0x%08X)", PortNumber, tfd, portIs);
     } else {
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
@@ -313,6 +432,118 @@ AhciFastPollComplete(
 
     /* FALSE = completed synchronously; AhciStartIo finishes the SRB. */
     return FALSE;
+}
+
+static BOOLEAN
+AhciExecuteAdminCommandSync(
+    IN PHW_DEVICE_EXTENSION HwInit,
+    IN ULONG PortNumber,
+    IN PUCHAR Cdb12,
+    IN PVOID DataBuffer,
+    IN ULONG DataBufferLen
+)
+{
+    PUCHAR portBase;
+    PAHCI_COMMAND_HEADER cmdHeader;
+    PFIS_REG_H2D fis;
+    PUCHAR acmd;
+    ULONG prdtEntries;
+    ATA_REQUEST tmpReq;
+    ULONG elapsedUsec;
+    ULONG ci, portIs, tfd;
+    BOOLEAN error;
+
+    portBase = AHCI_PORT_BASE(HwInit->AbarMapped, PortNumber);
+    cmdHeader = &HwInit->Ports[PortNumber].CommandList[0];
+    fis = (PFIS_REG_H2D)HwInit->Ports[PortNumber].CommandTable;
+    acmd = (PUCHAR)(HwInit->Ports[PortNumber].CommandTable + 0x40);
+    prdtEntries = 0;
+
+    if (DataBufferLen > 0) {
+        tmpReq.DataBuffer = DataBuffer;
+        tmpReq.DataBufferLen = DataBufferLen;
+        if (!AhciBuildPrdt(HwInit, PortNumber, &tmpReq, &prdtEntries)) {
+            return FALSE;
+        }
+    }
+
+    cmdHeader->Flags = 5 | (1 << 5);
+    cmdHeader->PrdtLength = (USHORT)prdtEntries;
+    cmdHeader->PrdByteCount = 0;
+    cmdHeader->CommandTableBase = HwInit->Ports[PortNumber].CommandTablePhysical;
+    cmdHeader->CommandTableBaseUpper = HwInit->Ports[PortNumber].CommandTablePhysicalUpper;
+
+    ZeroMemoryBytes(acmd, 16);
+    {
+        ULONG i;
+        for (i = 0; i < 12; i++) acmd[i] = Cdb12[i];
+    }
+
+    ZeroMemoryBytes(fis, sizeof(FIS_REG_H2D));
+    fis->FisType = 0x27;
+    fis->PmPortControl = 0x80;
+    fis->Command = IDE_COMMAND_PACKET;
+    fis->FeaturesLow = (DataBufferLen > 0) ? 0x01 : 0x00;
+    fis->Lba1 = (UCHAR)(DataBufferLen & 0xFF);
+    fis->Lba2 = (UCHAR)((DataBufferLen >> 8) & 0xFF);
+
+    /* Bump the command generation the instant this synchronous admin
+       command takes over the port -- see the CommandGeneration/
+       FallbackArmedGeneration comment in ahcint.h. */
+    HwInit->CommandGeneration++;
+
+    AHCI_WRITE_REG(portBase, AHCI_PORT_IS, 0xFFFFFFFF);
+    AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
+    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, 0);
+    AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << PortNumber));
+
+    AHCI_WRITE_REG(portBase, AHCI_PORT_CI, 1);
+
+    elapsedUsec = 0;
+    error = FALSE;
+    portIs = 0;
+
+    for (;;) {
+        ci = AHCI_READ_REG(portBase, AHCI_PORT_CI);
+        portIs = AHCI_READ_REG(portBase, AHCI_PORT_IS);
+        tfd = AHCI_READ_REG(portBase, AHCI_PORT_TFD);
+
+        if ((portIs & AHCI_PORT_IS_FATAL) || (tfd & TFD_STS_ERR)) {
+            error = TRUE;
+            break;
+        }
+        if (!(ci & 1)) break;
+        if (elapsedUsec >= AHCI_FAST_POLL_TIMEOUT_USEC) {
+            error = TRUE;
+            break;
+        }
+
+        ScsiPortStallExecution(AHCI_FAST_POLL_INTERVAL_USEC);
+        elapsedUsec += AHCI_FAST_POLL_INTERVAL_USEC;
+    }
+
+    if (portIs != 0) {
+        AHCI_WRITE_REG(portBase, AHCI_PORT_IS, portIs);
+    }
+    if (portIs & AHCI_PORT_IS_FATAL) {
+        AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
+    }
+    AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << PortNumber));
+
+    /* Every command in this driver is now fast-polled with PxIE off --
+       see the comment in AhciExecuteTransferEngineAsync -- so there is no
+       longer a different "normal" IE mask to restore here. */
+    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, 0);
+
+    HwInit->Ports[PortNumber].LastTfd = tfd;
+
+    if (error) {
+        AhciStopPortEngines(HwInit, portBase);
+        AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
+        AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static BOOLEAN
@@ -367,7 +598,7 @@ AhciExecuteTransferEngineAsync(
         fis->FisType = 0x27;
         fis->PmPortControl = 0x80;
         fis->Command = IDE_COMMAND_PACKET;
-        
+
         if (Req->DataBufferLen > 0 && !Req->ForcePio) {
             fis->FeaturesLow = 0x01;
             fis->Lba1 = 0;
@@ -431,10 +662,12 @@ AhciExecuteTransferEngineAsync(
         }
     }
 
+    /* Every command, ATA or ATAPI, is always fast-polled -- collapsed
+       to one completion path, matching the NT driver's model. PxIE
+       stays 0 for the port's entire lifetime. */
     AHCI_WRITE_REG(portBase, AHCI_PORT_IS, 0xFFFFFFFF);
     AHCI_WRITE_REG(portBase, AHCI_PORT_SERR, 0xFFFFFFFF);
-    /* No real IRQ: leave port IE off, FAST-POLL below handles completion. */
-    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, HwInit->UseInterrupt ? AHCI_PORT_IE_DEFAULT : 0);
+    AHCI_WRITE_REG(portBase, AHCI_PORT_IE, 0);
     AHCI_WRITE_REG(HwInit->AbarMapped, AHCI_GEN_IS, (1UL << portNumber));
 
     HwInit->ActivePort = portNumber;
@@ -442,20 +675,80 @@ AhciExecuteTransferEngineAsync(
 
     AHCI_WRITE_REG(portBase, AHCI_PORT_CI, 1);
 
-    if (!HwInit->UseInterrupt) {
-        /* No HAL-assigned IRQ (e.g. text-mode Setup): tight-poll here
-           instead of the ~10ms RequestTimerCall grid. */
-        if (HwInit->ActiveSrb == NULL) {
-            return FALSE;
-        }
-        return AhciFastPollComplete(HwInit, HwInit->ActiveSrb, portBase, portNumber);
+    /* Always fast-poll -- see the comment above. */
+    if (HwInit->ActiveSrb == NULL) {
+        return FALSE;
+    }
+    return AhciFastPollComplete(HwInit, HwInit->ActiveSrb, portBase, portNumber);
+}
+
+static VOID
+AhciSatlModeSenseAtapi(
+    IN PHW_DEVICE_EXTENSION HwInit,
+    IN ULONG Port,
+    IN PSCSI_REQUEST_BLOCK Srb
+)
+{
+    PCDB cdb;
+    UCHAR atapiCdb[12];
+    UCHAR scsiPageCode;
+    UCHAR scsiAllocLength;
+    BOOLEAN ok;
+
+    cdb = (PCDB)Srb->Cdb;
+    scsiPageCode = cdb->MODE_SENSE.PageCode & 0x3F;
+    scsiAllocLength = cdb->MODE_SENSE.AllocationLength;
+
+    /* Build the real ATAPI MODE SENSE(10) CDB (opcode 0x5A), matching
+       Scsi2Atapi() field-for-field: PageCode carried over as-is,
+       ParameterListLength = the SCSI-6 allocation length (Msb always 0 --
+       SCSI-6's AllocationLength is only one byte, so it can never need
+       the Msb byte). */
+    ZeroMemoryBytes(atapiCdb, sizeof(atapiCdb));
+    atapiCdb[0] = 0x5A;                  /* ATAPI_MODE_SENSE */
+    atapiCdb[2] = scsiPageCode;
+    atapiCdb[7] = 0;                     /* ParameterListLengthMsb */
+    atapiCdb[8] = scsiAllocLength;       /* ParameterListLengthLsb */
+
+    if (Srb->DataBuffer != NULL && Srb->DataTransferLength > 0) {
+        ZeroMemoryBytes(Srb->DataBuffer, Srb->DataTransferLength);
     }
 
-    /* Safety net: complete via polling if the IRQ never arrives. */
-    ScsiPortNotification(RequestTimerCall, HwInit, AhciFallbackTimer,
-                         AHCI_FALLBACK_TIMER_USEC);
+    ok = AhciExecuteAdminCommandSync(HwInit, Port, atapiCdb,
+                                      Srb->DataBuffer, Srb->DataTransferLength);
 
-    return TRUE;
+    if (ok && Srb->DataTransferLength >= sizeof(MODE_PARAMETER_HEADER_10)) {
+        PMODE_PARAMETER_HEADER_10 hdr10 = (PMODE_PARAMETER_HEADER_10)Srb->DataBuffer;
+        MODE_PARAMETER_HEADER hdr6;
+        ULONG payloadBytes;
+        ULONG i;
+
+        /* Squeeze the 8-byte ATAPI header down to SCSI's 4-byte header,
+           exactly as Microsoft's real reverse-conversion does:
+           ModeDataLength takes the Lsb (SCSI-6's length byte can't
+           represent anything the Msb would carry for the small CD mode
+           pages actually in use here), and the two SCSI-only fields ATAPI
+           has no equivalent for (DeviceSpecificParameter,
+           BlockDescriptorLength) come back zeroed rather than fabricated. */
+        hdr6.ModeDataLength = hdr10->ModeDataLengthLsb;
+        hdr6.MediumType = hdr10->MediumType;
+        hdr6.DeviceSpecificParameter = 0;
+        hdr6.BlockDescriptorLength = 0;
+
+        payloadBytes = Srb->DataTransferLength - sizeof(MODE_PARAMETER_HEADER_10);
+        if (payloadBytes > 0) {
+            PUCHAR dst = (PUCHAR)Srb->DataBuffer + sizeof(MODE_PARAMETER_HEADER);
+            PUCHAR src = (PUCHAR)Srb->DataBuffer + sizeof(MODE_PARAMETER_HEADER_10);
+            for (i = 0; i < payloadBytes; i++) {
+                dst[i] = src[i];
+            }
+        }
+
+        *(PMODE_PARAMETER_HEADER)Srb->DataBuffer = hdr6;
+    }
+
+    Srb->SrbStatus = ok ? SRB_STATUS_SUCCESS : SRB_STATUS_ERROR;
+    Srb->ScsiStatus = ok ? SCSISTAT_GOOD : SCSISTAT_CHECK_CONDITION;
 }
 
 BOOLEAN
@@ -492,17 +785,33 @@ AhciSatlProcessSrb(
         }
 
         if (cdb->CDB6GENERIC.OperationCode == SCSIOP_REQUEST_SENSE) {
-            AhciHandleRequestSense(Srb);
+            AhciHandleRequestSense(HwInit, port, Srb);
             return FALSE;
         }
 
         if (cdb->CDB6GENERIC.OperationCode == SCSIOP_TEST_UNIT_READY ||
-            cdb->CDB6GENERIC.OperationCode == SCSIOP_MEDIUM_REMOVAL ||
-            cdb->CDB6GENERIC.OperationCode == 0x1B ||
-            cdb->CDB6GENERIC.OperationCode == 0x46 ||
-            cdb->CDB6GENERIC.OperationCode == 0x4A ||
-            cdb->CDB6GENERIC.OperationCode == 0xA4 ||
-            cdb->CDB6GENERIC.OperationCode == SCSIOP_SYNCHRONIZE_CACHE) 
+            cdb->CDB6GENERIC.OperationCode == SCSIOP_MEDIUM_REMOVAL)
+        {
+            UCHAR tmpCdb[12];
+            BOOLEAN ok;
+            ULONG i;
+
+            ZeroMemoryBytes(tmpCdb, sizeof(tmpCdb));
+            for (i = 0; i < 6 && i < Srb->CdbLength; i++) {
+                tmpCdb[i] = Srb->Cdb[i];
+            }
+
+            ok = AhciExecuteAdminCommandSync(HwInit, port, tmpCdb, NULL, 0);
+            Srb->SrbStatus = ok ? SRB_STATUS_SUCCESS : SRB_STATUS_ERROR;
+            Srb->ScsiStatus = ok ? SCSISTAT_GOOD : SCSISTAT_CHECK_CONDITION;
+
+            if (!ok) {
+                AhciFillAutoSenseFromTfd(Srb, HwInit->Ports[port].LastTfd, TRUE);
+            }
+            return FALSE;
+        }
+
+        if (cdb->CDB6GENERIC.OperationCode == SCSIOP_SYNCHRONIZE_CACHE)
         {
             Srb->SrbStatus = SRB_STATUS_SUCCESS;
             Srb->ScsiStatus = SCSISTAT_GOOD;
@@ -510,9 +819,9 @@ AhciSatlProcessSrb(
         }
 
         if (cdb->CDB6GENERIC.OperationCode == SCSIOP_MODE_SENSE ||
-            cdb->CDB6GENERIC.OperationCode == 0x5A) 
+            cdb->CDB6GENERIC.OperationCode == 0x5A)
         {
-            AhciHandleModeSense(HwInit, Srb);
+            AhciSatlModeSenseAtapi(HwInit, port, Srb);
             return FALSE;
         }
 
@@ -532,7 +841,7 @@ AhciSatlProcessSrb(
         return FALSE;
 
     case SCSIOP_REQUEST_SENSE:
-        AhciHandleRequestSense(Srb);
+        AhciHandleRequestSense(HwInit, port, Srb);
         return FALSE;
 
     case SCSIOP_TEST_UNIT_READY:
@@ -551,13 +860,13 @@ AhciSatlProcessSrb(
         if (tot > 0) tot--;
         tot32 = (tot > 0xFFFFFFFF) ? 0xFFFFFFFF : (ULONG)tot;
 
-        cap->LogicalBlockAddress = 
+        cap->LogicalBlockAddress =
             ((tot32 & 0xFF000000) >> 24) |
             ((tot32 & 0x00FF0000) >> 8)  |
             ((tot32 & 0x0000FF00) << 8)  |
             ((tot32 & 0x000000FF) << 24);
 
-        cap->BytesPerBlock = 
+        cap->BytesPerBlock =
             ((sectorSize & 0xFF000000) >> 24) |
             ((sectorSize & 0x00FF0000) >> 8)  |
             ((sectorSize & 0x0000FF00) << 8)  |

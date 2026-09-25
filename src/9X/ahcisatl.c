@@ -1,4 +1,19 @@
-#include "ahcint.h"
+#include "ahcint9x.h"
+
+/* Confirmed against the real Windows 95 DDK's SCSI.H (Copyright 1993-95
+   Microsoft Corporation): SCSIOP_SYNCHRONIZE_CACHE is not defined there
+   (SCSI.H only goes up to SCSIOP_VERIFY = 0x2F and a handful of higher
+   opcodes; SYNCHRONIZE CACHE(10) = 0x35 is simply missing). Every other
+   SCSIOP_ / CDB / INQUIRYDATA / READ_CAPACITY_DATA symbol this file uses
+   was verified present and byte-layout-compatible in that header. Kept
+   here (Win95-only need) even though the rest of this file below is now
+   restored to match src/NT's ahci_satl.c verbatim, per the driver
+   author's own request -- NT4 already has this symbol defined natively,
+   so this #ifndef guard is a no-op there and only takes effect on the
+   Win95 build. */
+#ifndef SCSIOP_SYNCHRONIZE_CACHE
+#define SCSIOP_SYNCHRONIZE_CACHE   0x35
+#endif
 
 static VOID
 AhciExtractAtaString(
@@ -22,7 +37,7 @@ AhciExtractAtaString(
     while (outIndex > 0 && (OutBuffer[outIndex - 1] == ' ' || OutBuffer[outIndex - 1] == '\0')) {
         outIndex--;
     }
-    
+
     while (outIndex < OutBufferMax) {
         OutBuffer[outIndex++] = ' ';
     }
@@ -289,32 +304,6 @@ AhciExecuteTransferEngine(
 
     AHCI_WRITE_REG(portBase, AHCI_PORT_CI, 1);
 
-    /* BUG FOUND AND FIXED (two issues, same block): (1) the uncapped
-       5000-iteration busy-wait that used to run here first, with no
-       ScsiPortStallExecution at all, pinned the CPU at 100% in ring 0 on
-       every single I/O before ever reaching the stalled loop below --
-       this driver runs fully synchronously inside HwStartIo (no
-       HwInterrupt-driven completion for a data transfer's own wait), so
-       that phase added nothing but CPU-hogging risk; removed outright.
-       (2) The remaining wait loop only checked PxCI for completion. Per
-       the AHCI 1.3 spec, when a device returns an ATA/ATAPI error, the
-       HBA sets PxIS.TFES (Task File Error Status, bit 30) and typically
-       does NOT clear PxCI -- a failed command needs explicit software
-       recovery (the stop/restart block below) before the port accepts
-       the next one. With only PxCI in the wait condition, this loop
-       never noticed the error had already happened and burned the FULL
-       waitLimit (100000 x 20us = ~2 seconds for ATAPI) every time,
-       instead of recognizing the error the instant the drive reported
-       it. Confirmed via real hardware trace on the Win95 build of this
-       same driver: with no CD present, every ATAPI command (TEST_UNIT_
-       READY, REQUEST_SENSE, retries) burned the full ~2-second timeout
-       back to back -- a real, repeating multi-second stall with no disc
-       in the drive. Real fix: also break out as soon as PxIS shows
-       TFES/FATAL, since that means the HBA has already told us the
-       command is done (with an error) -- there is nothing left to wait
-       for. This turns a guaranteed ~2-second stall into a near-instant
-       NOT_READY response for the empty-tray case, while still fully
-       waiting out real in-flight transfers that haven't failed. */
     waitLimit = Req->IsAtapi ? 100000 : 25000;
     for (;;) {
         ULONG ci = AHCI_READ_REG(portBase, AHCI_PORT_CI);
@@ -323,6 +312,17 @@ AhciExecuteTransferEngine(
         if (isNow & AHCI_PORT_IS_FATAL) break;
         if (--waitLimit == 0) break;
         ScsiPortStallExecution(20);
+    }
+
+    /* Diagnostic only (temporary, kept from the trace that found the bug
+       above): if this still prints after the TFES-aware wait fix, the
+       full timeout is being hit for some OTHER reason than a reported
+       task-file error (e.g. a genuinely wedged port), which would need
+       separate investigation. Expected now: this should no longer print
+       for the plain "no disc in drive" case. Safe to remove once
+       confirmed quiet on real hardware. */
+    if (Req->IsAtapi && waitLimit == 0) {
+        AHCI_TRACE("ATAPI cmd: TIMED OUT (no TFES, CI never cleared)");
     }
 
     portIs = AHCI_READ_REG(portBase, AHCI_PORT_IS);
@@ -340,7 +340,13 @@ AhciExecuteTransferEngine(
             AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
             AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, AHCI_READ_REG(portBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
         }
+
         if (HwInit->ActiveSrb) {
+            ULONG portNum2 = HwInit->ActiveSrb->TargetId;
+            if (portNum2 < MAX_AHCI_PORTS) {
+                HwInit->Ports[portNum2].LastAtaError = (UCHAR)((tfd >> 8) & 0xFF);
+                HwInit->Ports[portNum2].LastErrorPending = TRUE;
+            }
             HwInit->ActiveSrb->SrbStatus = SRB_STATUS_ERROR;
             HwInit->ActiveSrb->ScsiStatus = SCSISTAT_CHECK_CONDITION;
         }
@@ -383,18 +389,6 @@ AhciSatlProcessSrb(
         AhciHandleInquiry(HwInit, Srb);
         return FALSE;
 
-    /* BUG FOUND AND FIXED: REQUEST_SENSE was not handled anywhere in
-       this file -- it fell into the default case and got forwarded to
-       the ATAPI drive as a raw CDB, and nothing ever set
-       Srb->SenseInfoBuffer. Combined with AutoRequestSense being
-       (wrongly) TRUE in ahci_main.c, the CD-ROM class driver's normal
-       CHECK_CONDITION -> REQUEST_SENSE flow had no real sense data
-       available under any circumstance -- a real cause of media-change
-       and error-recovery conditions never being reported correctly.
-       Real fix: issue one real ATAPI REQUEST SENSE(6) PACKET command to
-       the drive (opcode 0x03, valid and identical in both SCSI and
-       ATAPI -- no translation needed here, unlike MODE_SENSE) and
-       return the drive's own real SENSE_DATA verbatim. */
     case SCSIOP_REQUEST_SENSE:
         if (HwInit->Ports[port].IsAtapi) {
             UCHAR senseCdb[12];
@@ -403,11 +397,6 @@ AhciSatlProcessSrb(
             UCHAR savedCdb[16];
             UCHAR savedCdbLength;
 
-            /* Save/restore the entire original Cdb[16]/CdbLength, not
-               just Cdb[0] -- ScsiPort can reexamine an SRB's Cdb/
-               CdbLength after the miniport returns (retries, logging,
-               bookkeeping), so leaving CdbLength in its translated
-               state here would corrupt the SRB for whatever runs next. */
             ZeroMemoryBytes(savedCdb, sizeof(savedCdb));
             for (i = 0; i < 16; i++) {
                 savedCdb[i] = Srb->Cdb[i];
@@ -439,19 +428,26 @@ AhciSatlProcessSrb(
             AhciExecuteTransferEngine(HwInit, &ataReq);
 
             /* A REQUEST SENSE that itself fails leaves nothing real to
-               report -- an honest, empty NO SENSE reply (ErrorCode 0x70,
-               everything else zero) is the correct answer here, not a
-               fabricated specific error. */
+               report -- fabricating NO SENSE here would hide the real
+               condition, so this is the one place a clean, zeroed
+               SENSE_DATA (ErrorCode 0x70, SenseKey NO_SENSE, everything
+               else zero) really is the honest answer: "sense data was
+               requested but the drive gave us nothing usable." */
             if (Srb->SrbStatus != SRB_STATUS_SUCCESS &&
                 senseOut != NULL && Srb->DataTransferLength >= sizeof(SENSE_DATA)) {
                 ZeroMemoryBytes(senseOut, sizeof(SENSE_DATA));
                 senseOut->ErrorCode = 0x70;
             }
 
+            /* Restore the SRB's CDB exactly as ScsiPort gave it to us --
+               see the bug note above. This must happen for every return
+               path, success or failure. */
             for (i = 0; i < 16; i++) {
                 Srb->Cdb[i] = savedCdb[i];
             }
             Srb->CdbLength = savedCdbLength;
+
+            HwInit->Ports[port].LastErrorPending = FALSE;
 
             Srb->SrbStatus = SRB_STATUS_SUCCESS;
             Srb->ScsiStatus = SCSISTAT_GOOD;
@@ -459,8 +455,9 @@ AhciSatlProcessSrb(
         }
 
         /* ATA disks: nothing this driver does ever fails in a way that
-           produces real, meaningful sense data, so an honest, empty NO
-           SENSE response is the correct answer here. */
+           produces real, meaningful sense data (see SYNCHRONIZE_CACHE/
+           VERIFY below), so an honest, empty NO SENSE response -- not a
+           fabricated specific error -- is the correct real answer here. */
         if (Srb->DataTransferLength >= sizeof(SENSE_DATA)) {
             PSENSE_DATA senseOut = (PSENSE_DATA)Srb->DataBuffer;
             ZeroMemoryBytes(senseOut, sizeof(SENSE_DATA));
@@ -470,24 +467,29 @@ AhciSatlProcessSrb(
         Srb->ScsiStatus = SCSISTAT_GOOD;
         return FALSE;
 
-    /* BUG FOUND AND FIXED: TEST_UNIT_READY and MEDIUM_REMOVAL used to be
-       hardcoded to SRB_STATUS_SUCCESS/SCSISTAT_GOOD unconditionally for
-       EVERY device, with no real hardware check at all. For a fixed ATA
-       hard disk this is a reasonable shortcut, but for an ATAPI device
-       (CD-ROM) it's wrong: TEST_UNIT_READY is exactly the command a real
-       CD-ROM uses to report tray-open/no-media/media-changed, and always
-       answering "ready" regardless of actual media state means the
-       CD-ROM class driver can never learn the real media state. Real
-       fix: for ATAPI, pass TEST_UNIT_READY/MEDIUM_REMOVAL straight
-       through to the real drive as an actual ATAPI PACKET command
-       (SCSI TEST_UNIT_READY/START_STOP_UNIT opcodes are valid, real MMC
-       ATAPI packet-command opcodes too -- no translation needed), and
-       let the drive's own real TFD/status response decide SrbStatus/
-       ScsiStatus. SYNCHRONIZE_CACHE/VERIFY stay a real no-op: this
-       driver's transfer engine is fully synchronous with no write-back
-       cache of its own to flush, and VERIFY without BYTCHK has no real
-       hardware equivalent to check against, so "already true" is the
-       real answer for both ATA and ATAPI. */
+    /* Win95-specific fix (kept): TEST_UNIT_READY and MEDIUM_REMOVAL used
+       to be hardcoded to SRB_STATUS_SUCCESS/SCSISTAT_GOOD unconditionally
+       for EVERY device, with no real hardware check at all -- a fake/
+       placeholder answer. For a fixed ATA hard disk this is a reasonable
+       shortcut (a disk that AhciInitializePort already found present is,
+       definitionally, always "ready"), but for an ATAPI device (CD-ROM)
+       it's wrong: TEST_UNIT_READY is exactly the command a real CD-ROM
+       uses to report tray-open/no-media/media-changed, and always
+       answering "ready" regardless of actual media state is what let
+       Windows' CD Player applet believe a disc was always present and
+       kept it re-polling. Real fix: for ATAPI, pass TEST_UNIT_READY/
+       MEDIUM_REMOVAL straight through to the real drive as an actual
+       ATAPI PACKET command via AhciExecuteTransferEngine (SCSI
+       TEST_UNIT_READY/START_STOP_UNIT opcodes are valid, real MMC ATAPI
+       packet-command opcodes too -- HwInit->ActiveSrb->Cdb is copied
+       byte-for-byte into the ATAPI ACMD field there, so no translation
+       is needed), and let the drive's own real TFD/status response (not
+       a hardcoded value) decide SrbStatus/ScsiStatus.
+       SYNCHRONIZE_CACHE/VERIFY stay a real no-op: this driver's transfer
+       engine is fully synchronous with no write-back cache of its own to
+       flush, and VERIFY without BYTCHK has no real hardware equivalent
+       to check against, so "already true" is the real answer, not a
+       fake one, for both ATA and ATAPI. */
     case SCSIOP_SYNCHRONIZE_CACHE:
     case SCSIOP_VERIFY:
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
@@ -523,13 +525,13 @@ AhciSatlProcessSrb(
 
             if (tot > 0) tot--;
 
-            cap->LogicalBlockAddress = 
+            cap->LogicalBlockAddress =
                 ((tot & 0xFF000000) >> 24) |
                 ((tot & 0x00FF0000) >> 8)  |
                 ((tot & 0x0000FF00) << 8)  |
                 ((tot & 0x000000FF) << 24);
 
-            cap->BytesPerBlock = 
+            cap->BytesPerBlock =
                 ((sectorSize & 0xFF000000) >> 24) |
                 ((sectorSize & 0x00FF0000) >> 8)  |
                 ((sectorSize & 0x0000FF00) << 8)  |
@@ -540,33 +542,6 @@ AhciSatlProcessSrb(
             return FALSE;
         }
 
-    /* BUG FOUND AND FIXED: MODE_SENSE used to go to AhciHandleModeSense
-       unconditionally for every device, ATAPI included, which always
-       fabricates a Rigid Disk Geometry page (page 0x04) from CHS
-       numbers -- meaningful for a real ATA hard disk, but never a real
-       answer for an ATAPI CD-ROM, which has no cylinder/head/sector
-       geometry and never returns page 0x04 in real life. Worse: SCSI
-       and ATAPI do NOT share one MODE SENSE command format. Confirmed
-       against Microsoft's own real, shipped NT4 ATAPI miniport
-       (private/ntos/miniport/atapi/atapi.c, function Scsi2Atapi()): a
-       real ATAPI device expects MODE SENSE as opcode 0x5A
-       (ATAPI_MODE_SENSE) with a 10-byte/12-byte CDB and a 10-byte
-       parameter header on the way back (MODE_PARAMETER_HEADER_10:
-       ModeDataLengthMsb/Lsb, MediumType, Reserved[5]) -- not SCSI's
-       6-byte opcode 0x1A CDB with a 4-byte parameter header
-       (MODE_PARAMETER_HEADER) that ScsiPort/the OS above us sends and
-       expects. This is a real, verified contributing cause of CD-ROM
-       media being misidentified, since Windows never got the real
-       medium-type/CD-specific mode data back from the actual drive.
-       Real fix, matching Microsoft's own Scsi2Atapi() exactly: translate
-       the incoming SCSI-6 MODE_SENSE CDB into the real ATAPI 10-byte/
-       0x5A form before sending it to the drive, then translate the
-       10-byte parameter header that comes back into the 6-byte SCSI
-       form the caller actually expects, sliding the real mode-page
-       payload down to sit right after the now-shorter header.
-       AhciHandleModeSense's fabricated CHS-geometry answer is kept for
-       ATA, since that data really does come from the disk's own
-       IDENTIFY DEVICE response. */
     case SCSIOP_MODE_SENSE:
         if (HwInit->Ports[port].IsAtapi) {
             UCHAR atapiCdb[12];
@@ -576,9 +551,6 @@ AhciSatlProcessSrb(
             UCHAR savedCdb[16];
             UCHAR savedCdbLength;
 
-            /* Save/restore the entire original Cdb[16]/CdbLength, not
-               just Cdb[0] -- see the same note in the REQUEST_SENSE
-               case above; the reasoning is identical here. */
             ZeroMemoryBytes(savedCdb, sizeof(savedCdb));
             for (i = 0; i < 16; i++) {
                 savedCdb[i] = Srb->Cdb[i];
@@ -594,10 +566,10 @@ AhciSatlProcessSrb(
                length (Msb always 0 -- SCSI-6's AllocationLength is only
                one byte, so it can never need the Msb byte). */
             ZeroMemoryBytes(atapiCdb, sizeof(atapiCdb));
-            atapiCdb[0] = 0x5A;                  /* ATAPI_MODE_SENSE */
+            atapiCdb[0] = 0x5A;                 /* ATAPI_MODE_SENSE */
             atapiCdb[2] = scsiPageCode;
-            atapiCdb[7] = 0;                     /* ParameterListLengthMsb */
-            atapiCdb[8] = scsiAllocLength;        /* ParameterListLengthLsb */
+            atapiCdb[7] = 0;                    /* ParameterListLengthMsb */
+            atapiCdb[8] = scsiAllocLength;       /* ParameterListLengthLsb */
 
             ZeroMemoryBytes(Srb->Cdb, 16);
             for (i = 0; i < 12; i++) {
@@ -615,6 +587,11 @@ AhciSatlProcessSrb(
             ataReq.IsWrite = FALSE;
             ok = AhciExecuteTransferEngine(HwInit, &ataReq);
 
+            /* Restore the SRB's CDB exactly as ScsiPort gave it to us --
+               see the bug note above. This must happen for every return
+               path, success or failure, and before any of the header
+               conversion below (which only touches Srb->DataBuffer, not
+               Srb->Cdb, but is kept after this for clarity). */
             for (i = 0; i < 16; i++) {
                 Srb->Cdb[i] = savedCdb[i];
             }
@@ -628,8 +605,10 @@ AhciSatlProcessSrb(
 
                 /* Squeeze the 8-byte ATAPI header down to SCSI's 4-byte
                    header, exactly as Microsoft's real reverse-conversion
-                   does: ModeDataLength takes the Lsb, and the two
-                   SCSI-only fields ATAPI has no equivalent for
+                   does: ModeDataLength takes the Lsb (SCSI-6's length
+                   byte can't represent anything the Msb would carry for
+                   the small CD mode pages actually in use here), and the
+                   two SCSI-only fields ATAPI has no equivalent for
                    (DeviceSpecificParameter, BlockDescriptorLength) come
                    back zeroed rather than fabricated. */
                 hdr6.ModeDataLength = hdr10->ModeDataLengthLsb;

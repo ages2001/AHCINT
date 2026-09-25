@@ -1,5 +1,7 @@
-#ifndef _AHCINT_H_
-#define _AHCINT_H_
+/* ahcint9x - Windows 95 SCSI miniport target */
+
+#ifndef _ahcint9x_H_
+#define _ahcint9x_H_
 
 #include <miniport.h>
 #include <scsi.h>
@@ -64,8 +66,78 @@
 #define PCI_PROGIF_AHCI             0x01
 
 ULONG __cdecl DbgPrint(PCH Format, ...);
-#define AHCI_DBG_MSG(msg) DbgPrint("[AHCINT] " msg "\n")
+#define AHCI_DBG_MSG(msg) DbgPrint("[ahcint9x] " msg "\n")
 #define AHCI_DBG_LOG      DbgPrint
+
+/*
+ * Raw COM1 (16550 UART) debug checkpoint logger.
+ *
+ * DbgPrint (above) needs a kernel debugger attached over serial to show
+ * anything on real/VirtualBox Windows 95 -- with no debugger attached
+ * it goes nowhere, which is why every fix so far has effectively been
+ * a blind guess: there has been no way to see where the driver
+ * actually gets to before the hang. This writes single bytes directly
+ * to the COM1 UART's transmit register (I/O port 0x3F8) using plain
+ * "out dx,al" -- no VxD call, no DDK function, nothing that depends on
+ * an interrupt controller, an OS subsystem, or anything else that
+ * could itself be broken. It works as long as COM1 exists as a real
+ * (possibly emulated) 16550-compatible UART, which VirtualBox provides
+ * once its "Serial Ports" setting for COM1 is enabled and redirected
+ * to a host file (VBoxManage modifyvm <vm> --uart1 on 0x3F8 4
+ * --uartmode1 file <path-on-host>, VM powered off first). Every
+ * AHCI_TRACE() call below appends one line to that host file, live, as
+ * the driver runs -- including the moment right before whatever hangs.
+ */
+#define COM1_PORT       0x3F8
+#define COM1_LSR        (COM1_PORT + 5)   /* Line Status Register */
+#define COM1_LSR_THRE   0x20              /* Transmit Holding Register Empty */
+
+static __inline UCHAR AhciInPortB(USHORT port) {
+    UCHAR value;
+    __asm {
+        mov dx, port
+        in  al, dx
+        mov value, al
+    }
+    return value;
+}
+
+static __inline void AhciOutPortB(USHORT port, UCHAR value) {
+    __asm {
+        mov dx, port
+        mov al, value
+        out dx, al
+    }
+}
+
+static __inline void AhciTraceChar(UCHAR ch) {
+    ULONG spin;
+    /* Bounded wait for THRE so this can never itself hang if the UART
+       is missing/unresponsive -- worst case this becomes a harmless
+       no-op, it never blocks driver execution. */
+    spin = 100000;
+    while (!(AhciInPortB(COM1_LSR) & COM1_LSR_THRE) && --spin) { }
+    AhciOutPortB(COM1_PORT, ch);
+}
+
+static __inline void AhciTrace(PCH msg) {
+    while (*msg) {
+        if (*msg == '\n') AhciTraceChar('\r');
+        AhciTraceChar((UCHAR)*msg);
+        msg++;
+    }
+}
+
+#define AHCI_TRACE(msg) AhciTrace("[ahcint9x] " msg "\n")
+
+/* Win95 KB Q169584 workaround: _MapPhysToLinear VxD service call.
+   See ahcimain.c for the implementation and full explanation. */
+#define MPL_NonCached                0x00000000
+#define MPL_HardwareCoherentCached   0x00000001
+#define MPL_FrameBufferCached        0x00000002
+#define MPL_Cached                   0x00000004
+
+PVOID __cdecl _MapPhysToLinear(ULONG PhysAddr, ULONG nBytes, ULONG flags);
 
 #define MAX_PRDT_ENTRIES            32
 
@@ -115,15 +187,15 @@ typedef struct _AHCI_DMA_RESOURCES {
 
 /* Real ATAPI MODE SENSE(10) parameter header, confirmed against
    Microsoft's own real, shipped NT4 ATAPI miniport source
-   (private/ntos/miniport/atapi/atapi.c / atapi.h) -- NOT the same as
-   this DDK's own SCSI.H MODE_PARAMETER_HEADER, which is the 4-byte
-   SCSI-6 form (ModeDataLength, MediumType, DeviceSpecificParameter,
+   (private/ntos/miniport/atapi/atapi.c / atapi.h) -- NOT present in this
+   DDK's own SCSI.H, which only has the 4-byte SCSI-6 MODE_PARAMETER_HEADER
+   (ModeDataLength, MediumType, DeviceSpecificParameter,
    BlockDescriptorLength). All-UCHAR, so no packing pragma is needed:
-   natural alignment already matches the on-the-wire byte layout. Used
-   by ahci_satl.c's AhciSatlProcessSrb to convert a real ATAPI drive's
-   MODE SENSE(10) response back into the SCSI-6 MODE_PARAMETER_HEADER
-   format ScsiPort/the CD-ROM class driver above us actually expects,
-   the same way Microsoft's own driver's reverse-conversion code does. */
+   natural alignment already matches the on-the-wire byte layout. Used by
+   ahcisatl.c's AhciSatlProcessSrb to convert a real ATAPI drive's MODE
+   SENSE(10) response back into the SCSI-6 MODE_PARAMETER_HEADER format
+   ScsiPort/the CD-ROM class driver above us actually expects, the same
+   way Microsoft's own driver's reverse-conversion code does. */
 typedef struct _MODE_PARAMETER_HEADER_10 {
     UCHAR ModeDataLengthMsb;
     UCHAR ModeDataLengthLsb;
@@ -162,6 +234,20 @@ typedef struct _AHCI_PORT_INFO {
     PUCHAR                  IdentifyDmaBuffer;
     ULONG                   IdentifyDmaPhysical;
     ULONG                   IdentifyDmaPhysicalUpper;
+
+    /* Real ATA/ATAPI Error register (Task File Data, bits 8-15) latched
+       from the last failing command on this port, plus whether it's
+       actually new/unreported yet. This is what real REQUEST_SENSE
+       support is built on: the AHCI TFD register's error byte IS the
+       same real IDE_ERROR_* byte a native IDE controller would expose
+       (MEDIA_CHANGE, MEDIA_CHANGE_REQUESTED, END_OF_MEDIA, ABRT, etc,
+       per the ATA/ATAPI-4+ spec), we were just reading it and throwing
+       it away. Latching it here lets AhciSatlProcessSrb's REQUEST_SENSE
+       handler and its auto-sense-on-error path turn it into a real
+       SCSI SENSE_DATA response instead of never reporting media changes
+       to the CD-ROM class driver at all. */
+    UCHAR                   LastAtaError;
+    BOOLEAN                 LastErrorPending;
 } AHCI_PORT_INFO, *PAHCI_PORT_INFO;
 
 typedef struct _HW_DEVICE_EXTENSION {

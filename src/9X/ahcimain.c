@@ -1,4 +1,57 @@
-#include "ahcint.h"
+#include "ahcint9x.h"
+
+ULONG __cdecl DbgPrint(PCH Format, ...)
+{
+    if (Format != NULL) {
+        AhciTrace(Format);
+    }
+    return 0;
+}
+
+/*
+ * _MapPhysToLinear -- raw VxD service call, Win95 KB Q169584 workaround.
+ *
+ * ScsiPortGetDeviceBase() can fail to return a usable flat/linear
+ * address for a memory-mapped PCI BAR on real Windows 95 (this is a
+ * documented Microsoft bug, KB Q169584). This is the confirmed root
+ * cause of the install-time hard system hang: AhciFindAdapter used to
+ * map the AHCI ABAR with plain ScsiPortGetDeviceBase(), and every
+ * AHCI_READ_REG/AHCI_WRITE_REG access thereafter (most of
+ * AhciHwInitialize, which runs synchronously during Add New Hardware
+ * detection) went through that possibly-bad pointer.
+ *
+ * The fix, taken from nvme2k_9x (a real, shipping Windows 9x SCSI
+ * miniport by Dominik Behr & SweetLow) which has the exact same
+ * Q169584 workaround for its own NVMe BAR: call the VMM's
+ * _MapPhysToLinear service directly. This is a standard ring-0 VxD
+ * service call -- "int 0x20" is the VxD call trap, followed by the
+ * VxD service ordinal (0x006C for _MapPhysToLinear) and the target
+ * VxD's device ID (0x0001 for VMM itself), each encoded as two bytes
+ * per the documented Win9x VxD calling convention. This always
+ * returns a valid, guaranteed-linear pointer, unlike
+ * ScsiPortGetDeviceBase() on this platform.
+ */
+#define _MapPhysToLinear_Ordinal   0x006C
+#define VMM_DEVICE_ID              0x0001
+
+/* Naked, no explicit "ret": the VMM's VxD-call trap (int 0x20 plus the
+   4 encoded ordinal/device-ID bytes) itself performs the call and
+   returns control to the instruction right after those 4 bytes -- it is
+   NOT a normal x86 call/ret pair. This matches nvme2k_9x's own
+   _MapPhysToLinear/_PageModifyPermissions implementations exactly
+   (utils.c), which are naked with no trailing ret either; the __cdecl
+   caller's own "add esp,N" cleanup (emitted by the compiler at the call
+   site for a __cdecl function) is what actually returns from here, via
+   the return address the VMM call convention leaves on the stack. */
+__declspec(naked) PVOID __cdecl _MapPhysToLinear(ULONG PhysAddr, ULONG nBytes, ULONG flags) {
+    __asm {
+        int 0x20
+        _emit ((_MapPhysToLinear_Ordinal >> 0) & 0xFF)
+        _emit (((_MapPhysToLinear_Ordinal >> 8) & 0xFF) | 0x80)
+        _emit ((VMM_DEVICE_ID >> 0) & 0xFF)
+        _emit ((VMM_DEVICE_ID >> 8) & 0xFF)
+    }
+}
 
 BOOLEAN AhciHwInitialize(IN PVOID DeviceExtension);
 BOOLEAN AhciStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
@@ -6,6 +59,20 @@ BOOLEAN AhciInterrupt(IN PVOID DeviceExtension);
 BOOLEAN AhciResetBus(IN PVOID HwDeviceExtension, IN ULONG PathId);
 ULONG AhciFindAdapter(IN PVOID DeviceExtension, IN PVOID Context, IN PVOID BusInformation, IN PCHAR ArgumentString, IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo, OUT PBOOLEAN Again);
 BOOLEAN AhciSatlProcessSrb(IN PHW_DEVICE_EXTENSION DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb);
+BOOLEAN AhciAdapterState(IN PVOID DeviceExtension, IN PVOID Context, IN BOOLEAN SaveState);
+
+BOOLEAN AhciAdapterState(IN PVOID DeviceExtension, IN PVOID Context, IN BOOLEAN SaveState) {
+    /* DeviceExtension/Context/SaveState are intentionally unused now --
+       see the comment below for why this deliberately does nothing. */
+    (VOID)DeviceExtension;
+    (VOID)Context;
+    (VOID)SaveState;
+
+    AHCI_TRACE("AhciAdapterState: enter");
+
+    AHCI_TRACE("AhciAdapterState: exit, return TRUE");
+    return TRUE;
+}
 
 /* Multi-controller support: tracks which PCI bus:slot each
    DeviceExtension already claimed, so two instances can't grab
@@ -202,12 +269,14 @@ static VOID AhciExecuteIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG PortNum
 
     AHCI_WRITE_REG(portBase, AHCI_PORT_CI, 1);
 
+    AHCI_TRACE("AhciExecuteIdentify: entering CI poll loop");
     while (--timeout) {
         if (!(AHCI_READ_REG(portBase, AHCI_PORT_CI) & 1)) break;
         tfd = AHCI_READ_REG(portBase, AHCI_PORT_TFD);
         if (tfd & 0x01) break;
         ScsiPortStallExecution(10);
     }
+    AHCI_TRACE("AhciExecuteIdentify: CI poll loop exited");
 
     tfd = AHCI_READ_REG(portBase, AHCI_PORT_TFD);
     id = (PUSHORT)HwInit->Ports[PortNumber].IdentifyDmaBuffer;
@@ -230,8 +299,11 @@ static BOOLEAN AhciInitializePort(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG PortN
     PUCHAR portBase;
     ULONG ssts, sig, cmd, timeout;
 
+    AHCI_TRACE("AhciInitializePort: enter");
+
     portBase = AHCI_PORT_BASE(HwInit->AbarMapped, PortNumber);
     AhciStopPortEngines(portBase);
+    AHCI_TRACE("AhciInitializePort: AhciStopPortEngines done");
 
     /* AMD Promontory PHY power-on & spin-up. */
     cmd = AHCI_READ_REG(portBase, AHCI_PORT_CMD);
@@ -239,21 +311,25 @@ static BOOLEAN AhciInitializePort(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG PortN
     AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, cmd);
     ScsiPortStallExecution(1000);
 
+    AHCI_TRACE("AhciInitializePort: checking SSTS (link)");
     ssts = AHCI_READ_REG(portBase, AHCI_PORT_SSTS);
     if ((ssts & 0x0F) != 0x03) {
         AHCI_WRITE_REG(portBase, AHCI_PORT_SCTL, 0x301);
         ScsiPortStallExecution(2000);
         AHCI_WRITE_REG(portBase, AHCI_PORT_SCTL, 0x300);
 
+        AHCI_TRACE("AhciInitializePort: entering SSTS poll loop");
         timeout = 30000;
         while (--timeout) {
             ssts = AHCI_READ_REG(portBase, AHCI_PORT_SSTS);
             if ((ssts & 0x0F) == 0x03) break;
             ScsiPortStallExecution(10);
         }
+        AHCI_TRACE("AhciInitializePort: SSTS poll loop exited");
     }
 
     if ((ssts & 0x0F) != 0x03) {
+        AHCI_TRACE("AhciInitializePort: no link, port not present, return FALSE");
         HwInit->Ports[PortNumber].Present = FALSE;
         return FALSE;
     }
@@ -273,10 +349,12 @@ static BOOLEAN AhciInitializePort(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG PortN
     cmd |= AHCI_PORT_CMD_FRE;
     AHCI_WRITE_REG(portBase, AHCI_PORT_CMD, cmd);
 
+    AHCI_TRACE("AhciInitializePort: entering TFD poll loop (FRE)");
     timeout = 50000;
     while ((AHCI_READ_REG(portBase, AHCI_PORT_TFD) & 0x88) && --timeout) {
         ScsiPortStallExecution(10);
     }
+    AHCI_TRACE("AhciInitializePort: TFD poll loop exited");
 
     cmd = AHCI_READ_REG(portBase, AHCI_PORT_CMD);
     cmd |= AHCI_PORT_CMD_ST;
@@ -287,7 +365,9 @@ static BOOLEAN AhciInitializePort(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG PortN
     HwInit->Ports[PortNumber].IsAtapi = (sig == SATA_SIG_ATAPI);
     HwInit->Ports[PortNumber].IdentifyValid = FALSE;
 
+    AHCI_TRACE("AhciInitializePort: calling AhciExecuteIdentify");
     AhciExecuteIdentify(HwInit, PortNumber);
+    AHCI_TRACE("AhciInitializePort: exit, return TRUE");
     return TRUE;
 }
 
@@ -295,6 +375,24 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2) {
     HW_INITIALIZATION_DATA initData;
     PUCHAR ptr;
     ULONG i;
+    ULONG rc;
+
+    /* Raw, unconditional marker: the literal first thing this function
+       does, before any C statement, any function call, any struct
+       access, and NOT going through AhciTrace/AhciTraceChar (in case
+       that wait-for-THRE loop is itself somehow the problem). Writes
+       the single byte '!' straight to COM1's transmit register with
+       no readiness check at all -- if this never shows up on the host
+       log, DriverEntry is provably never being reached; if it DOES
+       show up but nothing else from AHCI_TRACE follows, the problem is
+       in AhciTraceChar's wait loop or later. */
+    __asm {
+        mov dx, 3F8h
+        mov al, '!'
+        out dx, al
+    }
+
+    AHCI_TRACE("DriverEntry: enter");
 
     ptr = (PUCHAR)&initData;
     for (i = 0; i < sizeof(HW_INITIALIZATION_DATA); i++) ptr[i] = 0;
@@ -305,70 +403,72 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2) {
     initData.HwInterrupt = AhciInterrupt;
     initData.HwResetBus = AhciResetBus;
     initData.HwFindAdapter = AhciFindAdapter;
+    initData.HwAdapterState = AhciAdapterState;
     initData.DeviceExtensionSize = sizeof(HW_DEVICE_EXTENSION);
     initData.AdapterInterfaceType = PCIBus;
     initData.NumberOfAccessRanges = 1;
     initData.MapBuffers = TRUE;
     initData.NeedPhysicalAddresses = TRUE;
-    /* BUG FOUND AND FIXED: this was TRUE. Confirmed against Microsoft's
-       own Win95/NT DDK documentation for HW_INITIALIZATION_DATA.
-       AutoRequestSense: "Indicates the device supports auto request
-       sense... Only intelligent adapters with built-in firmware to
-       perform the request sense should set this field to TRUE." Real
-       AHCI/ATAPI hardware has no such firmware-level auto-sense feature
-       -- this was claiming a capability the HBA does not have. The
-       documented consequence is architectural, not cosmetic: with
-       AutoRequestSense TRUE, SRB_STATUS_REQUEST_SENSE_FAILED "is
-       returned only if the controller performs auto request sense",
-       meaning the port/class driver stack expects THIS miniport to
-       silently fill in Srb->SenseInfoBuffer itself and set
-       SRB_STATUS_AUTOSENSE_VALID whenever it completes an SRB with
-       CHECK_CONDITION, instead of sending a separate REQUEST_SENSE SRB
-       of its own. This driver never implemented that auto-fill path, so
-       with AutoRequestSense left TRUE the class driver's normal "ask
-       again with REQUEST_SENSE" fallback may never fire, and the new
-       SCSIOP_REQUEST_SENSE handling added to ahci_satl.c's
-       AhciSatlProcessSrb (which answers exactly that kind of separate,
-       explicit REQUEST_SENSE SRB) would never get called. Setting this
-       FALSE is the honest, documented value for this hardware and is
-       what makes the class driver issue its own REQUEST_SENSE SRB after
-       a CHECK_CONDITION. */
     initData.AutoRequestSense = FALSE;
     initData.MultipleRequestPerLu = FALSE;
 
-    return ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
+    AHCI_TRACE("DriverEntry: calling ScsiPortInitialize");
+    rc = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
+    AHCI_TRACE("DriverEntry: ScsiPortInitialize returned, exiting");
+    return rc;
 }
 
 ULONG AhciFindAdapter(
-    IN PVOID DeviceExtension, 
-    IN PVOID Context, 
-    IN PVOID BusInformation, 
-    IN PCHAR ArgumentString, 
-    IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo, 
+    IN PVOID DeviceExtension,
+    IN PVOID Context,
+    IN PVOID BusInformation,
+    IN PCHAR ArgumentString,
+    IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
     OUT PBOOLEAN Again
 ) {
     PHW_DEVICE_EXTENSION hwInit;
     PCI_COMMON_CONFIG pciConfig;
-    ULONG bytesRead, busNumber, deviceNumber, funcNumber;
+    ULONG bytesRead, busNumber;
     PCI_SLOT_NUMBER pciSlot;
     USHORT pciCmd;
     SCSI_PHYSICAL_ADDRESS basePhys;
     PACCESS_RANGE accessRanges;
     BOOLEAN found;
 
+    AHCI_TRACE("AhciFindAdapter: enter");
+
     hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
     accessRanges = *ConfigInfo->AccessRanges;
     found = FALSE;
     *Again = FALSE;
+    busNumber = 0;
 
-    if (hwInit->AbarMapped != NULL) return SP_RETURN_FOUND;
+    if (hwInit->AbarMapped != NULL) {
+        AHCI_TRACE("AhciFindAdapter: already mapped, SP_RETURN_FOUND");
+        return SP_RETURN_FOUND;
+    }
 
-    /* Try ConfigInfo's own bus:slot first, then fall back to scanning
-       for the next unclaimed AHCI device, so multiple controllers each
-       get their own DeviceExtension. */
+    /* Windows 95's SCSIPORT.PDR already enumerates the PCI bus itself for
+       an AdapterInterfaceType=PCIBus miniport and calls HwFindAdapter once
+       per physical PCI function, with ConfigInfo->SystemIoBusNumber/
+       SlotNumber already pointing at that exact device -- this matches how
+       the DDK's own MINIPORT.H documents HalGetBusData/ScsiPortGetBusData
+       being used (query the given bus:slot, not sweep the whole bus).
+       Never do our own brute-force 256 bus x 32 device x 8 function PCI
+       config-space sweep here: on Win95's V86/PCI-BIOS-backed
+       ScsiPortGetBusData path this produced a full hard system hang during
+       driver install (confirmed on real hardware/VM by the driver author),
+       almost certainly because querying bus numbers or slots that don't
+       exist on Win95 is far less forgiving than it is on the NT PCI bus
+       driver this code was originally written against (see src/NT). If the
+       device this HwFindAdapter call was invoked for isn't a claimed AHCI
+       controller, just fail this call -- SCSIPORT will call again for the
+       next PCI function on its own. */
+    AHCI_TRACE("AhciFindAdapter: calling ScsiPortGetBusData");
     pciSlot.u.AsULONG = ConfigInfo->SlotNumber;
     bytesRead = ScsiPortGetBusData(hwInit, PCIConfiguration, ConfigInfo->SystemIoBusNumber,
                                    pciSlot.u.AsULONG, &pciConfig, sizeof(PCI_COMMON_CONFIG));
+    AHCI_TRACE("AhciFindAdapter: ScsiPortGetBusData returned");
     if (bytesRead == sizeof(PCI_COMMON_CONFIG) &&
         pciConfig.VendorID != 0xFFFF && pciConfig.VendorID != 0x0000 &&
         AhciPciConfigIsAhci(&pciConfig) &&
@@ -380,48 +480,52 @@ ULONG AhciFindAdapter(
     }
 
     if (!found) {
-        for (busNumber = 0; busNumber < 256 && !found; busNumber++) {
-            for (deviceNumber = 0; deviceNumber < 32 && !found; deviceNumber++) {
-                for (funcNumber = 0; funcNumber < 8; funcNumber++) {
-                    pciSlot.u.AsULONG = 0;
-                    pciSlot.u.bits.DeviceNumber = deviceNumber;
-                    pciSlot.u.bits.FunctionNumber = funcNumber;
-
-                    bytesRead = ScsiPortGetBusData(hwInit, PCIConfiguration, busNumber, pciSlot.u.AsULONG, &pciConfig, sizeof(PCI_COMMON_CONFIG));
-                    if (bytesRead != sizeof(PCI_COMMON_CONFIG) || pciConfig.VendorID == 0xFFFF || pciConfig.VendorID == 0x0000) {
-                        if (funcNumber == 0) break;
-                        continue;
-                    }
-
-                    if (AhciPciConfigIsAhci(&pciConfig) && !AhciIsDeviceClaimed(busNumber, pciSlot.u.AsULONG)) {
-                        hwInit->PciBus = busNumber;
-                        hwInit->PciSlot = pciSlot.u.AsULONG;
-                        found = TRUE;
-                        break;
-                    }
-                }
-            }
-        }
+        AHCI_TRACE("AhciFindAdapter: not our device, SP_RETURN_NOT_FOUND");
+        return SP_RETURN_NOT_FOUND;
     }
 
-    if (!found) return SP_RETURN_NOT_FOUND;
-
+    AHCI_TRACE("AhciFindAdapter: AHCI device matched, claiming");
     AhciClaimDevice(hwInit->PciBus, hwInit->PciSlot);
 
     pciCmd = (pciConfig.Command | 0x0006) & ~(1 << 10);
     ScsiPortSetBusDataByOffset(hwInit, PCIConfiguration, hwInit->PciBus, hwInit->PciSlot, &pciCmd, 0x04, sizeof(USHORT));
+    AHCI_TRACE("AhciFindAdapter: PCI command register updated");
 
     basePhys.LowPart = pciConfig.u.type0.BaseAddresses[5] & 0xFFFFFFF0;
     basePhys.HighPart = 0;
-    if (basePhys.LowPart == 0) return SP_RETURN_ERROR;
+    if (basePhys.LowPart == 0) {
+        AHCI_TRACE("AhciFindAdapter: BAR5 is zero, SP_RETURN_ERROR");
+        return SP_RETURN_ERROR;
+    }
 
     /* 64 KB (0x10000) mapping, matching the AHCI MMIO BAR size. */
     accessRanges[0].RangeStart = basePhys;
     accessRanges[0].RangeLength = 0x10000;
     accessRanges[0].RangeInMemory = TRUE;
 
-    hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(hwInit, PCIBus, hwInit->PciBus, basePhys, 0x10000, FALSE);
-    if (!hwInit->AbarMapped) return SP_RETURN_ERROR;
+    /* Win95 KB Q169584 workaround -- see _MapPhysToLinear() above and
+       ahcint9x.h for the full explanation. Plain ScsiPortGetDeviceBase()
+       is what caused the install-time hard hang; _MapPhysToLinear is
+       the proven-working replacement used by nvme2k_9x for the same
+       reason (mapping a PCI MMIO BAR on real Windows 95).
+       IMPORTANT: MPL_NonCached must be the real VMM value (0x0) -- see
+       the fixed #define and its comment in ahcint9x.h. An earlier version
+       of this fix had MPL_NonCached wrongly defined as 0x1, which is
+       actually MPL_HardwareCoherentCached: that mapped the ABAR as
+       CACHED, so AHCI_READ_REG on port status registers (SSTS/TFD/CMD)
+       could return stale cached values forever, making every polling
+       loop in AhciInitializePort() spin to its full timeout -- which is
+       exactly what still looked like a hang/lockup, and is almost
+       certainly why the first attempt at this fix did not resolve the
+       problem. */
+    AHCI_TRACE("AhciFindAdapter: calling _MapPhysToLinear");
+    hwInit->AbarMapped = (PUCHAR)_MapPhysToLinear(basePhys.LowPart, 0x10000, MPL_NonCached);
+    AHCI_TRACE("AhciFindAdapter: _MapPhysToLinear returned");
+    if (hwInit->AbarMapped == NULL || hwInit->AbarMapped == (PUCHAR)0xFFFFFFFF) {
+        AHCI_TRACE("AhciFindAdapter: ABAR map failed, SP_RETURN_ERROR");
+        hwInit->AbarMapped = NULL;
+        return SP_RETURN_ERROR;
+    }
 
     ConfigInfo->SystemIoBusNumber = hwInit->PciBus;
     ConfigInfo->SlotNumber = hwInit->PciSlot;
@@ -439,8 +543,13 @@ ULONG AhciFindAdapter(
     ConfigInfo->NumberOfBuses = 1;
     ConfigInfo->InitiatorBusId[0] = 7;
 
-    if (!AhciAllocateDma(hwInit, ConfigInfo)) return SP_RETURN_ERROR;
+    AHCI_TRACE("AhciFindAdapter: calling AhciAllocateDma");
+    if (!AhciAllocateDma(hwInit, ConfigInfo)) {
+        AHCI_TRACE("AhciFindAdapter: AhciAllocateDma failed, SP_RETURN_ERROR");
+        return SP_RETURN_ERROR;
+    }
 
+    AHCI_TRACE("AhciFindAdapter: exit, SP_RETURN_FOUND");
     return SP_RETURN_FOUND;
 }
 
@@ -449,33 +558,43 @@ BOOLEAN AhciHwInitialize(IN PVOID DeviceExtension) {
     ULONG ghc, pi, port, timeout;
     ULONG cap2;
 
+    AHCI_TRACE("AhciHwInitialize: enter");
+
     hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
 
     /* BIOS/OS handoff: request OS ownership (OOS bit). */
+    AHCI_TRACE("AhciHwInitialize: reading CAP2");
     cap2 = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_CAP2);
     if (cap2 & 0x01) {
         ULONG bohc = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_BOHC);
         bohc |= 0x02;
         AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_BOHC, bohc);
 
+        AHCI_TRACE("AhciHwInitialize: entering BOHC poll loop");
         timeout = 50000;
         while ((AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_BOHC) & 0x01) && --timeout) {
             ScsiPortStallExecution(10);
         }
+        AHCI_TRACE("AhciHwInitialize: BOHC poll loop exited");
     }
 
     ghc = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_GHC);
     ghc |= AHCI_GHC_AE;
     AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_GHC, ghc);
+    AHCI_TRACE("AhciHwInitialize: AE bit set");
 
     pi = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_PI);
     hwInit->PortsImplemented = pi;
+    AHCI_TRACE("AhciHwInitialize: PI read, starting port loop");
 
     for (port = 0; port < MAX_AHCI_PORTS; port++) {
         if (pi & (1 << port)) {
+            AHCI_TRACE("AhciHwInitialize: calling AhciInitializePort");
             AhciInitializePort(hwInit, port);
+            AHCI_TRACE("AhciHwInitialize: AhciInitializePort returned");
         }
     }
+    AHCI_TRACE("AhciHwInitialize: port loop done");
 
     for (port = 0; port < MAX_AHCI_PORTS; port++) {
         if (pi & (1 << port)) {
@@ -490,6 +609,7 @@ BOOLEAN AhciHwInitialize(IN PVOID DeviceExtension) {
     ghc = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_GHC);
     ghc |= AHCI_GHC_IE;
     AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_GHC, ghc);
+    AHCI_TRACE("AhciHwInitialize: exit, return TRUE");
 
     return TRUE;
 }

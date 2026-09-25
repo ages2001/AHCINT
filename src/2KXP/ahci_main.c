@@ -343,18 +343,18 @@ ULONG DriverEntry(IN PVOID DriverObject, IN PVOID Argument2) {
     initData.NumberOfAccessRanges = 1;
     initData.MapBuffers = TRUE;
     initData.NeedPhysicalAddresses = TRUE;
-    initData.AutoRequestSense = TRUE;
+    initData.AutoRequestSense = FALSE;
     initData.MultipleRequestPerLu = FALSE;
 
     return ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
 }
 
 ULONG AhciFindAdapter(
-    IN PVOID DeviceExtension, 
-    IN PVOID Context, 
-    IN PVOID BusInformation, 
-    IN PCHAR ArgumentString, 
-    IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo, 
+    IN PVOID DeviceExtension,
+    IN PVOID Context,
+    IN PVOID BusInformation,
+    IN PCHAR ArgumentString,
+    IN OUT PPORT_CONFIGURATION_INFORMATION ConfigInfo,
     OUT PBOOLEAN Again
 ) {
     PHW_DEVICE_EXTENSION hwInit;
@@ -450,21 +450,21 @@ ULONG AhciFindAdapter(
     ScsiPortSetBusDataByOffset(hwInit, PCIConfiguration, targetBus, targetSlot, &pciCmd, 0x04, sizeof(USHORT));
 
     hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(
-        hwInit, 
-        ConfigInfo->AdapterInterfaceType, 
-        targetBus, 
-        basePhys, 
-        0x10000, 
+        hwInit,
+        ConfigInfo->AdapterInterfaceType,
+        targetBus,
+        basePhys,
+        0x10000,
         FALSE
     );
 
     if (!hwInit->AbarMapped) {
         hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(
-            hwInit, 
-            PCIBus, 
-            targetBus, 
-            basePhys, 
-            0x10000, 
+            hwInit,
+            PCIBus,
+            targetBus,
+            basePhys,
+            0x10000,
             FALSE
         );
     }
@@ -696,6 +696,8 @@ VOID AhciFallbackTimer(IN PVOID DeviceExtension) {
     hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
     if (hwInit == NULL || hwInit->AbarMapped == NULL) return;
     if (hwInit->ActiveSrb == NULL) return;
+
+    if (hwInit->FallbackArmedGeneration != hwInit->CommandGeneration) return;
 
     p = hwInit->ActivePort;
     if (p >= MAX_SUPPORTED_PORTS) return;

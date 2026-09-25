@@ -85,6 +85,22 @@
 #define TFD_STS_ERR                     0x01
 #define TFD_STS_DF                      0x20
 
+/* PxTFD bits 15:8 mirror the real ATA/ATAPI Error register whenever
+   PxTFD.STS.ERR (bit 0) is set -- AHCI 1.3 spec, PxTFD layout. */
+#define TFD_ERR_SHIFT                   8
+
+/* Plain ATA (hard disk) Error register bit flags -- independent bits,
+   used only when the target is NOT an ATAPI device. */
+#define IDE_ERROR_MEDIA_CHANGE          0x20
+#define IDE_ERROR_MEDIA_CHANGE_REQ      0x08
+
+/* ATAPI Error register: the high nibble (>> 4) is the real SCSI sense
+   key, not a bitmask -- matches SCSI_SENSE_* in scsi.h (NO_SENSE=0x00,
+   RECOVERED_ERROR=0x01, NOT_READY=0x02, MEDIUM_ERROR=0x03,
+   HARDWARE_ERROR=0x04, ILLEGAL_REQUEST=0x05, UNIT_ATTENTION=0x06,
+   DATA_PROTECT=0x07, BLANK_CHECK=0x08, ABORTED_COMMAND=0x0B). */
+#define ATAPI_ERROR_SENSE_KEY(errByte)  (((errByte) >> 4) & 0x0F)
+
 #define SATA_SIG_ATA                    0x00000101
 #define SATA_SIG_ATAPI                  0xEB140101
 
@@ -147,6 +163,24 @@ typedef struct _FIS_REG_H2D {
 
 #pragma pack(pop)
 
+/* Real ATAPI MODE SENSE(10) parameter header, confirmed against
+   Microsoft's own real, shipped NT4 ATAPI miniport source
+   (private/ntos/miniport/atapi/atapi.c / atapi.h) -- NOT the same as
+   this DDK's own SCSI.H MODE_PARAMETER_HEADER, which is the 4-byte
+   SCSI-6 form (ModeDataLength, MediumType, DeviceSpecificParameter,
+   BlockDescriptorLength). All-UCHAR, so no packing pragma is needed:
+   natural alignment already matches the on-the-wire byte layout. Used
+   by ahci_satl.c's AhciSatlProcessSrb to convert a real ATAPI drive's
+   MODE SENSE(10) response back into the SCSI-6 MODE_PARAMETER_HEADER
+   format ScsiPort/the CD-ROM class driver above us actually expects,
+   the same way Microsoft's own driver's reverse-conversion code does. */
+typedef struct _MODE_PARAMETER_HEADER_10 {
+    UCHAR ModeDataLengthMsb;
+    UCHAR ModeDataLengthLsb;
+    UCHAR MediumType;
+    UCHAR Reserved[5];
+} MODE_PARAMETER_HEADER_10, *PMODE_PARAMETER_HEADER_10;
+
 typedef struct _AHCI_DMA_RESOURCES {
     UCHAR RawBuffer[65536];
 } AHCI_DMA_RESOURCES, *PAHCI_DMA_RESOURCES;
@@ -156,6 +190,11 @@ typedef struct _AHCI_PORT_INFO {
     BOOLEAN                 IsAtapi;
     BOOLEAN                 IdentifyValid;
     UCHAR                   IdentifyData[512];
+
+    /* Raw PxTFD value from the last completed command on this port; used
+       by AhciFillAutoSenseFromTfd in ahci_satl.c to fill real sense data
+       into an SRB the instant a command fails. */
+    ULONG                    LastTfd;
 
     PAHCI_COMMAND_HEADER    CommandList;
     ULONG                   CommandListPhysical;
@@ -189,6 +228,13 @@ typedef struct _HW_DEVICE_EXTENSION {
     BOOLEAN                 UseInterrupt;
     ULONG                   ActivePort;
     ULONG                   ActiveBytes;
+
+    /* Generation counter: bumped on every new command dispatch (async or
+       synchronous admin path). AhciFallbackTimer captures the generation
+       it was armed for and no-ops if a newer command has since started,
+       so a stale fallback callback can never grab an unrelated SRB. */
+    ULONG                   CommandGeneration;
+    ULONG                   FallbackArmedGeneration;
 
     PAHCI_DMA_RESOURCES     DmaArea;
     SCSI_PHYSICAL_ADDRESS   DmaAreaPhysical;

@@ -1,0 +1,10 @@
+-machine:i386
+-align:0x200
+-subsystem:native,4.00
+-debug:partial
+-base:0x10000
+-entry:DriverEntry
+-out:ahcint9x.mpd
+-map:ahcint9x.map
+-export:DriverEntry
+ahcimain.obj ahcisatl.obj C:\DDK\BLOCK\LIB\scsiport.lib
