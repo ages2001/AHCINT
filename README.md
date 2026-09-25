@@ -26,7 +26,7 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
   - IDENTIFY DEVICE / IDENTIFY PACKET DEVICE based device enumeration, with cached string extraction for INQUIRY vendor/product fields
 
 - **Multi-target support**
-  - Windows 95 / 98 / Me (x86) — `SCSIPORT.PDR` miniport (`ahcint.mpd`), synchronous polling-based I/O
+  - Windows 95 / 98 / Me (x86) — `SCSIPORT.PDR` miniport (`ahcint9x.mpd`), synchronous polling-based I/O
   - Windows NT 3.50 / 3.51 / NT 4.0 (x86) — synchronous polling-based I/O
   - Windows 2000 / XP / Server 2003 (x86) and Windows XP x64 Edition / Server 2003 x64 (amd64) — built from a single source tree, synchronous Fast Polling I/O
 
@@ -41,7 +41,7 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
                ↓                                       ↓
           SCSIPORT.PDR                            ScsiPort.sys
                ↓                                       ↓
-    ahcint.mpd  ← This driver              ahcint.sys  ← This driver
+  ahcint9x.mpd ← This driver               ahcint.sys  ← This driver
                ↓                                       ↓
                └─── AHCI Controller (PCI, 01-06-01) ───┘
                                    ↓
@@ -52,10 +52,10 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
 
 - **ahci_main.c** (`ahcimain.c` on 9X) – Driver entry, adapter/port initialization, `HwStartIo`, `HwInterrupt`, `HwResetBus`, DMA resource allocation (plus `HwAdapterState` and the `_MapPhysToLinear` ABAR mapping on 9X)
 - **ahci_satl.c** (`ahcisatl.c` on 9X) – SCSI command dispatch, SCSI↔ATA/ATAPI translation, INQUIRY/MODE SENSE synthesis, PRDT construction
-- **ahcint.h** – AHCI register layout, command/FIS structures, device extension, shared constants
-- **build.bat** / **makefile** / **ahcint.lnk** – Windows 9x/Me build script, NMAKE makefile (includes the DDK's `MASTER.MK`) and linker response file
+- **ahcint.h** (`ahcint9x.h` on 9X) – AHCI register layout, command/FIS structures, device extension, shared constants
+- **build.bat** / **makefile** / **ahcint9x.lnk** – Windows 9x/Me build script, NMAKE makefile (includes the DDK's `MASTER.MK`) and linker response file
 - **sources** / **makefile** / **ahcint.rc** – DDK `build` utility files for the 2000/XP and XP x64 targets
-- **ahcint.inf** / **oemsetup.inf** – Installation files (see [Installation](#installation))
+- **ahcint.inf** / **oemsetup.inf** / **ahcint9x.inf** – Installation files (see [Installation](#installation))
 
 Source folders: `src\9X` (Windows 95/98/Me), `src\NT` (NT 3.50/3.51/4.0), `src\2KXP` (2000/XP/Server 2003, both x86 and amd64).
 
@@ -64,7 +64,7 @@ Source folders: `src\9X` (Windows 95/98/Me), `src\NT` (NT 3.50/3.51/4.0), `src\2
 | | 95/98/Me (x86) | NT 3.50/3.51/4.0 (x86) | 2000/XP/2003 (x86) and XP x64/2003 x64 (amd64) |
 |---|---|---|---|
 | Source folder | `src\9X` | `src\NT` | `src\2KXP` |
-| Driver binary | `ahcint.mpd` (`SCSIPORT.PDR` miniport) | `ahcint.sys` | `ahcint.sys` |
+| Driver binary | `ahcint9x.mpd` (`SCSIPORT.PDR` miniport) | `ahcint.sys` | `ahcint.sys` |
 | I/O model | Synchronous — `HwStartIo` polls `PxCI`/`PxIS` every 20 µs (~0.5 s ATA / ~2 s ATAPI timeout) | Synchronous — same polling model as 9X | Synchronous Fast Polling — `HwStartIo` polls `PxCI`/`PxIS`/`PxTFD` every 10 µs (3 s timeout) |
 | Interrupt usage | None — `PxIE` kept at 0, completion by polling | None — `PxIE` kept at 0, completion by polling | None in practice — `HwInterrupt` is registered (legacy INTx), but `PxIE` is cleared before every command |
 | Max AHCI ports | 8 | 8 | 8 |
@@ -83,7 +83,7 @@ Source folders: `src\9X` (Windows 95/98/Me), `src\NT` (NT 3.50/3.51/4.0), `src\2
 | PRDT entries per command | 32 | 32 | 32 |
 | DMA arena size | 64 KB (shared across ports) | 64 KB (shared across ports) | 64 KB (shared across ports) |
 | Max transfer size per I/O | ~128 KB | ~128 KB | ~128 KB |
-| Debug output | Raw COM1 UART (`0x3F8`) | `DbgPrint` | `DbgPrint` |
+| Debug output | Raw COM1 UART (`0x3F8`), prefix `[ahcint9x]` | `DbgPrint`, prefix `[AHCINT]` | `DbgPrint`, prefix `[AHCINT]` |
 
 ## Known Limitations
 
@@ -116,15 +116,15 @@ Source folders: `src\9X` (Windows 95/98/Me), `src\NT` (NT 3.50/3.51/4.0), `src\2
 
 #### For Windows 95 / 98 / Me (x86)
 
-`build.bat` expects the driver source in `C:\AHCINT` (it runs `cd \ahcint`), and `ahcint.lnk` links against `C:\DDK\BLOCK\LIB\scsiport.lib`. If your tools live elsewhere, edit the `SET` lines at the top of `build.bat` (`MASM_ROOT`, `C16_ROOT`, `C32_ROOT`, `SDKROOT`, `DDKROOT`) and the library path in `ahcint.lnk`.
+`build.bat` expects the driver source in `C:\AHCINT9X` (it runs `cd \ahcint9x`), and `ahcint9x.lnk` links against `C:\DDK\BLOCK\LIB\scsiport.lib`. If your tools live elsewhere, edit the `SET` lines at the top of `build.bat` (`MASM_ROOT`, `C16_ROOT`, `C32_ROOT`, `SDKROOT`, `DDKROOT`) and the library path in `ahcint9x.lnk`.
 
 ```bat
-REM Copy the 9X sources to C:\AHCINT
-mkdir C:\AHCINT
-copy <path-to-AHCINT>\src\9X\*.* C:\AHCINT
+REM Copy the 9X sources to C:\AHCINT9X
+mkdir C:\AHCINT9X
+copy <path-to-AHCINT>\src\9X\*.* C:\AHCINT9X
 
 C:
-cd \AHCINT
+cd \AHCINT9X
 
 REM Optional: debug build (-DDEBLEVEL=1 -DDEBUG)
 REM set DEBUG=1
@@ -133,9 +133,9 @@ REM Build
 build.bat
 ```
 
-`build.bat` sets `MASTER_MAKE=1` and the tool roots, puts MASM 6.11 and Visual C++ 2.0 on `PATH`, creates `TMP`/`TEMP` (default `C:\WINDOWS\TEMP`) if they are missing, warns if any expected tool is not found, and then runs `nmake`. The makefile pulls in the DDK's `MASTER.MK` (`BUILD_BITS=32`, `BUILD_TYPE=block`), compiles `ahcimain.c` and `ahcisatl.c`, and links them with `ahcint.lnk`.
+`build.bat` sets `MASTER_MAKE=1` and the tool roots, puts MASM 6.11 and Visual C++ 2.0 on `PATH`, creates `TMP`/`TEMP` (default `C:\WINDOWS\TEMP`) if they are missing, warns if any expected tool is not found, and then runs `nmake`. The makefile pulls in the DDK's `MASTER.MK` (`BUILD_BITS=32`, `BUILD_TYPE=block`), compiles `ahcimain.c` and `ahcisatl.c`, and links them with `ahcint9x.lnk`.
 
-Output: `C:\AHCINT\ahcint.mpd` (plus `ahcint.map`). Run `nmake clean` to remove build output.
+Output: `C:\AHCINT9X\ahcint9x.mpd` (plus `ahcint9x.map`). Run `nmake clean` to remove build output.
 
 #### For NT 3.50 / 3.51 / NT 4.0 (x86)
 
@@ -207,7 +207,7 @@ AHCINT\
 
 Windows NT 3.50/3.51/4.0 uses its own OEM Setup layout instead (`oemsetup.inf` + `txtsetup.oem` + `ahcint.sys`, see `bin\NT\floppy\`).
 
-Windows 95/98/Me uses its own `.inf` + `ahcint.mpd` pair, see `bin\9X\`.
+Windows 95/98/Me uses its own `ahcint9x.inf` + `ahcint9x.mpd` pair, see `bin\9X\`.
 
 ### Installing
 
@@ -216,8 +216,8 @@ Windows 95/98/Me uses its own `.inf` + `ahcint.mpd` pair, see `bin\9X\`.
 Windows 9x/Me setup itself runs through the BIOS (INT 13h), so there is no F6-style driver step — install AHCINT once Windows is up:
 
 1. Open **Control Panel → Add New Hardware**, let the wizard continue, and choose to select the hardware from a list.
-2. Pick **SCSI controllers**, click **Have Disk**, and point it at `bin\9X\`.
-3. Select **AHCINT SATA AHCI Storage Controller** and reboot. The miniport is installed as `ahcint.mpd` in `WINDOWS\SYSTEM\IOSUBSYS`.
+2. Pick **SCSI controllers**, click **Have Disk**, and point it at `bin\9X\` (`ahcint9x.inf`).
+3. Select **AHCINT SATA AHCI Storage Controller** and reboot. The miniport is installed as `ahcint9x.mpd` in `WINDOWS\SYSTEM\IOSUBSYS`.
 
 If the protected-mode driver fails to load, Windows 9x falls back to MS-DOS compatibility mode for the affected disks (check **Device Manager → Performance** and `BOOTLOG.TXT`).
 
@@ -237,10 +237,6 @@ Copy the contents of the corresponding `bin\<target>\floppy\` folder onto a flop
 
 NT uses the older OEM Setup mechanism (`oemsetup.inf`) rather than a standard `.inf`/`.cat` pair. Use **"Have Disk"** during setup (GUI-mode) or the equivalent F6 OEM prompt (text-mode) and point it at `bin\NT\floppy\`, which contains `oemsetup.inf`, `txtsetup.oem`, and `ahcint.sys`.
 
-#### Windows 95/98/Me
-
-Use `bin\9X\ahcint9x.inf` with **"Have Disk"** during a manual driver install, or place the matching `.sys`/`.inf` pair where Plug and Play can find them.
-
 ## Configuration
 
 Registry values set at install time on the NT family (see `ahcint.inf` / `txtsetup.oem` `[Config.*]` sections):
@@ -255,7 +251,7 @@ On Windows 9x/Me the driver is registered by its `.inf` as a `SCSIPORT.PDR` mini
 
 The NT, 2000/XP and x64 variants log via `DbgPrint`/`AHCI_DBG_MSG`/`AHCI_DBG_LOG`, visible through a kernel debugger (e.g. WinDbg / i386kd, depending on target OS) or `DebugView` once a debugger port is attached. Debug output is prefixed `[AHCINT]`.
 
-The 9X variant writes its `AHCI_TRACE` checkpoints straight to the COM1 UART (I/O port `0x3F8`), with no debugger needed. Redirect the VM's COM1 to a file (e.g. QEMU `-serial file:com1.log`, or VirtualBox `--uart1 0x3F8 4 --uartmode1 file <path>`) to capture them. `DbgPrint` on 9X also goes out over COM1, but prints the literal format string (no `%` substitution, since no CRT is linked).
+The 9X variant writes its `AHCI_TRACE` checkpoints (prefixed `[ahcint9x]`) straight to the COM1 UART (I/O port `0x3F8`), with no debugger needed. Redirect the VM's COM1 to a file (e.g. QEMU `-serial file:com1.log`, or VirtualBox `--uart1 0x3F8 4 --uartmode1 file <path>`) to capture them. `DbgPrint` on 9X also goes out over COM1, but prints the literal format string (no `%` substitution, since no CRT is linked).
 
 ## Technical Notes
 
