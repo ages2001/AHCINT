@@ -55,7 +55,7 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
 - **ahcint.h** (`ahcint9x.h` on 9X) – AHCI register layout, command/FIS structures, device extension, shared constants
 - **build.bat** / **makefile** / **ahcint9x.lnk** – Windows 9x/Me build script, NMAKE makefile (includes the DDK's `MASTER.MK`) and linker response file
 - **sources** / **makefile** / **ahcint.rc** – DDK `build` utility files for the 2000/XP and XP x64 targets
-- **ahcint.inf** / **oemsetup.inf** / **ahcint9x.inf** – Installation files (see [Installation](#installation))
+- **ahcint.inf** / **txtsetup.oem** / **oemsetup.inf** / **AHCINT9X.INF** – Installation files (in `bin\`) (see [Installation](#installation))
 
 Source folders: `src\9X` (Windows 95/98/Me), `src\NT` (NT 3.50/3.51/4.0), `src\2KXP` (2000/XP/Server 2003, both x86 and amd64).
 
@@ -108,7 +108,7 @@ Source folders: `src\9X` (Windows 95/98/Me), `src\NT` (NT 3.50/3.51/4.0), `src\2
   - Win32 SDK for Windows NT 4.0 / Windows 95 — expected at `C:\MSTOOLS`
   - Microsoft Macro Assembler (MASM) 6.11 — expected at `C:\MASM611` (`BIN\ML.EXE`, `BIN\NMAKE.EXE`)
   - Microsoft Visual C++ 2.0 — expected at `C:\MSVC20` (`BIN\CL.EXE`, `BIN\LINK.EXE`, `BIN\NMAKE.EXE`)
-- **NT 3.50 / 3.51 / NT 4.0 (x86):** Windows NT 4.0 DDK + Visual C++ 4.0 (MSVC 4.0)
+- **Windows NT 3.50 / 3.51 / NT 4.0 (x86):** Windows NT 4.0 DDK + Visual C++ 4.0 (MSVC 4.0)
 - **Windows 2000 / XP (x86):** Windows Server 2003 SP1 DDK ("WDK 6001", build 3790.1830)
 - **Windows XP x64 / Server 2003 x64 (amd64):** A DDK/WDK with an amd64 ("WNET") cross-compiler — Windows Server 2003 SP1 DDK ("WDK 6001", build 3790.1830), Windows Server 2003 R2 DDK, or the Windows 7 WDK (WinDDK 7600.16385.1)
 
@@ -137,7 +137,7 @@ build.bat
 
 Output: `C:\AHCINT9X\ahcint9x.mpd` (plus `ahcint9x.map`). Run `nmake clean` to remove build output.
 
-#### For NT 3.50 / 3.51 / NT 4.0 (x86)
+#### For Windows NT 3.50 / 3.51 / NT 4.0 (x86)
 
 ```bat
 cd <path-to-AHCINT>\src\NT
@@ -154,7 +154,7 @@ cl -nologo -c -Gz -Ox -W3 -Zp8 -Zi -D_X86_=1 -Di386=1 -DCONDITION_HANDLING=1 -DN
 link -nologo -debug -debugtype:both -subsystem:native,3.50 -entry:DriverEntry@8 -driver -base:0x10000 -align:0x200 -out:ahcint.sys ahci_main.obj ahci_satl.obj scsiport.lib ntoskrnl.lib
 ```
 
-Output: `ahcint.sys`, targeting NT 3.50 and later (`-subsystem:native,3.50`).
+Output: `ahcint.sys`, targeting Windows NT 3.50 and later (`-subsystem:native,3.50`).
 
 #### For Windows 2000 / XP (x86)
 
@@ -194,30 +194,55 @@ Output: `ahcint.sys` under the amd64 output directory (`objfre_wnet_amd64\amd64\
 
 ## Installation
 
-### Creating Installation Media
+### Installation Media
+
+Prebuilt binaries and install files live under `bin\`:
 
 ```
-AHCINT\
-├── ahcint.inf         (2000/XP and XP x64/Server 2003 targets)
-├── i386\
-│   └── ahcint.sys      (x86 binary)
-└── amd64\
-    └── ahcint.sys      (x64 binary)
+bin\
+├── 9X\
+│   ├── AHCINT9X.INF          (Windows 95/98/Me install file)
+│   └── AHCINT9X.MPD          (SCSIPORT.PDR miniport)
+├── NT\
+│   ├── oemsetup.inf
+│   ├── ahcint.sys
+│   └── floppy\               (NT 3.50/3.51/4.0 driver disk)
+│       ├── disk1             (tag file)
+│       ├── oemsetup.inf
+│       ├── txtsetup.oem
+│       └── ahcint.sys
+└── 2KXP\
+    ├── ahcint.inf            (one INF for x86 and x64)
+    ├── ahcint.sys            (x86 binary)
+    ├── i386\
+    │   └── ahcint.sys        (x86 binary)
+    ├── amd64\
+    │   └── ahcint.sys        (x64 binary)
+    ├── floppy_i386\          (F6 disk, 2000/XP/2003 x86)
+    │   ├── disk1             (tag file)
+    │   ├── txtsetup.oem
+    │   ├── ahcint.inf
+    │   ├── ahcint.sys
+    │   └── i386\ahcint.sys
+    └── floppy_amd64\         (F6 disk, XP x64/2003 x64)
+        ├── disk1             (tag file)
+        ├── txtsetup.oem
+        ├── ahcint.inf
+        ├── ahcint.sys
+        └── amd64\ahcint.sys
 ```
 
-Windows NT 3.50/3.51/4.0 uses its own OEM Setup layout instead (`oemsetup.inf` + `txtsetup.oem` + `ahcint.sys`, see `bin\NT\floppy\`).
-
-Windows 95/98/Me uses its own `ahcint9x.inf` + `ahcint9x.mpd` pair, see `bin\9X\`.
+All three INF/OEM files match the controller by PCI class code (`PCI\CC_010601`, Mass Storage - SATA - AHCI).
 
 ### Installing
 
 #### Windows 95 / 98 / Me
 
-Windows 9x/Me setup itself runs through the BIOS (INT 13h), so there is no F6-style driver step — install AHCINT once Windows is up:
+Windows 9x/Me setup itself runs through the BIOS (INT 13h), so there is no F6-style driver step — install AHCINT9x once Windows is up. Because `AHCINT9X.INF` matches `PCI\CC_010601`, Windows may offer the controller in the **New Hardware Found** wizard on its own; otherwise install it manually:
 
 1. Open **Control Panel → Add New Hardware**, let the wizard continue, and choose to select the hardware from a list.
-2. Pick **SCSI controllers**, click **Have Disk**, and point it at `bin\9X\` (`ahcint9x.inf`).
-3. Select **AHCINT SATA AHCI Storage Controller** and reboot. The miniport is installed as `ahcint9x.mpd` in `WINDOWS\SYSTEM\IOSUBSYS`.
+2. Pick **SCSI controllers**, click **Have Disk**, and point it at `bin\9X\` (`AHCINT9X.INF`).
+3. Select **AHCINT9x SATA AHCI Storage Controller** and reboot. `AHCINT9X.MPD` is copied to `WINDOWS\SYSTEM\IOSUBSYS`.
 
 If the protected-mode driver fails to load, Windows 9x falls back to MS-DOS compatibility mode for the affected disks (check **Device Manager → Performance** and `BOOTLOG.TXT`).
 
@@ -225,27 +250,27 @@ If the protected-mode driver fails to load, Windows 9x falls back to MS-DOS comp
 
 #### GUI-mode setup (Windows 2000/XP/XP x64/Server 2003)
 
-Use `bin\2KXP\ahcint.inf` with **"Have Disk"** during a manual driver install, or place the matching `.sys`/`.inf` pair where Plug and Play can find them. The driver installs as service `AHCINT` under `LoadOrderGroup = SCSI Miniport`.
-
-**Note:** The driver expects the AHCI controller to be visible on the PCI bus with class code `01-06-01` (Mass Storage - SATA - AHCI).
+Use `bin\2KXP\ahcint.inf` with **"Have Disk"** during a manual driver install. The same INF serves both architectures: it copies `i386\ahcint.sys` on x86 and `amd64\ahcint.sys` on x64. The device shows up as **AHCINT SATA AHCI Storage Controller** (x86) or **AHCINT SATA AHCI Storage Controller (x64)**, and the driver installs as service `AHCINT` under `LoadOrderGroup = SCSI Miniport`.
 
 #### Text-mode (F6) setup — Windows 2000/XP/XP x64/Server 2003
 
-Copy the contents of the corresponding `bin\<target>\floppy\` folder onto a floppy disk (or a virtual floppy image for VM installs), press **F6** at the start of text-mode setup, and select **AHCINT SATA AHCI Storage Controller**. Required whenever the install disk itself sits behind the AHCI controller.
+Copy the contents of `bin\2KXP\floppy_i386\` (x86) or `bin\2KXP\floppy_amd64\` (x64) onto a floppy disk (or a virtual floppy image for VM installs), press **F6** at the start of text-mode setup, and select **AHCINT SATA AHCI Storage Controller (ages2001)** — or **AHCINT SATA AHCI Storage Controller x64 (ages2001)** on x64. Required whenever the install disk itself sits behind the AHCI controller.
 
 #### Windows NT 3.50 / 3.51 / NT 4.0
 
-NT uses the older OEM Setup mechanism (`oemsetup.inf`) rather than a standard `.inf`/`.cat` pair. Use **"Have Disk"** during setup (GUI-mode) or the equivalent F6 OEM prompt (text-mode) and point it at `bin\NT\floppy\`, which contains `oemsetup.inf`, `txtsetup.oem`, and `ahcint.sys`.
+NT uses the older OEM Setup mechanism (`oemsetup.inf`) rather than a standard `.inf`/`.cat` pair. Use **"Have Disk"** during setup (GUI-mode) or the equivalent F6 OEM prompt (text-mode), point it at `bin\NT\floppy\`, and select **AHCINT SATA AHCI Storage Controller (ages2001)**.
 
 ## Configuration
 
-Registry values set at install time on the NT family (see `ahcint.inf` / `txtsetup.oem` `[Config.*]` sections):
+Registry values set at install time on the NT family (`ahcint.inf` service section, `txtsetup.oem` `[Config.scsi.AHCINT]`, `oemsetup.inf`):
 
-- **Tag** – boot-load ordering tag (differs per target/build)
+- **Tag** – boot-load ordering tag: `40` on 2000/XP/x64, `33` on NT 3.50/3.51/4.0
 - **Group** – `SCSI Miniport`
-- **Type / Start / ErrorControl** – standard `SERVICE_KERNEL_DRIVER` / boot-start / normal-error-control service values
+- **Type / Start / ErrorControl** – `1` (`SERVICE_KERNEL_DRIVER`) / `0` (boot start) / `1` (normal)
+- **Event log** – `IoLogMsg.dll` registered as the event message file (`TypesSupported = 7`)
+- **2000/XP/x64 only** – `Parameters\PnpInterface\5 = 1` (PnP on the PCI bus)
 
-On Windows 9x/Me the driver is registered by its `.inf` as a `SCSIPORT.PDR` miniport; there are no extra settings to configure.
+On Windows 9x/Me, `AHCINT9X.INF` registers the controller with `DevLoader = *IOS` and `PortDriver = AHCINT9X.MPD` (plus `DontLoadIfConflict = Y`); there are no extra settings to configure.
 
 ## Debugging
 
