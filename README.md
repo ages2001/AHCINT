@@ -71,7 +71,7 @@ Source folders: `src\9X` (Windows 95/98/Me), `src\NT` (NT 3.50/3.51/4.0), `src\2
 | Max AHCI controllers | 8 | 8 | 8 |
 | PCI detection | Class code `01-06-01`, only on the bus:slot `SCSIPORT.PDR` hands in (no bus scan) | Class code `01-06-01`, with full-bus fallback scan | Class code `01-06-01` plus known AMD/Intel device IDs, with full-bus fallback scan |
 | ABAR (MMIO) mapping | VMM `_MapPhysToLinear`, non-cached (KB Q169584 workaround) | `ScsiPortGetDeviceBase` | `ScsiPortGetDeviceBase` |
-| ATA read/write commands | READ/WRITE DMA EXT (48-bit) | READ/WRITE DMA EXT (48-bit) | READ/WRITE DMA (28-bit) for small requests, READ/WRITE DMA EXT otherwise |
+| ATA read/write commands | READ/WRITE DMA EXT (48-bit) | READ/WRITE DMA EXT (48-bit) | READ/WRITE DMA (28-bit) for small requests, READ/WRITE DMA EXT (48-bit) otherwise |
 | READ/WRITE(16) | No — READ/WRITE(6)/(10) only | No — READ/WRITE(6)/(10) only | Yes |
 | Addressable capacity | 2^32 sectors (~2 TB) | 2^32 sectors (~2 TB) | 2^32 sectors (~2 TB) — READ CAPACITY(10) only, capped at `0xFFFFFFFF` |
 | REQUEST SENSE | Yes | Yes | Yes |
@@ -205,7 +205,7 @@ AHCINT\
     └── ahcint.sys      (x64 binary)
 ```
 
-NT 3.50/3.51/4.0 uses its own OEM Setup layout instead (`oemsetup.inf` + `txtsetup.oem` + `ahcint.sys`, see `bin\NT\floppy\`).
+Windows NT 3.50/3.51/4.0 uses its own OEM Setup layout instead (`oemsetup.inf` + `txtsetup.oem` + `ahcint.sys`, see `bin\NT\floppy\`).
 
 Windows 95/98/Me uses its own `.inf` + `ahcint.mpd` pair, see `bin\9X\`.
 
@@ -225,7 +225,7 @@ If the protected-mode driver fails to load, Windows 9x falls back to MS-DOS comp
 
 #### GUI-mode setup (Windows 2000/XP/XP x64/Server 2003)
 
-Use `bin\2KXP\ahcint.inf` (x86) or `bin\XPAMD64\ahcint.inf` (x64) with **"Have Disk"** during a manual driver install, or place the matching `.sys`/`.inf` pair where Plug and Play can find them. The driver installs as service `AHCINT` under `LoadOrderGroup = SCSI Miniport`.
+Use `bin\2KXP\ahcint.inf` with **"Have Disk"** during a manual driver install, or place the matching `.sys`/`.inf` pair where Plug and Play can find them. The driver installs as service `AHCINT` under `LoadOrderGroup = SCSI Miniport`.
 
 **Note:** The driver expects the AHCI controller to be visible on the PCI bus with class code `01-06-01` (Mass Storage - SATA - AHCI).
 
@@ -233,9 +233,13 @@ Use `bin\2KXP\ahcint.inf` (x86) or `bin\XPAMD64\ahcint.inf` (x64) with **"Have D
 
 Copy the contents of the corresponding `bin\<target>\floppy\` folder onto a floppy disk (or a virtual floppy image for VM installs), press **F6** at the start of text-mode setup, and select **AHCINT SATA AHCI Storage Controller**. Required whenever the install disk itself sits behind the AHCI controller.
 
-#### NT 3.50 / 3.51 / NT 4.0
+#### Windows NT 3.50 / 3.51 / NT 4.0
 
 NT uses the older OEM Setup mechanism (`oemsetup.inf`) rather than a standard `.inf`/`.cat` pair. Use **"Have Disk"** during setup (GUI-mode) or the equivalent F6 OEM prompt (text-mode) and point it at `bin\NT\floppy\`, which contains `oemsetup.inf`, `txtsetup.oem`, and `ahcint.sys`.
+
+#### Windows 95/98/Me
+
+Use `bin\9X\ahcint9x.inf` with **"Have Disk"** during a manual driver install, or place the matching `.sys`/`.inf` pair where Plug and Play can find them.
 
 ## Configuration
 
@@ -291,7 +295,7 @@ Copyright (c) 2026 ages2001. All rights reserved.
 - infuscomus for porting driver to x64
 - Dietmar for Fast Polling idea
 - DominBear for [nvme2k project](https://github.com/techomancer/nvme2k)
-- [UniATA project](http://alter.org.ua/)
+- [UniATA project](http://alter.org.ua/win/uni_ata/)
 - Windows 2000 Dev Community
 - Testers
 - And everyone which supports it
