@@ -2,6 +2,9 @@ TARGETNAME=ahcint
 TARGETPATH=obj
 TARGETTYPE=MINIPORT
 
+# Shared sources live one level up (src\); no target define = 2000/XP/2003
+INCLUDES=..
+
 TARGETLIBS=$(DDK_LIB_PATH)\scsiport.lib \
            $(DDK_LIB_PATH)\ntoskrnl.lib
 
@@ -12,5 +15,5 @@ MUI=0
 MUI_COMMENT=0
 BUFFER_OVERFLOW_CHECKS=0
 
-SOURCES=ahci_main.c \
-        ahci_satl.c
+SOURCES=..\ahcimain.c \
+        ..\ahcisatl.c

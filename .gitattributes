@@ -1,0 +1,58 @@
+# Line endings for AHCINT
+#
+# Text is stored with LF inside the repository and always checked out with
+# CRLF, on every host (Linux included) and in GitHub "Download ZIP"
+# archives. The 9x/NT/DDK tools (COMMAND.COM, NMAKE, BUILD, MASTER.MK)
+# need CRLF, so the tree can be copied straight into the build guest.
+
+# Default for everything Git detects as text
+* text=auto eol=crlf
+
+# Sources
+*.c        text eol=crlf diff=cpp
+*.h        text eol=crlf diff=cpp
+*.C        text eol=crlf diff=cpp
+*.H        text eol=crlf diff=cpp
+
+# Build files (9X: build.bat, makefile, ahcint9x.lnk; NT: build.bat;
+# 2KXP: sources, makefile, ahcint.rc)
+*.bat      text eol=crlf
+*.BAT      text eol=crlf
+makefile   text eol=crlf
+MAKEFILE   text eol=crlf
+sources    text eol=crlf
+SOURCES    text eol=crlf
+*.lnk      text eol=crlf
+*.LNK      text eol=crlf
+*.mk       text eol=crlf
+*.def      text eol=crlf
+*.rc       text eol=crlf
+
+# Install files (bin\)
+*.inf      text eol=crlf
+*.INF      text eol=crlf
+*.oem      text eol=crlf
+*.OEM      text eol=crlf
+disk1      text eol=crlf
+
+# Documentation
+*.md       text eol=crlf
+*.txt      text eol=crlf
+LICENSE    text eol=crlf
+
+# Build output and archives: never touch
+*.sys      binary
+*.SYS      binary
+*.mpd      binary
+*.MPD      binary
+*.obj      binary
+*.pdb      binary
+*.res      binary
+*.sym      binary
+*.exe      binary
+*.dll      binary
+*.zip      binary
+*.ZIP      binary
+*.bdl      binary
+*.img      binary
+*.ima      binary
