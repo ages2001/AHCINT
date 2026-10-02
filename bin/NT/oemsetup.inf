@@ -1,0 +1,320 @@
+;-----------------------------------------------------------------------
+; OEMSETUP.INF - AHCINT SATA AHCI Driver for Windows NT
+; Copyright (c) 2026 ages2001. All rights reserved.
+;-----------------------------------------------------------------------
+
+[Identification]
+    OptionType = SCSI
+
+[PlatformsSupported]
+    PCI
+
+[LanguagesSupported]
+    ENG
+
+[Options]
+    "AHCINT" = AHCINT
+
+[OptionsTextENG]
+    "AHCINT" = "AHCINT SATA AHCI Storage Controller (ages2001)"
+
+[MiniportDrivers]
+    AHCINT = !SERVICE_KERNEL_DRIVER, "SCSI Miniport", !SERVICE_ERROR_NORMAL, 33, %SystemRoot%\System32\IoLogMsg.dll, 7
+
+[Identify]
+    read-syms Identification
+    set Status     = STATUS_SUCCESSFUL
+    set Identifier = $(OptionType)
+    set Media      = #("Source Media Descriptions", 1, 1)
+    Return $(Status) $(Identifier) $(Media)
+
+[ReturnOptions]
+    set Status        = STATUS_FAILED
+    set OptionList     = {}
+    set OptionTextList = {}
+    set LanguageList = ^(LanguagesSupported, 1)
+    Ifcontains(i) $($0) in $(LanguageList)
+        goto returnoptions
+    else
+        set Status = STATUS_NOLANGUAGE
+        goto finish_ReturnOptions
+    endif
+
+returnoptions = +
+    set OptionList     = ^(Options, 0)
+    set OptionTextList = ^(OptionsText$($0), 1)
+    set Status         = STATUS_SUCCESSFUL
+
+finish_ReturnOptions = +
+    Return $(Status) $(OptionList) $(OptionTextList)
+
+[InstallOption]
+    set Status = STATUS_FAILED
+    set DrivesToFree = {}
+    set Option   = $($1)
+    set SrcDir   = $($2)
+    set AddCopy  = $($3)
+    set DoCopy   = $($4)
+    set DoConfig = $($5)
+
+    set LanguageList = ^(LanguagesSupported, 1)
+    Ifcontains(i) $($0) in $(LanguageList)
+    else
+        set Status = STATUS_NOLANGUAGE
+        goto finish_InstallOption
+    endif
+    read-syms Strings$($0)
+
+    set OptionList = ^(Options, 0)
+    ifcontains $(Option) in $(OptionList)
+    else
+        goto finish_InstallOption
+    endif
+    set OptionList = ""
+
+    set MiniportDriver   =   #(Options,         $(Option),         1)
+    set Type             = $(#(MiniportDrivers, $(MiniportDriver), 1))
+    set Group            =   #(MiniportDrivers, $(MiniportDriver), 2)
+    set ErrorControl     = $(#(MiniportDrivers, $(MiniportDriver), 3))
+    set Tag              =   #(MiniportDrivers, $(MiniportDriver), 4)
+    set EventMessageFile =   #(MiniportDrivers, $(MiniportDriver), 5)
+    set TypesSupported   =   #(MiniportDrivers, $(MiniportDriver), 6)
+    set Start            =   $(!SERVICE_BOOT_START)
+
+installtheoption = +
+    ifstr(i) $(AddCopy) == "YES"
+        set DoActualCopy = NO
+        set FileToCheck = #(Files-ScsiMiniportDrivers, $(MiniportDriver), 2)
+        LibraryProcedure STATUS,$(!LIBHANDLE),CheckFileExistance $(!STF_WINDOWSSYSPATH)"\drivers\"$(FileToCheck)
+        ifstr(i) $(STATUS) == NO
+            set DoActualCopy = YES
+        endif
+
+        ifstr(i) $(DoActualCopy) == NO
+            shell "subroutn.inf" DriversExist $($0) $(String1)
+            ifint $($ShellCode) != $(!SHELL_CODE_OK)
+                goto finish_InstallOption
+            endif
+            ifstr(i) $($R0) == STATUS_CURRENT
+            else-ifstr(i) $($R0) == STATUS_NEW
+                set DoActualCopy = YES
+            else
+                goto finish_InstallOption
+            endif
+        endif
+
+        ifstr(i) $(DoActualCopy) == YES
+            shell "subroutn.inf" DoAskSourceEx $(SrcDir) $(String2)
+            ifint $($ShellCode) != $(!SHELL_CODE_OK)
+                goto finish_InstallOption
+            endif
+            ifstr(i) $($R0) == STATUS_SUCCESSFUL
+                set SrcDir = $($R1)
+                ifstr(i) $($R2) != ""
+                    set DrivesToFree = >($(DrivesToFree), $($R2))
+                endif
+            else
+                goto finish_InstallOption
+            endif
+
+            install Install-AddCopyOption
+            ifstr(i) $(STF_INSTALL_OUTCOME) != "STF_SUCCESS"
+                goto finish_InstallOption
+            endif
+        else
+            set DoCopy = NO
+        endif
+    endif
+
+    ifstr(i) $(DoCopy) == "YES"
+        read-syms ProgressCopy$($0)
+        install Install-DoCopyOption
+        ifstr(i) $(STF_INSTALL_OUTCOME) == "STF_FAILURE"
+            goto finish_InstallOption
+        else-ifstr(i) $(STF_INSTALL_OUTCOME) == "STF_USERQUIT"
+            set Status = STATUS_USERCANCEL
+            goto finish_InstallOption
+        endif
+    endif
+
+    ifstr(i) $(DoConfig) == "YES"
+        shell "registry.inf" CheckSetupModify
+        ifint $($ShellCode) != $(!SHELL_CODE_OK)
+            goto finish_InstallOption
+        endif
+        ifstr(i) $($R0) != STATUS_SUCCESSFUL
+            goto finish_InstallOption
+        endif
+
+        set ServiceNode   = $(MiniportDriver)
+        set ServiceBinary = System32\drivers\#(Files-ScsiMiniportDrivers, $(MiniportDriver), 2)
+
+        set ServicesValues   = { +
+                {Type,           0, $(!REG_VT_DWORD),     $(Type)                  }, +
+                {Start,          0, $(!REG_VT_DWORD),     $(Start)                 }, +
+                {Group,          0, $(!REG_VT_SZ),        $(Group)                 }, +
+                {ErrorControl,   0, $(!REG_VT_DWORD),     $(ErrorControl)          }, +
+                {Tag,            0, $(!REG_VT_DWORD),     $(Tag)                   }, +
+                {BinaryPathName, 0, $(!REG_VT_EXPAND_SZ), $(ServiceBinary)         }  +
+                }
+
+        set ParametersValues = { +
+                {BusType, 0, $(!REG_VT_DWORD), 5}  +
+                }
+
+        set DeviceValues     = { +
+                {NumberOfRequests, 0, $(!REG_VT_DWORD), 32}, +
+                {MaximumSGList, 0, $(!REG_VT_DWORD), 512}  +
+                }
+
+        set EventLogValues   = { +
+                {EventMessageFile, 0, $(!REG_VT_EXPAND_SZ), $(EventMessageFile) }, +
+                {TypesSupported,   0, $(!REG_VT_DWORD),     $(TypesSupported)   }  +
+                }
+
+        shell "registry.inf"  MakeServicesEntry $(ServiceNode)      +
+                                                $(ServicesValues)   +
+                                                $(ParametersValues) +
+                                                $(DeviceValues)     +
+                                                $(EventLogValues)   +
+                                                Parameters
+
+        ifint $($ShellCode) != $(!SHELL_CODE_OK)
+            goto finish_InstallOption
+        endif
+        ifstr(i) $($R0) != STATUS_SUCCESSFUL
+            goto finish_InstallOption
+        endif
+    endif
+
+    set Status = STATUS_SUCCESSFUL
+
+finish_InstallOption = +
+    ForListDo $(DrivesToFree)
+        LibraryProcedure STATUS,$(!LIBHANDLE), DeleteNetConnection $($) "TRUE"
+    EndForListDo
+    Return $(Status)
+
+[Install-AddCopyOption]
+    set PlatformSrcDir = $(SrcDir)
+    LibraryProcedure STATUS,$(!LIBHANDLE),CheckFileExistance $(SrcDir)"\"#(Files-ScsiMiniportDrivers, $(MiniportDriver), 2)
+    ifstr(i) $(STATUS) == "NO"
+        set PlatformSrcDir = $(SrcDir)"\"$(!STF_PLATFORM)
+    endif
+    AddSectionKeyFileToCopyList   Files-ScsiMiniportDrivers         +
+                                  $(MiniportDriver)                 +
+                                  $(PlatformSrcDir)                 +
+                                  $(!STF_WINDOWSSYSPATH)\drivers
+    exit
+
+[Install-DoCopyOption]
+    CopyFilesInCopyList
+    exit
+
+[DeInstallOption]
+    set Status   = STATUS_FAILED
+    set Option   = $($1)
+    set LanguageList = ^(LanguagesSupported, 1)
+    Ifcontains(i) $($0) in $(LanguageList)
+    else
+        set Status = STATUS_NOLANGUAGE
+        goto finish_DeInstallOption
+    endif
+    read-syms Strings$($0)
+
+    set OptionList = ^(Options, 0)
+    ifcontains $(Option) in $(OptionList)
+    else
+        goto finish_DeInstallOption
+    endif
+    set OptionList = ""
+
+    set MiniportDriver = #(Options, $(Option), 1)
+    set MiniportFile   = #(Files-ScsiMiniportDrivers, $(MiniportDriver), 2)
+    set FilePath       = $(!STF_WINDOWSSYSPATH)"\drivers\"$(MiniportFile)
+
+    LibraryProcedure STATUS,$(!LIBHANDLE),CheckFileExistance $(FilePath)
+    ifstr(i) $(STATUS) == "NO"
+        set Status = STATUS_SUCCESSFUL
+        goto finish_DeInstallOption
+    endif
+
+    shell "registry.inf" GetServicesEntryStart $(MiniportDriver)
+    ifstr(i) $($R0) != "STATUS_SUCCESSFUL"
+        set Status = STATUS_SUCCESSFUL
+        goto finish_DeInstallOption
+    endif
+
+    ifstr(i) $($R1) == $(!SERVICE_BOOT_START)
+        shell "subroutn.inf" SetupMessage $(!STF_LANGUAGE) "WARNING" $(String3)
+        ifstr(i) $($R0) != STATUS_SUCCESSFUL
+            goto do_removal
+        endif
+        ifstr(i) $($R1) == "CANCEL"
+            goto finish_DeInstallOption
+        endif
+    endif
+
+do_removal =+
+    shell "registry.inf" RemoveServicesEntry $(MiniportDriver)
+    ifint $($ShellCode) != $(!SHELL_CODE_OK)
+        goto finish_DeInstallOption
+    endif
+    set Status = STATUS_SUCCESSFUL
+
+finish_DeInstallOption =+
+    return $(Status)
+
+[GetInstalledOptions]
+    set Status = STATUS_FAILED
+    set InstalledOptions = {}
+    set InstalledOptionsText = {}
+    set LanguageList = ^(LanguagesSupported, 1)
+    Ifcontains(i) $($0) in $(LanguageList)
+    else
+        set Status = STATUS_NOLANGUAGE
+        goto finish_GetInstalledOptions
+    endif
+
+    set OptionList = ^(Options, 0)
+    ForListDo $(OptionList)
+        set MiniportDriver = #(Options, $($), 1)
+        set MiniportFile   = #(Files-ScsiMiniportDrivers, $(MiniportDriver), 2)
+        set FilePath       = $(!STF_WINDOWSSYSPATH)"\drivers\"$(MiniportFile)
+        LibraryProcedure STATUS,$(!LIBHANDLE),CheckFileExistance $(FilePath)
+        ifstr(i) $(STATUS) == "YES"
+            shell "registry.inf" GetServicesEntryStart $(MiniportDriver)
+            ifint $($ShellCode) == $(!SHELL_CODE_OK)
+                ifstr(i) $($R0) == STATUS_SUCCESSFUL
+                    ifstr(i) $($R1) != $(!SERVICE_DISABLED)
+                        set OptionText = #(OptionsText$($0), $($), 1)
+                        set InstalledOptions     = >($(InstalledOptions), $($))
+                        set InstalledOptionsText = >($(InstalledOptionsText), $(OptionText))
+                    endif
+                endif
+            endif
+        endif
+    EndForListDo
+    set Status = STATUS_SUCCESSFUL
+
+finish_GetInstalledOptions =+
+    Return $(Status) $(InstalledOptions) $(InstalledOptionsText)
+
+[ProgressCopyENG]
+    ProCaption   = "Windows NT Setup"
+    ProCancel    = "Cancel"
+    ProCancelMsg = "Windows NT is not correctly installed. Are you sure you want to cancel copying files?"
+    ProCancelCap = "Setup Message"
+    ProText1     = "Copying:"
+    ProText2     = "To:"
+
+[StringsENG]
+    String1 = "AHCINT SATA AHCI Adapter"
+    String2 = "Please enter the full path to the AHCINT Driver files. Then choose Continue."
+    String3 = "The AHCINT Adapter has been marked as a boot device. Removing it may cause the system not to boot."$(!LF)$(!LF)"Are you sure you want to remove the Adapter?"
+
+[Source Media Descriptions]
+    1 = "AHCINT Driver Disk", TAGFILE = disk1
+
+[Files-ScsiMiniportDrivers]
+    AHCINT = 1, AHCINT.sys, SIZE=999

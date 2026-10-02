@@ -1,6 +1,6 @@
 # AHCINT - SATA AHCI Driver for Windows NT/2000/XP and Windows 95/98/Me
 
-An AHCI (Advanced Host Controller Interface) SATA storage controller driver for Windows NT family and the Windows 95/98/Me, targeting operating systems from Windows 95 and Windows NT 3.50 up through Windows XP x64 Edition / Server 2003 x64 — long before Microsoft shipped a native AHCI driver.
+An AHCI (Advanced Host Controller Interface) SATA storage controller driver for Windows NT family and the Windows 95/98/Me, targeting operating systems from Windows 95 and Windows NT 3.1 up through Windows XP x64 Edition / Server 2003 x64 — long before Microsoft shipped a native AHCI driver.
 
 ## Overview
 
@@ -27,10 +27,11 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
   - ATAPI (PACKET command) pass-through for CD/DVD-class devices, alongside plain ATA disk support
   - Real ATAPI media status: TEST UNIT READY / MEDIUM REMOVAL are passed through to the drive, REQUEST SENSE returns the drive's own sense data, and MODE SENSE(6) is translated to ATAPI MODE SENSE(10) and back — so media changes and empty trays are reported correctly to the CD-ROM class driver
   - IDENTIFY DEVICE / IDENTIFY PACKET DEVICE based device enumeration, with cached string extraction for INQUIRY vendor/product fields
+  - Logical sector sizes of 512, 1024, 2048 and 4096 bytes (IDENTIFY word 106 / words 117–118): READ CAPACITY(10)/(16) and MODE SENSE report the drive's own block length, READ CAPACITY(16) also the logical-per-physical exponent (512e drives); see [Logical sector size](#logical-sector-size)
 
 - **Multi-target support from one source tree**
   - Windows 95 / 98 / Me (x86) — `SCSIPORT.PDR` miniport (`ahcint9x.mpd`)
-  - Windows NT 3.50 / 3.51 / NT 4.0 (x86) — `ahcint.sys`
+  - Windows NT 3.1 / 3.50 / 3.51 / NT 4.0 (x86) — `ahcint.sys` (one binary for all four)
   - Windows 2000 / XP / Server 2003 (x86) and Windows XP x64 Edition / Server 2003 x64 (amd64) — `ahcint.sys`
   - Every target uses the same synchronous Fast Polling I/O path; the few real differences are `#ifdef`s (see [One source tree](#one-source-tree))
 
@@ -58,7 +59,7 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
 - **src\ahcisatl.c** – SCSI command dispatch, SCSI↔ATA/ATAPI translation, 28/48-bit command selection, INQUIRY/READ CAPACITY/MODE SENSE synthesis, sense handling, PRDT construction, the Fast Polling command engine
 - **src\ahcint.h** – Target switches (`AHCI_W9X`, `AHCI_NT4`), AHCI register layout, command/FIS structures, device extension, shared constants
 - **src\9X\** – `build.bat`, NMAKE `makefile` (includes the DDK's `MASTER.MK`) and `ahcint9x.lnk` for Windows 9x/Me
-- **src\NT\** – `build.bat` for NT 3.50/3.51/4.0
+- **src\NT\** – `build.bat` for NT 3.1/3.50/3.51/4.0
 - **src\2KXP\** – `sources` / `makefile` / `ahcint.rc` for the DDK `build` utility (2000/XP/2003, x86 and amd64)
 - **ahcint.inf** / **txtsetup.oem** / **oemsetup.inf** / **AHCINT9X.INF** – Installation files (in `bin\`) (see [Installation](#installation))
 
@@ -66,16 +67,16 @@ All targets compile the same three files in `src\`; the per-target folders only 
 
 ## Feature matrix by target
 
-| | 95/98/Me (x86) | NT 3.50/3.51/4.0 (x86) | 2000/XP/2003 (x86) and XP x64/2003 x64 (amd64) |
+| | 95/98/Me (x86) | NT 3.1/3.50/3.51/4.0 (x86) | 2000/XP/2003 (x86) and XP x64/2003 x64 (amd64) |
 |---|---|---|---|
 | Build folder (sources are shared in `src\`) | `src\9X` | `src\NT` | `src\2KXP` |
 | Target define | `AHCI_W9X` (implies `AHCI_NT4`) | `AHCI_NT4` | none |
 | Driver binary | `ahcint9x.mpd` (`SCSIPORT.PDR` miniport) | `ahcint.sys` | `ahcint.sys` |
-| I/O model | Synchronous Fast Polling — `HwStartIo` polls `PxCI`/`PxIS`/`PxTFD` every 10 µs (3 s timeout) | Same | Same |
-| Interrupt usage | None — `PxIE` = 0 and `GHC.IE` off; `HwInterrupt` only acknowledges stray status | Same | Same |
+| I/O model | Synchronous Fast Polling — `HwStartIo` polls `PxCI`/`PxIS`/`PxTFD` every 10 µs, up to the SRB's `TimeOutValue` minus 1 s (see [Command timeout](#command-timeout)) | Same | Same |
+| Interrupt usage | None — `PxIE` = 0 and `GHC.IE` off; `HwInterrupt` only acknowledges stray status | Same; on NT 3.1 no interrupt is connected at all | Same |
 | Max AHCI ports | 8 (build-time, see [Build-time limits](#build-time-limits)) | 8 (build-time) | 8 (build-time) |
 | Max AHCI controllers | 8 (build-time, see [Build-time limits](#build-time-limits)) | 8 (build-time) | 8 (build-time) |
-| PCI detection | Class code `01-06-01` plus known AMD/Intel device IDs; the bus:slot `SCSIPORT.PDR` hands in first, then a PCI bus-scan fallback | Same, bus:slot from ScsiPort first, then bus-scan fallback | Same, PnP-assigned bus:slot first, then bus-scan fallback |
+| PCI detection | Class code `01-06-01` plus known AMD/Intel device IDs; the bus:slot `SCSIPORT.PDR` hands in first, then a PCI bus-scan fallback | Same, bus:slot from ScsiPort first, then bus-scan fallback; NT 3.1 (no PCI support in its HAL) reads config space through ports `CF8h`/`CFCh` | Same, PnP-assigned bus:slot first, then bus-scan fallback |
 | ABAR (MMIO) mapping | VMM `_MapPhysToLinear`, non-cached (KB Q169584 workaround) | `ScsiPortGetDeviceBase` | `ScsiPortGetDeviceBase` |
 | ATA read/write commands | READ/WRITE DMA (28-bit) when the request ends below LBA 2^28 and moves ≤ 256 sectors; READ/WRITE DMA EXT only if IDENTIFY reports 48-bit support | Same | Same |
 | READ/WRITE(16), READ CAPACITY(16), INQUIRY VERSION 05h (SPC-3) | Yes | Yes | Yes |
@@ -95,12 +96,14 @@ All targets compile the same three files in `src\`; the per-target folders only 
 
 - No NCQ (Native Command Queuing) — `PxSACT` is defined but never used; every port issues one command at a time via slot 0
 - No interrupt-driven completion — every target completes commands by Fast Polling; no MSI/MSI-X support
+- A slow command keeps the CPU that issued it busy polling for as long as it takes, up to the SRB timeout (see [Command timeout](#command-timeout))
 - ~128 KB maximum transfer size per request (32 physical breaks), well short of AHCI's theoretical per-PRDT 4 MB limit
 - No hot-plug support on any target; devices are detected once, at `HwInitialize`
 - No power management (no device sleep/spin-down handling, no S3/S4 resume path beyond what ScsiPort provides)
 - Single-queue-depth design — no per-port command queuing beyond the one in-flight command AHCINT itself tracks
 - Disks past 2 TB need an upper layer that issues 16-byte CDBs (e.g. LBA64HLP.VXD on Windows 9x); the driver answers them on every target
-- Only 512-byte logical sectors; CHS-only devices (no LBA) are not addressable (SATA requires LBA)
+- Logical sectors larger than 4096 bytes are not taken (the port is left unusable); CHS-only devices (no LBA) are not addressable (SATA requires LBA)
+- A disk with logical sectors larger than 512 bytes works as a data disk only: BIOS INT 13h and the boot loaders read 512-byte sectors, so the system cannot boot from it
 - SYNCHRONIZE CACHE and VERIFY are completed without issuing an ATA command
 - 9X and NT builds do not fill auto-sense; the OS-era class drivers issue their own REQUEST SENSE
 - Windows 95 RTM: see the [SCSIPORT.PDR note](#windows-95--98--me) below
@@ -115,7 +118,7 @@ All targets compile the same three files in `src\`; the per-target folders only 
   - Win32 SDK for Windows NT 4.0 / Windows 95 — expected at `C:\MSTOOLS`
   - Microsoft Macro Assembler (MASM) 6.11 — expected at `C:\MASM611` (`BIN\ML.EXE`, `BIN\NMAKE.EXE`)
   - Microsoft Visual C++ 2.0 — expected at `C:\MSVC20` (`BIN\CL.EXE`, `BIN\LINK.EXE`, `BIN\NMAKE.EXE`)
-- **Windows NT 3.50 / 3.51 / NT 4.0 (x86):** Windows NT 4.0 DDK + Visual C++ 4.0 (MSVC 4.0)
+- **Windows NT 3.1 / 3.50 / 3.51 / NT 4.0 (x86):** Windows NT 4.0 DDK + Visual C++ 4.0 (MSVC 4.0)
 - **Windows 2000 / XP (x86):** Windows Server 2003 SP1 DDK ("WDK 6001", build 3790.1830)
 - **Windows XP x64 / Server 2003 x64 (amd64):** A DDK/WDK with an amd64 ("WNET") cross-compiler — Windows Server 2003 SP1 DDK ("WDK 6001", build 3790.1830), Windows Server 2003 R2 DDK, or the Windows 7 WDK (WinDDK 7600.16385.1)
 
@@ -146,7 +149,7 @@ build.bat
 
 Output: `C:\AHCINT\9X\ahcint9x.mpd` (plus `ahcint9x.map`). Run `nmake clean` to remove build output.
 
-#### For Windows NT 3.50 / 3.51 / NT 4.0 (x86)
+#### For Windows NT 3.1 / 3.50 / 3.51 / NT 4.0 (x86)
 
 ```bat
 cd <path-to-AHCINT>\src\NT
@@ -155,7 +158,7 @@ build.bat
 
 `build.bat` sets `MSVCDIR` (default `C:\MSDEV`) and `DDKDIR` (default `C:\NT4DDK`) — edit them if your tools live elsewhere — then compiles `..\ahcimain.c` and `..\ahcisatl.c` with `-DAHCI_NT4` and links against `scsiport.lib` and `ntoskrnl.lib`.
 
-Output: `src\NT\ahcint.sys`, targeting Windows NT 3.50 and later (`-subsystem:native,3.50`).
+Output: `src\NT\ahcint.sys`, for Windows NT 3.1 and later (`-subsystem:native,3.50`; the NT 3.1 loader does not check the subsystem version). The NT build imports only functions NT 3.1's `SCSIPORT.SYS` exports, so it must not call `ScsiPortSetBusDataByOffset`.
 
 #### For Windows 2000 / XP (x86)
 
@@ -257,19 +260,23 @@ Use `bin\2KXP\ahcint.inf` with **"Have Disk"** during a manual driver install. T
 
 Copy the contents of `bin\2KXP\floppy_i386\` (x86) or `bin\2KXP\floppy_amd64\` (x64) onto a floppy disk (or a virtual floppy image for VM installs), press **F6** at the start of text-mode setup, and select **AHCINT SATA AHCI Storage Controller (ages2001)** — or **AHCINT SATA AHCI Storage Controller x64 (ages2001)** on x64. Required whenever the install disk itself sits behind the AHCI controller.
 
-#### Windows NT 3.50 / 3.51 / NT 4.0
+#### Windows NT 3.1 / 3.50 / 3.51 / NT 4.0
 
 NT uses the older OEM Setup mechanism (`oemsetup.inf`) rather than a standard `.inf`/`.cat` pair. Use **"Have Disk"** during setup (GUI-mode) or the equivalent F6 OEM prompt (text-mode), point it at `bin\NT\floppy\`, and select **AHCINT SATA AHCI Storage Controller (ages2001)**.
+
+**`boot.ini` on Windows NT 3.1:** both ARC paths work. `multi(0)disk(0)rdisk(0)partition(1)\WINNT` makes NTLDR read through the BIOS (INT 13h), so the BIOS has to boot from the AHCI disk. `scsi(0)disk(0)rdisk(0)partition(1)\WINNT` (`disk(n)` = AHCI port number) makes NTLDR drive the controller itself through `NTBOOTDD.SYS`, a copy of `ahcint.sys` in the root of the system partition; this works with NT 3.1's own NTLDR and with the Windows 2000 NTLDR/NTDETECT.COM.
+
+**Booting Windows NT 3.1 from an AHCI disk:** NT 3.1's `scsidisk` (SCSI disk class driver) must be a boot driver (`Start = 0`), otherwise NTLDR does not load it and the system stops with `0x7B INACCESSIBLE_BOOT_DEVICE`. Text-mode setup sets this when it installs onto a SCSI disk; when moving an existing installation onto the AHCI controller, set `HKLM\SYSTEM\CurrentControlSet\Services\scsidisk\Start` to `0` first (and `AHCINT`'s own `Start` to `0`).
 
 ## Configuration
 
 Registry values set at install time on the NT family (`ahcint.inf` service section, `txtsetup.oem` `[Config.scsi.AHCINT]`, `oemsetup.inf`):
 
-- **Tag** – boot-load ordering tag: `40` on 2000/XP/x64, `33` on NT 3.50/3.51/4.0
+- **Tag** – boot-load ordering tag: `40` on 2000/XP/x64, `33` on NT 3.1/3.50/3.51/4.0
 - **Group** – `SCSI Miniport`
 - **Type / Start / ErrorControl** – `1` (`SERVICE_KERNEL_DRIVER`) / `0` (boot start) / `1` (normal)
 - **Event log** – `IoLogMsg.dll` registered as the event message file (`TypesSupported = 7`)
-- **2000/XP/x64 only** – `Parameters\PnpInterface\5 = 1` (PnP on the PCI bus)
+- **2000/XP/x64 only** – `Parameters\PnpInterface\5 = 1` (PnP on the PCI bus). Set by `ahcint.inf`; when it is missing, the driver creates it itself at load (see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics))
 
 On Windows 9x/Me, `AHCINT9X.INF` registers the controller with `DevLoader = *IOS` and `PortDriver = AHCINT9X.MPD` (plus `DontLoadIfConflict = Y`); there are no extra settings to configure.
 
@@ -287,6 +294,7 @@ The port and controller limits are compile-time constants in `src\ahcint.h`. The
 Raising it has these consequences, all in `src\ahcint.h` and `src\ahcimain.c`:
 
 - **DMA arena** – every port takes 4 KB of the uncached DMA arena (command list 1 KB, received-FIS area 256 bytes, command table 2 KB, bounce buffer 512 bytes, plus alignment). The default `RawBuffer[65536]` in `AHCI_DMA_RESOURCES` holds 15 ports safely. For 16 or more ports, enlarge it to at least `(MAX_SUPPORTED_PORTS + 1) * 4096` bytes (the extra 4 KB covers alignment), for example `UCHAR RawBuffer[(MAX_SUPPORTED_PORTS + 1) * 4096];`. The driver does not check this at run time: too small an arena overruns the uncached extension.
+- **ABAR range** – the driver maps, and on NT 3.x/4.0 claims, only the registers it uses: `100h + 80h * MAX_SUPPORTED_PORTS` bytes (500h by default; 1100h for 32 ports). HBAs are often only 4 KB apart, so a fixed larger range would collide with the next controller's ABAR and ScsiPort would reject that controller.
 - **Initiator ID** – ScsiPort reserves one target ID for the HBA itself and does not scan it. `AhciFindAdapter` sets `ConfigInfo->InitiatorBusId[0]` to `MAX_SUPPORTED_PORTS`, one past the last port, so it follows the limit automatically and never hides a port.
 - **Device extension** – `HW_DEVICE_EXTENSION` grows by about 550 bytes per port (the `Ports[]` array, including a 512-byte copy of IDENTIFY data). This is ordinary non-paged memory and not a practical concern.
 - **Uncached memory** – a larger arena means a larger physically contiguous `ScsiPortGetUncachedExtension` allocation per controller (128 KB + 4 KB for 32 ports). This is usually fine on NT and 2000/XP; on Windows 9x with little RAM a large contiguous allocation can fail, and `HwFindAdapter` then returns `SP_RETURN_ERROR`.
@@ -312,7 +320,7 @@ AHCI_DBG((AHCI_PFX "Port %lu: TFD=%08lX\n", port, tfd));
 
 ### I/O Model
 
-- **All targets (Fast Polling):** every command, ATA or ATAPI, is issued from `HwStartIo` and polled every 10 µs on `PxCI`/`PxIS`/`PxTFD` (3 s timeout), then completed before `HwStartIo` returns. `PxIE` stays 0, so completion never depends on an interrupt being delivered — this also covers text-mode Setup, where the HAL has not assigned an IRQ. The loop exits as soon as `PxIS`/`PxTFD` report an error, so an empty CD tray answers NOT READY at once; the port is then stopped and restarted as the AHCI spec requires.
+- **All targets (Fast Polling):** every command, ATA or ATAPI, is issued from `HwStartIo` and polled every 10 µs on `PxCI`/`PxIS`/`PxTFD` (see [Command timeout](#command-timeout)), then completed before `HwStartIo` returns. `PxIE` stays 0, so completion never depends on an interrupt being delivered — this also covers text-mode Setup, where the HAL has not assigned an IRQ. The loop exits as soon as `PxIS`/`PxTFD` report an error, so an empty CD tray answers NOT READY at once; the port is then stopped and restarted as the AHCI spec requires.
 
 ### ATA command selection
 
@@ -322,11 +330,48 @@ Each read/write is checked against that capacity (out of range → CHECK CONDITI
 
 LBAs are kept as two `ULONG`s (`AHCI_LBA`), so no `__int64` arithmetic — and none of the `_aulldiv`/`_allshl` CRT helpers the 9x build does not link — is needed.
 
+### Logical sector size
+
+ATA disks may use logical sectors larger than 512 bytes ("4Kn" drives use 4096). `AhciParseIdentify` reads word 106: when it is valid (bits 15:14 = `01`) and bit 12 is set, words 117–118 give the logical sector size in words. 512, 1024, 2048 and 4096 bytes are taken; anything else leaves the port unusable instead of guessing. All ATA LBAs and sector counts are in logical sectors, so the SATL only has to report the right block length (READ CAPACITY(10)/(16), MODE SENSE block descriptor) and size each transfer as count × sector size. When bit 13 is set, bits 3:0 (logical sectors per physical sector) go into READ CAPACITY(16) byte 13, so 512e drives report their 4 KB physical sectors.
+
+What the operating system does with such a disk is up to its class and file system drivers. Tested with QEMU patched to emulate ATA disks with large logical sectors (see `TESTS.TXT`):
+
+| OS | 1024 bytes | 2048 bytes | 4096 bytes |
+|---|---|---|---|
+| Windows NT 3.1 | FAT, NTFS | NTFS (FAT formats but does not mount) | NTFS (FAT formats but does not mount; NT 3.1's FORMAT.COM faults at the end of an NTFS format, the volume is fine) |
+| Windows NT 4.0 SP6 | FAT, NTFS | FAT, NTFS | FAT, NTFS |
+| Windows 2000 | FAT, NTFS | FAT, NTFS | FAT, NTFS |
+| Windows 95 | FAT | FAT | Not usable: Windows 95 reads the MBR and boot sector, then fails every access to the drive ("General failure") without sending a read |
+
 ### Windows 9x specifics
 
 - **ABAR mapping:** `ScsiPortGetDeviceBase` can fail to return a usable linear address for a memory-mapped PCI BAR on Windows 95 (Microsoft KB Q169584). The 9X build maps the ABAR with the VMM's `_MapPhysToLinear` service instead, as non-cached (`MPL_NonCached`), so register polling always sees live hardware state.
 - **`HwAdapterState`:** `SCSIPORT.PDR` calls this for PCI miniports during Plug and Play state changes; the 9X build provides it (a no-op that returns `TRUE`), because leaving it `NULL` makes `SCSIPORT.PDR` report "Init Failure" for the miniport.
 - **PCI discovery:** like the NT targets, the bus:slot `SCSIPORT.PDR` hands in is tried first, then the PCI bus-scan fallback.
+
+### Windows NT 3.1 specifics
+
+NT 3.1's ScsiPort and HAL predate PCI support in non-PnP miniports. The NT build handles this at run time, so the same `ahcint.sys` runs on NT 3.1, 3.50, 3.51 and 4.0:
+
+- **`HW_INITIALIZATION_DATA` size:** NT 3.1's `ScsiPortInitialize` accepts only its own 40h-byte structure and fails anything else before calling `HwFindAdapter`. `DriverEntry` first calls it with the NT 3.50–4.0 size on `PCIBus`; if that fails without `HwFindAdapter` ever being called, it retries with the 40h-byte layout on the ISA bus.
+- **PCI configuration space:** NT 3.1's `HalGetBusData` only knows CMOS and EISA data, so `ScsiPortGetBusData(PCIConfiguration)` returns nothing. The driver then uses configuration mechanism #1 (ports `CF8h`/`CFCh`) for the bus scan. `ScsiPortSetBusDataByOffset` does not exist on NT 3.1, so on the whole NT build the PCI command register is written through the same ports, and only when the BIOS left memory space or bus mastering off.
+- **`PORT_CONFIGURATION_INFORMATION`:** 58h bytes on NT 3.1, without `SlotNumber` and `MaximumNumberOfTargets` (the access ranges follow right after it). The driver checks `ConfigInfo->Length` before touching those fields.
+- **DMA:** NT 3.1's HAL gives an ISA bus master map registers below 16 MB in every case (it ignores `Dma32BitAddresses`), so with more RAM every transfer is bounced, and the copy-back overwrites the data the SATL itself writes into the request (INQUIRY, READ CAPACITY, ...): scsidisk sees garbage and the boot ends in `0x7B`. Before taking the uncached extension the driver therefore reports `Eisa` as the interface type; the HAL gives a scatter/gather master on EISA no map registers, and the HBA sees real physical addresses. Tested up to 3 GB RAM.
+- **Interrupt:** on the ISA bus a PCI INTx line means nothing, so no interrupt is reported (level 0) and ScsiPort connects none — Fast Polling does not need one.
+- **Several controllers:** each HBA asks to be called again (`*Again = TRUE`); the next call scans for the next unclaimed HBA.
+
+### Windows 2000/XP/x64 specifics
+
+- **Text-mode setup (F6):** the setup kernel boots with a bare `AHCINT` service key; the `[Config.scsi.AHCINT]` values of `txtsetup.oem` are written only to the installed system. Without `Parameters\PnpInterface\5`, the XP x64 / Server 2003 x64 ScsiPort fails `IRP_MN_START_DEVICE` before `HwFindAdapter` is called, so setup stops with STOP 0x7B (the x86 ScsiPort tolerates the missing value). `DriverEntry` therefore creates `Parameters\PnpInterface\5 = 1` under its service key when the `PnpInterface` key does not exist yet, before `ScsiPortInitialize`. An existing key is left as it is. Both F6 `txtsetup.oem` files also set the value in `[Config.scsi.AHCINT]`, so a system installed through F6 gets it from setup as well.
+
+### Command timeout
+
+A command is polled until the SRB's `TimeOutValue` minus one second (10 s when the SRB carries none, at most 60 s); commands the driver issues on its own (ATAPI REQUEST SENSE, MODE SENSE translation) get 3 s. Earlier builds used a fixed 3 s for everything, which was wrong both ways:
+
+- **Too short:** one write can legitimately take several seconds — disk spin-up, a dynamically expanding VHD growing under a benchmark's large test file, host cache flushes in a VM. The driver then gave up, stopped the port while the HBA was still transferring and failed the request, so long runs such as CrystalDiskMark could not finish (in QEMU the emulator itself crashed on the mid-transfer stop). Disk class drivers use a 10 s `TimeOutValue`, so a write now has 9 s.
+- **Too long for short SRBs:** ScsiPort runs its own one-second request timer. On a multiprocessor system that timer fires on another CPU while `HwStartIo` is still polling; if the poll outlasts the SRB's `TimeOutValue`, ScsiPort starts its own timeout handling (bus reset) for a request the miniport is about to complete. Ending the poll one second early keeps the miniport's timeout ahead of ScsiPort's.
+
+When a command does time out, the port restart issues a COMRESET if the command engine will not stop or the device still reports BSY/DRQ, and sets `PxCMD.ST` again only after BSY/DRQ have cleared (AHCI 1.3, 10.4.2 and 10.3.1).
 
 ### One source tree
 
@@ -335,7 +380,8 @@ LBAs are kept as two `ULONG`s (`AHCI_LBA`), so no `__int64` arithmetic — and n
 | Define | Target | What it changes |
 |---|---|---|
 | `AHCI_W9X` | Windows 95/98/Me | ABAR mapped with VMM `_MapPhysToLinear` (KB Q169584); `HwAdapterState`; debug output via VMM `_Debug_Printf_Service`; implies `AHCI_NT4` |
-| `AHCI_NT4` | NT 3.50/3.51/4.0 (and 9x) | No HBA reset (links taken over as the BIOS left them); ATAPI packets always carry the DMA bit; no `Dma64BitAddresses` in `PORT_CONFIGURATION_INFORMATION`; access range and INTx reported to ScsiPort by the miniport; no auto-sense (the class driver issues REQUEST SENSE) |
+| `AHCI_NT4` | NT 3.1/3.50/3.51/4.0 (and 9x) | No HBA reset (links taken over as the BIOS left them); ATAPI packets always carry the DMA bit; no `Dma64BitAddresses` in `PORT_CONFIGURATION_INFORMATION`; access range and INTx reported to ScsiPort by the miniport; no auto-sense (the class driver issues REQUEST SENSE) |
+| `AHCI_NT31_COMPAT` | NT build only (set by `ahcint.h` for `AHCI_NT4` without `AHCI_W9X`) | Windows NT 3.1 support in the same binary, see [Windows NT 3.1 specifics](#windows-nt-31-specifics) |
 | none | 2000/XP/2003 x86 and x64 | HBA reset (`GHC.HR`) at init; 64-bit DMA when `CAP.S64A`; PnP-assigned interrupt; auto-sense |
 
 The 2000/XP x86 and XP x64/Server 2003 x64 drivers differ only in the build environment; there are no architecture-specific code paths.

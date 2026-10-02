@@ -1,0 +1,126 @@
+AHCINT - test results for this release (QEMU 8.2, ich9-ahci)
+
+bin\NT\ahcint.sys was built from these sources with i686 MinGW (GCC 13)
+against import libraries generated from NT 3.1's own SCSIPORT.SYS and
+NTOSKRNL.EXE exports; it imports nothing NT 3.1 lacks. src\NT\build.bat
+(MSVC 4.0 + NT4 DDK) builds the same sources. For the Windows 95 tests
+bin\9X\AHCINT9X.MPD was built from the same sources with MinGW as well
+(PE layout as from MSVC: file and section alignment 200h);
+src\9X\build.bat builds the same sources with MSVC.
+bin\2KXP\i386 and bin\2KXP\amd64\ahcint.sys were built with MinGW
+(i686 / x86_64) against import libraries generated from Windows 2000's
+and XP x64's own SCSIPORT.SYS and NTOSKRNL.EXE; src\2KXP (DDK build)
+builds the same sources.
+
+Test load used throughout: a CrystalDiskMark-like tool (no buffering,
+write-through, overlapped I/O): 1 MB sequential write/read, 512 KB and
+4 KB random write/read, 4 KB at queue depth 32, then a full re-read.
+Every sector carries its own number and a generation tag, so a misplaced,
+stale or lost write is detected.
+
+Windows NT 3.1 SP0, Standard HAL
+- Driver load with NT 3.1's ScsiPort (40h-byte HW_INITIALIZATION_DATA,
+  ISA bus, PCI found through ports CF8h/CFCh).
+- AHCI data disks: FAT and NTFS formatted by NT 3.1, copies compared,
+  chkdsk clean; files also checked from the host image.
+- ATAPI CD-ROM on AHCI (CDFS), CRC32 of every file.
+- Boot from AHCI, boot.ini multi(): 32 MB up to 3 GB RAM with the
+  Windows 2000 NTLDR/NTDETECT.COM, 32/256 MB with NT 3.1's own NTLDR.
+- Boot from AHCI, boot.ini scsi() with NTBOOTDD.SYS: both loaders.
+- LBA48: NTFS partition past sector 2^28 on a 140 GB disk.
+- Two AHCI controllers (32 MB to 1 GB RAM).
+- Load test at 2 GB: D: (FAT) 200 MB, F: (NTFS, LBA48) 300 MB,
+  C: 60 MB - no errors.
+
+Windows NT 3.51 SP5, Standard HAL (system disk on AHCI)
+- FAT/NTFS format, copies, CD, load test D: 300 MB, E: 4500 MB
+  (file larger than 4 GB), C: 100 MB - no errors.
+
+Windows NT 4.0 SP6, Standard HAL and MPS HAL (halmps.dll/ntkrnlmp.exe)
+- UP: system disk on IDE and on AHCI, load test on FAT, NTFS and C:,
+  two 1000 MB runs in parallel, one 4500 MB run - no errors.
+- MPS, 2 and 4 CPUs, 256 MB to 2 GB: boot + concurrent load (three
+  load tests, CD reader, xcopy) repeated 15 times - no bugcheck.
+- Slow disk (QEMU throttled to 20 KB/s, one 128 KB write ~6 s): the
+  previous build timed out after 3 s, stopped the port mid-transfer and
+  QEMU crashed; this build completes the copy and fc /b finds no
+  differences.
+
+Logical sector sizes (QEMU 8.2.2 patched so that its ATA disks report
+1024/2048/4096-byte logical sectors in IDENTIFY words 106/117-118)
+- Windows NT 4.0 SP6: FAT and NTFS at 1024, 2048 and 4096 bytes, each
+  formatted by NT 4.0; load test, copies compared by CRC32, chkdsk
+  clean, files re-read after a cold boot. 512-byte disks re-tested.
+- Windows NT 3.1 SP0: FAT at 1024 bytes; NTFS at 1024, 2048 and 4096
+  bytes; load test and CRC32 comparison of copies. FAT at 2048/4096
+  bytes formats and the volume is valid (fsck.fat on the host), but NT
+  3.1's FASTFAT does not mount it. NT 3.1's FORMAT.COM faults
+  (UNTFS.DLL) at the end of a 4096-byte NTFS format; the volume is
+  complete and usable.
+- Windows 95 (4.00.950), data disk on AHCI, FAT16 made on the host with
+  the matching sector size: 512, 1024 and 2048 bytes work. Per size: a
+  96 MB pattern file (sequential, random 4 KB and 32 KB writes, full
+  verify), XCOPY of WINDOWS\SYSTEM (274 files) compared by CRC32 in the
+  guest, then the image checked on the host (fsck.fat, pattern file,
+  every copied file) - no errors. Windows 95 reports the sector size
+  through GetDiskFreeSpace (1024/2048).
+  4096 bytes: the driver reads the MBR and boot sector at boot (4096
+  bytes each), after that Windows 95 sends only TEST UNIT READY and
+  answers every access with "General failure reading drive D".
+- Not covered: Windows 98/Me, 2000/XP, NT 3.50/3.51 with large sectors.
+
+Windows 2000 (5.0.2195, system disk on AHCI, booted with bin\2KXP\i386)
+- Data disks with 512, 1024, 2048 and 4096-byte logical sectors on one
+  controller. Each volume formatted by Windows 2000 as FAT, then as
+  NTFS. Per volume: 100 MB load test, copy of WINNT\INF and
+  SYSTEM32\DRIVERS (1281 files) compared by CRC32, then after a cold
+  boot all files re-read and compared, chkdsk /f clean. FAT volumes
+  also checked on the host with fsck.fat - no errors.
+
+Windows XP x64 (5.2.3790), text-mode setup with F6 (bin\2KXP\amd64)
+- Reproduced with the previous build: AHCI controller with the target
+  disk and the setup CD, driver from the F6 floppy -> STOP 0x7B
+  (C0000034). The driver loaded, ScsiPort's AddDevice succeeded,
+  IRP_MN_START_DEVICE failed (STATUS_UNSUCCESSFUL) before HwFindAdapter
+  was called. Cause: Parameters\PnpInterface missing from the text-mode
+  registry (see README, Windows 2000/XP/x64 specifics); adding it to
+  txtsetup.oem's [Config] section does not help, since setup applies
+  those values only to the installed system.
+- The F6 disks' txtsetup.oem now also list PnpInterface in [Config]
+  (for the installed system); the driver no longer depends on it.
+- This build: setup finds the disk and the CD, partition/format (NTFS)
+  and file copy complete, the first boot from the AHCI disk reaches
+  GUI-mode setup (driver loaded from the installed system). The rest of
+  GUI-mode setup was not run (product key).
+
+Windows 95 test environment notes
+- The system disk was on QEMU's IDE controller, the AHCI controller
+  presented as ICH8M (8086:2829) like in the VirtualBox VM. With the
+  system disk on AHCI, SeaBIOS's INT 13h made Windows 95 stop with
+  "While initializing device IOS: An I/O subsystem driver failed to
+  load" - also with the AHCI driver removed, so not driver related.
+- When SeaBIOS also serves an AHCI disk through INT 13h, Windows 95
+  shows it twice: once through AHCINT9X and once in MS-DOS
+  compatibility mode (same with the VM's own ahcint9x.mpd). The tests hid
+  the AHCI disks from SeaBIOS (prog-if 00); the driver accepts the
+  ICH8M by its ID.
+
+Not reproduced here
+- CrystalDiskMark itself: the supplied CrystalMark Retro 2.1.0 package
+  holds only the XP SP2+ executables (they import GetFileSizeEx,
+  SetFilePointerEx, EncodePointer, ... which NT4 lacks), not
+  CrystalMarkRetroNT.exe. The fix above addresses the one failure mode
+  found under a CrystalDiskMark-like load.
+- The intermittent 0xA on MPS HALs did not occur in any run, with or
+  without the timeout change. The timeout change removes one MP-only
+  race (see README, Command timeout); whether it is the reported one
+  could not be confirmed.
+
+Test environment note
+- In this QEMU setup, scsi() boots of NT 3.1 sometimes stopped in NTLDR
+  with "could not read from the selected boot disk" while the emulator
+  received no outside events. It happened identically with the previous
+  release, with NT 3.1's own NTLDR and with HwResetBus disabled, never
+  with multi(), and never while the QEMU monitor was active. It was not
+  seen on the previous day's host and is treated as an emulator timing
+  artifact; worth one check on VirtualBox or real hardware.

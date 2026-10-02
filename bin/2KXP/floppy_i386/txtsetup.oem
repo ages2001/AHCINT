@@ -1,0 +1,69 @@
+#
+# TXTSETUP.OEM - AHCI SATA Driver for Windows 2000/XP text-mode setup
+#
+# This file is used during text-mode setup to install the AHCI driver
+# for boot from AHCI SATA controllers.
+#
+
+[Disks]
+
+# <description> is a descriptive name for a disk, used when
+#   prompting for the disk
+# <tagfile> is a file whose presence allows setup to recognize
+#   that the disk is inserted.
+# <directory> is where the files are located on the disk.
+
+d1 = "AHCINT SATA AHCI Driver Disk", \disk1, \
+
+
+[Defaults]
+
+# This section lists the default selection for the 'scsi' component.
+
+scsi = AHCINT
+
+
+[scsi]
+
+# <id> is the unique string for the option
+# <description> is a text string, presented to the user in a menu
+# <key_name> gives the name of the key to be created for the component in
+#   HKEY_LOCAL_MACHINE\ControlSet001\Services
+
+AHCINT = "AHCINT SATA AHCI Storage Controller (ages2001)", AHCINT
+
+
+[HardwareIds.scsi.AHCINT]
+
+# This section lists the hardware IDs of devices that this driver supports.
+# AHCI devices use PCI class code 01/06/01:
+#   Class 01 = Mass Storage Controller
+#   Subclass 06 = SATA controller
+#   Programming Interface 01 = AHCI
+
+id = "PCI\CC_010601", "AHCINT"
+
+
+[Files.scsi.AHCINT]
+
+# <file_type> is one of driver, port, class, dll, hal, inf, or detect.
+# <source_disk> identifies where the file is to be copied from, and must
+#   match an entry in the [Disks] section.
+# <filename> is the name of the file.
+
+driver = d1, AHCINT.sys, AHCINT
+inf    = d1, AHCINT.inf
+
+
+[Config.scsi.AHCINT]
+
+# This section specifies values to be set in the registry for
+# this component option. <key_name> is relative to the services node
+# for this device; empty means the services node itself.
+
+value = "", Tag, REG_DWORD, 40
+value = "", Type, REG_DWORD, 1
+value = "", Start, REG_DWORD, 0
+value = "", Group, REG_SZ, "SCSI Miniport"
+value = "", ErrorControl, REG_DWORD, 1
+value = Parameters\PnpInterface, 5, REG_DWORD, 1

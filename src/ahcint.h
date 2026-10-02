@@ -2,7 +2,7 @@
  * AHCINT - SATA AHCI SCSI miniport driver
  *
  *   AHCI_W9X  Windows 95/98/Me (implies AHCI_NT4)
- *   AHCI_NT4  Windows NT 3.50/3.51/4.0
+ *   AHCI_NT4  Windows NT 3.1/3.50/3.51/4.0
  *   (neither) Windows 2000/XP/2003, x86 and x64
  */
 
@@ -27,6 +27,28 @@
 #else
 #define AHCI_HAS_DMA64          1
 #define AHCI_AUTOSENSE          1
+#endif
+
+/* The NT build also runs on NT 3.1, whose ScsiPort and HAL differ:
+   HW_INITIALIZATION_DATA must be exactly 40h bytes, the ConfigInfo is
+   58h bytes (no SlotNumber / MaximumNumberOfTargets), the HAL has no PCI
+   configuration access and ScsiPortSetBusDataByOffset does not exist. */
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+#define AHCI_NT31_COMPAT
+#endif
+
+#ifndef FIELD_OFFSET
+#define FIELD_OFFSET(type, field)       ((LONG)&(((type *)0)->field))
+#endif
+
+#ifdef AHCI_NT31_COMPAT
+/* NT 3.1 HW_INITIALIZATION_DATA ends where VendorId starts; NT 3.50 to
+   4.0 accept the structure up to DeviceId. */
+#define AHCI_HWINIT_SIZE_NT31           ((ULONG)FIELD_OFFSET(HW_INITIALIZATION_DATA, VendorId))
+#define AHCI_HWINIT_SIZE_NT35           ((ULONG)FIELD_OFFSET(HW_INITIALIZATION_DATA, DeviceId) + sizeof(PVOID))
+
+/* ConfigInfo field present in the structure ScsiPort handed us? */
+#define AHCI_CONFIG_HAS(ci, field)      ((ci)->Length >= (ULONG)FIELD_OFFSET(PORT_CONFIGURATION_INFORMATION, field) + sizeof((ci)->field))
 #endif
 
 /* NT family: always; 9x: DEBUG builds only */
@@ -67,7 +89,8 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define MAX_SUPPORTED_PORTS             8           /* 1..32; also the initiator ID */
 #define AHCI_MAX_CONTROLLERS            8
 #define AHCI_MAX_TRANSFER               0x20000     /* 128 KB */
-#define AHCI_SECTOR_SIZE                512
+#define AHCI_SECTOR_SIZE                512         /* default logical sector */
+#define AHCI_MAX_SECTOR_SIZE            4096        /* largest logical sector taken */
 
 /* An unaligned 128 KB buffer spans 33 pages; the command table fits 120 */
 #define AHCI_MAX_PHYS_BREAKS            32
@@ -85,7 +108,10 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define PCI_SUBCLASS_AHCI               0x06
 #define PCI_PROGIF_AHCI                 0x01
 #define AHCI_ABAR_INDEX                 5           /* BAR5 = ABAR */
-#define AHCI_ABAR_MAP_SIZE              0x10000
+/* Generic host registers plus the port blocks the driver uses. Claimed
+   and mapped as is: HBAs often sit only 4 KB apart, so a larger range
+   would collide with the next controller's ABAR. */
+#define AHCI_ABAR_MAP_SIZE              (0x100 + 0x80 * MAX_SUPPORTED_PORTS)
 
 /* ------------------------------------------------------------------ */
 /* HBA registers                                                       */
@@ -169,7 +195,15 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 
 /* Polling (Fast Polling: every command is completed inside HwStartIo) */
 #define AHCI_POLL_INTERVAL_USEC         10
-#define AHCI_POLL_TIMEOUT_USEC          3000000
+
+/* Per-command limit, from the SRB's TimeOutValue and ending one second
+   before ScsiPort's own request timer would expire: a single write can
+   take seconds (spin-up, a growing dynamic VHD, host cache flushes), and
+   on MP systems the port driver's timer runs on another CPU while
+   HwStartIo still polls. */
+#define AHCI_POLL_TIMEOUT_DEFAULT_SEC   10      /* SRB without TimeOutValue */
+#define AHCI_POLL_TIMEOUT_INTERNAL_SEC  3       /* driver's own commands */
+#define AHCI_POLL_TIMEOUT_MAX_SEC       60
 
 /* ------------------------------------------------------------------ */
 /* ATA                                                                 */
@@ -210,12 +244,19 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define IDW_CMDSET_SUPPORTED_2          83
 #define IDW_CMDSET_ENABLED_2            86
 #define IDW_LBA48_SECTORS               100         /* 100..103 */
+#define IDW_SECTOR_SIZE_INFO            106
+#define IDW_LOGICAL_SECTOR_WORDS        117         /* 117..118 */
 
 #define IDW49_LBA_SUPPORTED             0x0200
 #define IDW83_VALID_MASK                0xC000
 #define IDW83_VALID                     0x4000
 #define IDW83_LBA48                     0x0400
 #define IDW86_LBA48                     0x0400
+#define IDW106_VALID_MASK               0xC000
+#define IDW106_VALID                    0x4000
+#define IDW106_MULTI_LOGICAL            0x2000      /* several logical per physical */
+#define IDW106_LONG_LOGICAL             0x1000      /* logical sector > 256 words */
+#define IDW106_PHYS_EXP_MASK            0x000F
 
 /* 28-bit commands: LBA 0..0x0FFFFFFF, 1..256 sectors (count 0 = 256).
    48-bit commands: 1..65536 sectors (count 0 = 65536). */
@@ -339,7 +380,9 @@ typedef struct _AHCI_PORT_INFO {
     /* Parsed from IDENTIFY DEVICE (ATA only), see AhciParseIdentify */
     BOOLEAN                 LbaSupported;
     BOOLEAN                 Lba48;
-    AHCI_LBA                TotalSectors;
+    AHCI_LBA                TotalSectors;   /* in logical sectors */
+    ULONG                   SectorSize;     /* logical sector, bytes */
+    UCHAR                   PhysExponent;   /* log2(logical sectors per physical) */
 
     /* Sense data for the next REQUEST SENSE on an ATA target (ATAPI
        targets answer REQUEST SENSE from the drive itself). */

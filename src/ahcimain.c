@@ -141,6 +141,96 @@ AhciPciConfigIsAhci(IN PPCI_COMMON_CONFIG PciConfig)
     return FALSE;
 }
 
+#ifdef AHCI_NT31_COMPAT
+/* Configuration mechanism #1 through the I/O ports, for a HAL without PCI
+   support (NT 3.1). On x86 the HAL maps I/O ports 1:1, so the port
+   number is the address the ScsiPort port functions take. */
+#define AHCI_PCI_CONFIG_ADDRESS         0xCF8
+#define AHCI_PCI_CONFIG_DATA            0xCFC
+#define AHCI_PCI_CONFIG_ENABLE          0x80000000UL
+
+static BOOLEAN g_AhciPciProbed;
+static BOOLEAN g_AhciPciViaPorts;
+
+static VOID
+AhciPciSelect(IN ULONG Bus, IN ULONG Slot, IN ULONG Offset)
+{
+    PCI_SLOT_NUMBER slot;
+
+    slot.u.AsULONG = Slot;
+    ScsiPortWritePortUlong((PULONG)AHCI_PCI_CONFIG_ADDRESS,
+                           AHCI_PCI_CONFIG_ENABLE | ((Bus & 0xFF) << 16) |
+                           ((ULONG)slot.u.bits.DeviceNumber << 11) |
+                           ((ULONG)slot.u.bits.FunctionNumber << 8) |
+                           (Offset & 0xFC));
+}
+
+static ULONG
+AhciPciReadPortDword(IN ULONG Bus, IN ULONG Slot, IN ULONG Offset)
+{
+    AhciPciSelect(Bus, Slot, Offset);
+    return ScsiPortReadPortUlong((PULONG)AHCI_PCI_CONFIG_DATA);
+}
+
+/* FALSE for an empty function */
+static BOOLEAN
+AhciPciReadPortHeader(IN ULONG Bus, IN ULONG Slot, OUT PPCI_COMMON_CONFIG PciConfig)
+{
+    PULONG dw = (PULONG)PciConfig;
+    ULONG i;
+
+    dw[0] = AhciPciReadPortDword(Bus, Slot, 0);
+    if ((dw[0] & 0xFFFF) == 0xFFFF || (dw[0] & 0xFFFF) == 0) return FALSE;
+
+    for (i = 1; i < AHCI_PCI_HEADER_LENGTH / sizeof(ULONG); i++) {
+        dw[i] = AhciPciReadPortDword(Bus, Slot, i * sizeof(ULONG));
+    }
+    return TRUE;
+}
+
+/* Once per driver: does config space have to go through the ports? */
+static VOID
+AhciPciProbeAccess(IN PHW_DEVICE_EXTENSION HwInit)
+{
+    ULONG id;
+    ULONG save;
+
+    if (g_AhciPciProbed) return;
+    g_AhciPciProbed = TRUE;
+
+    /* The HAL answers for bus 0 whenever it knows PCI at all */
+    if (ScsiPortGetBusData(HwInit, PCIConfiguration, 0, 0, &id, sizeof(ULONG)) != 0) return;
+
+    save = ScsiPortReadPortUlong((PULONG)AHCI_PCI_CONFIG_ADDRESS);
+    ScsiPortWritePortUlong((PULONG)AHCI_PCI_CONFIG_ADDRESS, AHCI_PCI_CONFIG_ENABLE);
+    if (ScsiPortReadPortUlong((PULONG)AHCI_PCI_CONFIG_ADDRESS) == AHCI_PCI_CONFIG_ENABLE) {
+        g_AhciPciViaPorts = TRUE;
+    }
+    ScsiPortWritePortUlong((PULONG)AHCI_PCI_CONFIG_ADDRESS, save);
+
+    AHCI_DBG((AHCI_PFX "PCI: no HAL config access, mechanism #1 %s\n",
+              g_AhciPciViaPorts ? "used" : "not found"));
+}
+#endif /* AHCI_NT31_COMPAT */
+
+/* Memory space + bus master on, INTx disable off */
+static VOID
+AhciPciEnableDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Bus, IN ULONG Slot, IN USHORT Command)
+{
+    USHORT pciCmd = (USHORT)((Command | 0x0006) & ~(1 << 10));
+
+#ifdef AHCI_NT31_COMPAT
+    /* No ScsiPortSetBusDataByOffset to import on NT 3.1: write the command
+       register through the ports, and only when the BIOS left it off. */
+    (VOID)HwInit;
+    if (pciCmd == Command) return;
+    AhciPciSelect(Bus, Slot, 0x04);
+    ScsiPortWritePortUshort((PUSHORT)(AHCI_PCI_CONFIG_DATA + (0x04 & 2)), pciCmd);
+#else
+    ScsiPortSetBusDataByOffset(HwInit, PCIConfiguration, Bus, Slot, &pciCmd, 0x04, sizeof(USHORT));
+#endif
+}
+
 /* FALSE for an empty slot; *BusMissing when the bus does not exist */
 static BOOLEAN
 AhciReadPciHeader(
@@ -152,6 +242,13 @@ AhciReadPciHeader(
 )
 {
     ULONG bytesRead;
+
+#ifdef AHCI_NT31_COMPAT
+    if (g_AhciPciViaPorts) {
+        if (BusMissing != NULL) *BusMissing = FALSE;
+        return AhciPciReadPortHeader(Bus, Slot, PciConfig);
+    }
+#endif
 
     bytesRead = ScsiPortGetBusData(HwInit, PCIConfiguration, Bus, Slot,
                                    PciConfig, AHCI_PCI_HEADER_LENGTH);
@@ -335,10 +432,34 @@ AhciStopPortEngines(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR PortBase)
 VOID
 AhciRestartPort(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR PortBase)
 {
+    ULONG timeout;
+
     AhciStopPortEngines(HwInit, PortBase);
+
+    /* Engine still running or device still busy (a timed-out command):
+       COMRESET, as AHCI 1.3 section 10.4.2 asks. */
+    if ((AHCI_READ_REG(PortBase, AHCI_PORT_CMD) & (AHCI_PORT_CMD_CR | AHCI_PORT_CMD_FR)) ||
+        (AHCI_READ_REG(PortBase, AHCI_PORT_TFD) & (TFD_STS_BSY | TFD_STS_DRQ))) {
+        AHCI_DBG((AHCI_PFX "RestartPort: engine/device busy, COMRESET\n"));
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_SCTL, 0x301);
+        ScsiPortStallExecution(1000);
+        AHCI_WRITE_REG(PortBase, AHCI_PORT_SCTL, 0x300);
+        timeout = 1000;
+        while ((AHCI_READ_REG(PortBase, AHCI_PORT_SSTS) & AHCI_SSTS_DET_MASK) != AHCI_SSTS_DET_PHY && --timeout) {
+            ScsiPortStallExecution(1000);
+        }
+    }
+
     AHCI_WRITE_REG(PortBase, AHCI_PORT_SERR, 0xFFFFFFFF);
     AHCI_WRITE_REG(PortBase, AHCI_PORT_IS, 0xFFFFFFFF);
     AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_FRE);
+
+    /* ST only once the device has dropped BSY/DRQ (AHCI 10.3.1) */
+    timeout = 2000;
+    while ((AHCI_READ_REG(PortBase, AHCI_PORT_TFD) & (TFD_STS_BSY | TFD_STS_DRQ)) && --timeout) {
+        ScsiPortStallExecution(1000);
+    }
+
     AHCI_WRITE_REG(PortBase, AHCI_PORT_CMD, AHCI_READ_REG(PortBase, AHCI_PORT_CMD) | AHCI_PORT_CMD_ST);
 }
 
@@ -526,6 +647,103 @@ AhciInitializePort(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG PortNumber)
 /* DriverEntry                                                         */
 /* ------------------------------------------------------------------ */
 
+#ifdef AHCI_NT31_COMPAT
+static BOOLEAN g_AhciFindAdapterCalled;
+#endif
+
+#if !defined(AHCI_NT4)
+/* Text-mode setup boots with a bare service key: the [Config] values of
+   txtsetup.oem reach only the installed system. Without
+   Parameters\PnpInterface the x64 ScsiPort fails IRP_MN_START_DEVICE
+   before HwFindAdapter (STOP 0x7B), so the driver adds the entry the INF
+   would have made. Declared here: miniport.h has no registry API. */
+typedef struct _AHCI_UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    USHORT *Buffer;
+} AHCI_UNICODE_STRING, *PAHCI_UNICODE_STRING;
+
+typedef struct _AHCI_OBJECT_ATTRIBUTES {
+    ULONG Length;
+    PVOID RootDirectory;
+    PAHCI_UNICODE_STRING ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} AHCI_OBJECT_ATTRIBUTES;
+
+LONG __stdcall ZwOpenKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAttributes);
+LONG __stdcall ZwCreateKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAttributes,
+                           ULONG TitleIndex, PVOID Class, ULONG CreateOptions, PULONG Disposition);
+LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
+                             PVOID Data, ULONG DataSize);
+LONG __stdcall ZwClose(PVOID Handle);
+
+#define AHCI_OBJ_CASE_INSENSITIVE       0x00000040
+#define AHCI_OBJ_KERNEL_HANDLE          0x00000200
+#define AHCI_KEY_READ_WRITE             0x0002001F  /* KEY_READ | KEY_WRITE */
+#define AHCI_REG_CREATED_NEW_KEY        1
+#define AHCI_REG_DWORD                  4
+
+static USHORT g_AhciParametersName[] = L"Parameters";
+static USHORT g_AhciPnpInterfaceName[] = L"PnpInterface";
+static USHORT g_AhciPciBusValueName[] = L"5";              /* PCIBus */
+
+static VOID
+AhciInitString(OUT PAHCI_UNICODE_STRING String, IN USHORT *Text, IN ULONG Bytes)
+{
+    String->Buffer = Text;
+    String->Length = (USHORT)(Bytes - sizeof(USHORT));
+    String->MaximumLength = (USHORT)Bytes;
+}
+
+static VOID
+AhciInitAttributes(OUT AHCI_OBJECT_ATTRIBUTES *Oa, IN PAHCI_UNICODE_STRING Name, IN PVOID Root)
+{
+    Oa->Length = sizeof(AHCI_OBJECT_ATTRIBUTES);
+    Oa->RootDirectory = Root;
+    Oa->ObjectName = Name;
+    Oa->Attributes = AHCI_OBJ_CASE_INSENSITIVE | AHCI_OBJ_KERNEL_HANDLE;
+    Oa->SecurityDescriptor = NULL;
+    Oa->SecurityQualityOfService = NULL;
+}
+
+static VOID
+AhciEnsurePnpInterface(IN PVOID RegistryPath)
+{
+    AHCI_OBJECT_ATTRIBUTES oa;
+    AHCI_UNICODE_STRING name;
+    PVOID service, params, pnp;
+    ULONG disposition = 0;
+    ULONG one = 1;
+    LONG status;
+
+    if (RegistryPath == NULL) return;
+
+    AhciInitAttributes(&oa, (PAHCI_UNICODE_STRING)RegistryPath, NULL);
+    if (ZwOpenKey(&service, AHCI_KEY_READ_WRITE, &oa) < 0) return;
+
+    AhciInitString(&name, g_AhciParametersName, sizeof(g_AhciParametersName));
+    AhciInitAttributes(&oa, &name, service);
+    status = ZwCreateKey(&params, AHCI_KEY_READ_WRITE, &oa, 0, NULL, 0, &disposition);
+    if (status >= 0) {
+        AhciInitString(&name, g_AhciPnpInterfaceName, sizeof(g_AhciPnpInterfaceName));
+        AhciInitAttributes(&oa, &name, params);
+        status = ZwCreateKey(&pnp, AHCI_KEY_READ_WRITE, &oa, 0, NULL, 0, &disposition);
+        if (status >= 0) {
+            if (disposition == AHCI_REG_CREATED_NEW_KEY) {
+                AhciInitString(&name, g_AhciPciBusValueName, sizeof(g_AhciPciBusValueName));
+                status = ZwSetValueKey(pnp, &name, 0, AHCI_REG_DWORD, &one, sizeof(one));
+                AHCI_DBG((AHCI_PFX "DriverEntry: Parameters\\PnpInterface\\5 added (%08lX)\n", (ULONG)status));
+            }
+            ZwClose(pnp);
+        }
+        ZwClose(params);
+    }
+    ZwClose(service);
+}
+#endif
+
 ULONG
 DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 {
@@ -536,7 +754,11 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 
     ZeroMemoryBytes(&initData, sizeof(HW_INITIALIZATION_DATA));
 
+#ifdef AHCI_NT31_COMPAT
+    initData.HwInitializationDataSize = AHCI_HWINIT_SIZE_NT35;
+#else
     initData.HwInitializationDataSize = sizeof(HW_INITIALIZATION_DATA);
+#endif
     initData.HwInitialize = AhciHwInitialize;
     initData.HwStartIo = AhciStartIo;
     initData.HwInterrupt = AhciInterrupt;
@@ -555,7 +777,23 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
     initData.AutoRequestSense = FALSE;
     initData.MultipleRequestPerLu = FALSE;
 
+#if !defined(AHCI_NT4)
+    AhciEnsurePnpInterface(Argument2);
+#endif
+
     status = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
+
+#ifdef AHCI_NT31_COMPAT
+    /* NT 3.1 refuses any other structure size before HwFindAdapter is ever
+       called, and has no PCI bus to scan: retry with its 40h-byte layout on
+       the ISA bus. The PCI functions are then found through the ports. */
+    if (status != 0 && !g_AhciFindAdapterCalled) {
+        AHCI_DBG((AHCI_PFX "DriverEntry: %08lX, retrying with the NT 3.1 layout\n", status));
+        initData.HwInitializationDataSize = AHCI_HWINIT_SIZE_NT31;
+        initData.AdapterInterfaceType = Isa;
+        status = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
+    }
+#endif
 
     AHCI_DBG((AHCI_PFX "DriverEntry: ScsiPortInitialize returned %08lX\n", status));
     return status;
@@ -580,11 +818,12 @@ AhciFindAdapter(
     PACCESS_RANGE accessRanges;
     SCSI_PHYSICAL_ADDRESS basePhys;
     ULONG targetBus, targetSlot;
+    ULONG mapBus;
     ULONG bar;
     ULONG i;
-    USHORT pciCmd;
     BOOLEAN found;
     BOOLEAN ownSlot;
+    BOOLEAN hasSlot;
 
     (VOID)Context;
     (VOID)BusInformation;
@@ -594,18 +833,29 @@ AhciFindAdapter(
     accessRanges = *ConfigInfo->AccessRanges;
     *Again = FALSE;
 
+#ifdef AHCI_NT31_COMPAT
+    g_AhciFindAdapterCalled = TRUE;
+    AhciPciProbeAccess(hwInit);
+    /* NT 3.1: no SlotNumber, called for the ISA bus rather than a PCI slot */
+    hasSlot = (BOOLEAN)AHCI_CONFIG_HAS(ConfigInfo, SlotNumber);
+#else
+    hasSlot = TRUE;
+#endif
+
     if (hwInit->AbarMapped != NULL) return SP_RETURN_FOUND;
 
     AHCI_DBG((AHCI_PFX "FindAdapter: called for bus %lu slot %08lX, %lu access range(s)\n",
-              ConfigInfo->SystemIoBusNumber, ConfigInfo->SlotNumber, ConfigInfo->NumberOfAccessRanges));
+              ConfigInfo->SystemIoBusNumber, hasSlot ? ConfigInfo->SlotNumber : 0xFFFFFFFF,
+              ConfigInfo->NumberOfAccessRanges));
 
     /* Step 1: the function ScsiPort / PnP / SCSIPORT.PDR called us for */
     found = FALSE;
     ownSlot = FALSE;
     targetBus = ConfigInfo->SystemIoBusNumber;
-    targetSlot = ConfigInfo->SlotNumber;
+    targetSlot = hasSlot ? ConfigInfo->SlotNumber : 0;
 
-    if (AhciReadPciHeader(hwInit, targetBus, targetSlot, &pciConfig, NULL) &&
+    if (hasSlot &&
+        AhciReadPciHeader(hwInit, targetBus, targetSlot, &pciConfig, NULL) &&
         AhciPciConfigIsAhci(&pciConfig) &&
         !AhciIsDeviceClaimed(targetBus, targetSlot)) {
         found = TRUE;
@@ -652,10 +902,7 @@ AhciFindAdapter(
     hwInit->PciBus = targetBus;
     hwInit->PciSlot = targetSlot;
 
-    /* Memory space + bus master on, INTx disable off */
-    pciCmd = (USHORT)((pciConfig.Command | 0x0006) & ~(1 << 10));
-    ScsiPortSetBusDataByOffset(hwInit, PCIConfiguration, targetBus, targetSlot,
-                               &pciCmd, 0x04, sizeof(USHORT));
+    AhciPciEnableDevice(hwInit, targetBus, targetSlot, pciConfig.Command);
 
 #ifdef AHCI_NT4
     /* Non-PnP ScsiPort: report the range we use so it gets claimed */
@@ -666,14 +913,19 @@ AhciFindAdapter(
     }
 #endif
 
+    /* Without a slot (NT 3.1) the ABAR is mapped on the bus ScsiPort
+       called us for: there is no PCI bus to translate on. */
+    mapBus = hasSlot ? targetBus : ConfigInfo->SystemIoBusNumber;
+
 #ifdef AHCI_W9X
+    (VOID)mapBus;
     hwInit->AbarMapped = (PUCHAR)_MapPhysToLinear(basePhys.LowPart, AHCI_ABAR_MAP_SIZE, MPL_NonCached);
     if (hwInit->AbarMapped == (PUCHAR)0xFFFFFFFF) {
         hwInit->AbarMapped = NULL;
     }
 #else
     hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(hwInit, ConfigInfo->AdapterInterfaceType,
-                                                       targetBus, basePhys, AHCI_ABAR_MAP_SIZE, FALSE);
+                                                       mapBus, basePhys, AHCI_ABAR_MAP_SIZE, FALSE);
     if (hwInit->AbarMapped == NULL && ConfigInfo->AdapterInterfaceType != PCIBus) {
         hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(hwInit, PCIBus, targetBus, basePhys,
                                                            AHCI_ABAR_MAP_SIZE, FALSE);
@@ -685,15 +937,29 @@ AhciFindAdapter(
         return SP_RETURN_ERROR;
     }
 
-    ConfigInfo->SystemIoBusNumber = targetBus;
-    ConfigInfo->SlotNumber = targetSlot;
-
+    if (hasSlot) {
+        ConfigInfo->SystemIoBusNumber = targetBus;
+        ConfigInfo->SlotNumber = targetSlot;
+        ConfigInfo->MaximumNumberOfTargets = MAX_SUPPORTED_PORTS;
 #ifdef AHCI_NT4
-    /* When the miniport picks the slot itself, NT4 ScsiPort does not look
-       up the interrupt for it -- take INTx from config space. */
-    ConfigInfo->BusInterruptLevel = pciConfig.u.type0.InterruptLine;
-    ConfigInfo->BusInterruptVector = pciConfig.u.type0.InterruptLine;
+        /* When the miniport picks the slot itself, ScsiPort does not look
+           up the interrupt for it -- take INTx from config space. */
+        ConfigInfo->BusInterruptLevel = pciConfig.u.type0.InterruptLine;
+        ConfigInfo->BusInterruptVector = pciConfig.u.type0.InterruptLine;
 #endif
+    } else {
+        /* NT 3.1: Fast Polling needs no interrupt, and the PCI INTx line
+           means nothing on the ISA bus -- level 0 connects none. Ask to be
+           called again for the next HBA. */
+        ConfigInfo->BusInterruptLevel = 0;
+        ConfigInfo->BusInterruptVector = 0;
+        *Again = TRUE;
+        /* NT 3.1 HAL: an ISA bus master always gets map registers below
+           16 MB, and the copy-back from them overwrites data the SATL wrote
+           itself. A scatter/gather master on EISA gets real physical
+           addresses. Must be set before the uncached extension is taken. */
+        ConfigInfo->AdapterInterfaceType = Eisa;
+    }
     ConfigInfo->InterruptMode = LevelSensitive;
 
     hwInit->HbaCapabilities = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_CAP);
@@ -706,7 +972,6 @@ AhciFindAdapter(
     ConfigInfo->ScatterGather = TRUE;
     ConfigInfo->MaximumTransferLength = AHCI_MAX_TRANSFER;
     ConfigInfo->NumberOfPhysicalBreaks = AHCI_MAX_PHYS_BREAKS;
-    ConfigInfo->MaximumNumberOfTargets = MAX_SUPPORTED_PORTS;
     ConfigInfo->NumberOfBuses = 1;
     /* ScsiPort skips the initiator ID when scanning: keep it past the last port */
     ConfigInfo->InitiatorBusId[0] = (UCHAR)MAX_SUPPORTED_PORTS;

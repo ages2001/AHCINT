@@ -96,8 +96,30 @@ AhciParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port)
     pi->Lba48 = FALSE;
     pi->TotalSectors.Low = 0;
     pi->TotalSectors.High = 0;
+    pi->SectorSize = AHCI_SECTOR_SIZE;
+    pi->PhysExponent = 0;
 
     if (!pi->IdentifyValid || pi->IsAtapi) return;
+
+    /* Word 106: logical sector size (words 117-118) and logical sectors per
+       physical sector; all LBAs and counts are in logical sectors. */
+    if ((id[IDW_SECTOR_SIZE_INFO] & IDW106_VALID_MASK) == IDW106_VALID) {
+        if (id[IDW_SECTOR_SIZE_INFO] & IDW106_LONG_LOGICAL) {
+            ULONG bytes = ((ULONG)id[IDW_LOGICAL_SECTOR_WORDS] |
+                           ((ULONG)id[IDW_LOGICAL_SECTOR_WORDS + 1] << 16)) * 2;
+            if (bytes >= AHCI_SECTOR_SIZE && bytes <= AHCI_MAX_SECTOR_SIZE &&
+                (bytes & (bytes - 1)) == 0) {
+                pi->SectorSize = bytes;
+            } else {
+                AHCI_DBG((AHCI_PFX "Port %lu: logical sector of %lu bytes not supported\n", Port, bytes));
+                pi->IdentifyValid = FALSE;
+                return;
+            }
+        }
+        if (id[IDW_SECTOR_SIZE_INFO] & IDW106_MULTI_LOGICAL) {
+            pi->PhysExponent = (UCHAR)(id[IDW_SECTOR_SIZE_INFO] & IDW106_PHYS_EXP_MASK);
+        }
+    }
 
     pi->LbaSupported = (BOOLEAN)((id[IDW_CAPABILITIES] & IDW49_LBA_SUPPORTED) != 0);
 
@@ -115,12 +137,13 @@ AhciParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port)
         pi->TotalSectors.Low = (ULONG)id[IDW_LBA28_SECTORS] | ((ULONG)id[IDW_LBA28_SECTORS + 1] << 16);
     }
 
-    AHCI_DBG((AHCI_PFX "Port %lu: LBA=%s LBA48=%s (W83=%04lX W86=%04lX) sectors=%08lX:%08lX\n",
+    AHCI_DBG((AHCI_PFX "Port %lu: LBA=%s LBA48=%s (W83=%04lX W86=%04lX) sectors=%08lX:%08lX x %lu bytes, %lu per physical\n",
               Port,
               pi->LbaSupported ? "yes" : "no",
               pi->Lba48 ? "yes" : "no",
               (ULONG)id[IDW_CMDSET_SUPPORTED_2], (ULONG)id[IDW_CMDSET_ENABLED_2],
-              pi->TotalSectors.High, pi->TotalSectors.Low));
+              pi->TotalSectors.High, pi->TotalSectors.Low,
+              pi->SectorSize, 1UL << pi->PhysExponent));
 
     if (!pi->LbaSupported) {
         /* SATA mandates LBA; a CHS-only device is not addressable here. */
@@ -289,6 +312,7 @@ AhciRunCommand(
     PAHCI_PRDT_ENTRY prdt;
     ULONG prdtEntries;
     ULONG elapsed;
+    ULONG timeoutUsec;
     ULONG ci, portIs, tfd;
     ULONG result;
     ULONG i;
@@ -371,6 +395,15 @@ AhciRunCommand(
 
     AHCI_WRITE_REG(portBase, AHCI_PORT_CI, 1);
 
+    if (Srb == NULL) {
+        timeoutUsec = AHCI_POLL_TIMEOUT_INTERNAL_SEC;
+    } else {
+        timeoutUsec = Srb->TimeOutValue ? Srb->TimeOutValue : AHCI_POLL_TIMEOUT_DEFAULT_SEC;
+        if (timeoutUsec > 1) timeoutUsec--;
+        if (timeoutUsec > AHCI_POLL_TIMEOUT_MAX_SEC) timeoutUsec = AHCI_POLL_TIMEOUT_MAX_SEC;
+    }
+    timeoutUsec *= 1000000UL;
+
     result = AHCI_CMD_OK;
     elapsed = 0;
     for (;;) {
@@ -383,7 +416,7 @@ AhciRunCommand(
             break;
         }
         if (!(ci & 1)) break;
-        if (elapsed >= AHCI_POLL_TIMEOUT_USEC) {
+        if (elapsed >= timeoutUsec) {
             result = AHCI_CMD_HBA_ERROR;
             break;
         }
@@ -401,7 +434,7 @@ AhciRunCommand(
         AHCI_DBG((AHCI_PFX "Port %lu: cmd %02lX %s, TFD=%08lX IS=%08lX CI=%08lX\n",
                   Port,
                   (ULONG)(Req->IsAtapi ? Req->Cdb[0] : Req->Command),
-                  (elapsed >= AHCI_POLL_TIMEOUT_USEC) ? "timed out" : "failed",
+                  (elapsed >= timeoutUsec) ? "timed out" : "failed",
                   tfd, portIs, ci));
         AhciRestartPort(HwInit, portBase);
     }
@@ -571,7 +604,7 @@ AhciHandleReadCapacity10(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI
     AHCI_LBA last = AhciLastLba(&HwInit->Ports[Port]);
 
     AhciPutBigEndian32(&data[0], (last.High != 0) ? 0xFFFFFFFF : last.Low);
-    AhciPutBigEndian32(&data[4], AHCI_SECTOR_SIZE);
+    AhciPutBigEndian32(&data[4], HwInit->Ports[Port].SectorSize);
 
     AhciCopyToSrb(Srb, data, sizeof(data));
     Srb->SrbStatus = SRB_STATUS_SUCCESS;
@@ -590,7 +623,8 @@ AhciHandleReadCapacity16(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI
     ZeroMemoryBytes(data, sizeof(data));
     AhciPutBigEndian32(&data[0], last.High);
     AhciPutBigEndian32(&data[4], last.Low);
-    AhciPutBigEndian32(&data[8], AHCI_SECTOR_SIZE);
+    AhciPutBigEndian32(&data[8], HwInit->Ports[Port].SectorSize);
+    data[13] = (UCHAR)(HwInit->Ports[Port].PhysExponent & 0x0F);
 
     n = sizeof(data);
     if (n > allocLen) n = allocLen;
@@ -645,7 +679,7 @@ AhciHandleModeSenseAta(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_R
         p = &buf[len];
         AhciPutBigEndian32(&p[0], pi->TotalSectors.High);
         AhciPutBigEndian32(&p[4], pi->TotalSectors.Low);
-        AhciPutBigEndian32(&p[12], AHCI_SECTOR_SIZE);
+        AhciPutBigEndian32(&p[12], pi->SectorSize);
         descLen = 16;
         len += 16;
     } else if (!dbd) {
@@ -656,9 +690,9 @@ AhciHandleModeSenseAta(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_R
         p[1] = (UCHAR)(blocks >> 16);
         p[2] = (UCHAR)(blocks >> 8);
         p[3] = (UCHAR)blocks;
-        p[5] = (UCHAR)(AHCI_SECTOR_SIZE >> 16);
-        p[6] = (UCHAR)(AHCI_SECTOR_SIZE >> 8);
-        p[7] = (UCHAR)AHCI_SECTOR_SIZE;
+        p[5] = (UCHAR)(pi->SectorSize >> 16);
+        p[6] = (UCHAR)(pi->SectorSize >> 8);
+        p[7] = (UCHAR)pi->SectorSize;
         descLen = 8;
         len += 8;
     }
@@ -738,14 +772,14 @@ AhciAtaReadWrite(
         return;
     }
 
-    if (Count > (Srb->DataTransferLength / AHCI_SECTOR_SIZE)) {
+    if (Count > (Srb->DataTransferLength / pi->SectorSize)) {
         Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
         return;
     }
 
     ZeroMemoryBytes(&req, sizeof(req));
     req.DataBuffer = Srb->DataBuffer;
-    req.DataBufferLen = Count * AHCI_SECTOR_SIZE;
+    req.DataBufferLen = Count * pi->SectorSize;
     req.IsWrite = IsWrite;
     req.Lba = Lba;
     req.SectorCount = Count;

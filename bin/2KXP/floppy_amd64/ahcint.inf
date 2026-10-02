@@ -1,0 +1,118 @@
+; AHCINT.inf
+; Windows 2000 / XP / Server 2003 (x86) and XP x64 / Server 2003 x64 (amd64)
+; AHCI SATA Storage Controller Driver Installation File
+; Copyright (c) 2026 ages2001
+
+[Version]
+Signature="$Windows NT$"
+Class=SCSIAdapter
+ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider=%ProviderString%
+DriverVer=10/02/2026,1.4.0.0
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir = 12  ; DIRID_DRIVERS
+
+;-------------------------------------------------------------------------------
+;                    Source disks
+;-------------------------------------------------------------------------------
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksNames.x86]
+1 = %DiskName%,,,\i386
+
+[SourceDisksNames.amd64]
+1 = %DiskName%,,,\amd64
+
+[SourceDisksFiles]
+AHCINT.sys=1
+
+[SourceDisksFiles.x86]
+AHCINT.sys=1
+
+[SourceDisksFiles.amd64]
+AHCINT.sys=1
+
+;-------------------------------------------------------------------------------
+;                    Models
+;-------------------------------------------------------------------------------
+
+[Manufacturer]
+%VendorString%=Ahci_Models,NTx86,NTamd64
+
+[Ahci_Models]
+%Ahci.DeviceDesc.x86% = Ahci_Inst, PCI\CC_010601
+
+[Ahci_Models.NTx86]
+%Ahci.DeviceDesc.x86% = Ahci_Inst, PCI\CC_010601
+
+[Ahci_Models.NTamd64]
+%Ahci.DeviceDesc.amd64% = Ahci_Inst, PCI\CC_010601
+
+;-------------------------------------------------------------------------------
+;                    Install AHCINT Service
+;-------------------------------------------------------------------------------
+
+[Ahci_Inst]
+CopyFiles = Ahci_CopyFiles
+
+[Ahci_Inst.Services]
+AddService = AHCINT, %SPSVCINST_ASSOCSERVICE%, Ahci_Service_Inst, Miniport_EventLog_Inst
+
+[Ahci_Service_Inst]
+ServiceType    = %SERVICE_KERNEL_DRIVER%
+StartType      = %SERVICE_BOOT_START%
+ErrorControl   = %SERVICE_ERROR_NORMAL%
+ServiceBinary  = %12%\AHCINT.sys
+LoadOrderGroup = SCSI Miniport
+AddReg         = Ahci_AddReg
+
+[Ahci_CopyFiles]
+AHCINT.sys
+
+[Ahci_AddReg]
+HKR, "Parameters\PnpInterface", "5", %REG_DWORD%, 0x00000001
+
+[Miniport_EventLog_Inst]
+AddReg = Miniport_EventLog_AddReg
+
+[Miniport_EventLog_AddReg]
+HKR,,EventMessageFile,%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,%REG_DWORD%,7
+
+[Strings]
+ProviderString        = "ages2001"
+VendorString          = "Standard SATA AHCI Controller"
+Ahci.DeviceDesc.x86   = "AHCINT SATA AHCI Storage Controller"
+Ahci.DeviceDesc.amd64 = "AHCINT SATA AHCI Storage Controller (x64)"
+DiskName              = "AHCINT SATA AHCI Driver Disk"
+
+; Service install flags
+SPSVCINST_ASSOCSERVICE = 0x00000002
+
+; Service Type
+SERVICE_KERNEL_DRIVER  = 1
+
+; Service Start Type
+SERVICE_BOOT_START     = 0
+SERVICE_SYSTEM_START   = 1
+SERVICE_AUTO_START     = 2
+SERVICE_DEMAND_START   = 3
+SERVICE_DISABLED       = 4
+
+; Service Error Control
+SERVICE_ERROR_IGNORE   = 0
+SERVICE_ERROR_NORMAL   = 1
+SERVICE_ERROR_SEVERE   = 2
+SERVICE_ERROR_CRITICAL = 3
+
+; Registry types
+REG_SZ         = 0x00000000
+REG_MULTI_SZ   = 0x00010000
+REG_EXPAND_SZ  = 0x00020000
+REG_BINARY     = 0x00000001
+REG_DWORD      = 0x00010001
+REG_NONE       = 0x00020001

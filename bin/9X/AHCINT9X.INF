@@ -1,0 +1,45 @@
+; AHCINT9X.INF
+; Windows 9x Installation File for AHCI Storage Controller Driver
+; Copyright (c) 2026 ages2001
+
+[Version]
+Signature="$CHICAGO"
+Class=SCSIAdapter
+ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
+Provider=%ProviderString%
+DriverVer=10/02/2026,1.4.0.0
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,
+
+[SourceDisksFiles]
+AHCINT9X.MPD = 1
+
+[Manufacturer]
+%VendorString%=AHCI_Models
+
+[AHCI_Models]
+%AHCI.DeviceDesc% = AHCI_Inst, PCI\CC_010601
+
+[AHCI_Inst]
+CopyFiles = AHCI_CopyFiles
+AddReg = IOS, AHCI_AddReg_9x
+
+[AHCI_CopyFiles]
+AHCINT9X.MPD
+
+[IOS]
+HKR,,DevLoader,,*IOS
+HKR,,DontLoadIfConflict,,"Y"
+
+[AHCI_AddReg_9x]
+HKR,,PortDriver,,AHCINT9X.MPD
+
+[Strings]
+ProviderString = "ages2001"
+VendorString = "Standard SATA AHCI Controller"
+AHCI.DeviceDesc = "AHCINT9x SATA AHCI Storage Controller"
+DiskName = "AHCI Storage Controller Installation Disk"
