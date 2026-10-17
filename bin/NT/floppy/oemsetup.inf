@@ -185,6 +185,18 @@ installtheoption = +
         ifstr(i) $($R0) != STATUS_SUCCESSFUL
             goto finish_InstallOption
         endif
+
+        ; The disk class driver has to start at boot as well, otherwise the
+        ; disks on this controller are not claimed when the class driver was
+        ; set up for a later start (scsidisk on NT 3.x, disk on NT 4.0).
+        ForListDo {scsidisk, disk}
+            set ClassKey = ""
+            OpenRegKey $(!REG_H_LOCAL) "" "SYSTEM\CurrentControlSet\Services\"$($) 33554432 ClassKey
+            ifstr(i) $(ClassKey) != ""
+                SetRegValue $(ClassKey) {Start, 0, $(!REG_VT_DWORD), 0}
+                CloseRegKey $(ClassKey)
+            endif
+        EndForListDo
     endif
 
     set Status = STATUS_SUCCESSFUL

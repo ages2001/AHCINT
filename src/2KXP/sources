@@ -16,4 +16,5 @@ MUI_COMMENT=0
 BUFFER_OVERFLOW_CHECKS=0
 
 SOURCES=..\ahcimain.c \
+        ..\ahcicmd.c \
         ..\ahcisatl.c

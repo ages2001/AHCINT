@@ -12,6 +12,145 @@ bin\2KXP\i386 and bin\2KXP\amd64\ahcint.sys were built with MinGW
 and XP x64's own SCSIPORT.SYS and NTOSKRNL.EXE; src\2KXP (DDK build)
 builds the same sources.
 
+QEMU used for the 1.5 tests
+- QEMU 8.2.2, patched (test environment only):
+  - ATA disks with 1024/2048/4096-byte logical sectors (IDENTIFY words
+    106/117-118), also for NCQ commands.
+  - Port multiplier emulation (AHCI_PM=<port>): CAP.SPM, a multiplier
+    with two device ports (GSCR product 37261095h, PSCR SStatus/SError/
+    SControl, READ/WRITE PORT MULTIPLIER), PM port n = IDE unit n of
+    that AHCI port, software reset per PM port with the device's
+    signature, the PM signature on port 15. On the other ports the PM
+    port field is ignored, as by a directly attached device.
+  - Fix: an NCQ command accepted after a failed command carried the old
+    error status in its D2H FIS (QEMU raised TFES for a good command).
+- I/O errors injected with QEMU's blkdebug driver (EIO on every read
+  of one sector).
+
+New in 1.5 - what was tested
+
+NCQ
+- Windows 2000 (system disk and four data disks with 512, 1024, 2048
+  and 4096-byte sectors on one controller, PnP interrupt): NCQ active
+  on every disk, several commands queued per port. Per volume (NTFS):
+  100 MB load test, copy of WINNT\INF and SYSTEM32\DRIVERS (1280
+  files) compared by CRC32, re-read after a cold boot, chkdsk /f clean.
+  The same with NCQ=0 (Fast Polling) for comparison.
+- Windows NT 4.0 SP6, system disk on AHCI, UP (IRQ 11) and MPS HAL with
+  2 CPUs (IOAPIC, IRQ 16): NCQ active, data disks with 512, 1024, 2048
+  and 4096-byte sectors: CRC32 of the files on every volume, 100 MB load
+  test per volume, chkdsk - no errors. Debug and release builds.
+- Windows NT 3.1, system disk on AHCI: Fast Polling by default (as
+  before). With NCQ=1 (INTx connected level-sensitive on the EISA bus):
+  NCQ active, up to 16 commands queued, load tests on 1 KB and 4 KB
+  NTFS volumes and CRC32 comparison - no errors.
+- Windows XP x64, text-mode setup with F6 (bin\2KXP\amd64): NCQ active
+  already in text-mode setup (IRQ 10); partition, format, file copy,
+  first boot from the AHCI disk into GUI-mode setup.
+- Error recovery (Windows 2000, disk with one unreadable sector):
+  overlapped and single reads around it, three rounds; only the read of
+  the bad sector fails (I/O device error), every other read succeeds,
+  NCQ stays on. Same result with NCQ=0. This run found the stale
+  PxTFD.ERR problem fixed in 1.5 (see the changelog): before, the next
+  Fast Polling command after a failed one could fail as well.
+- Not reproduced here: the missing-interrupt fallback to Fast Polling
+  (QEMU always delivers the interrupt), and the NCQ error log (QEMU does
+  not implement READ LOG EXT; the single-command path was used).
+
+Port multipliers (emulated, see above)
+- Windows 2000: two disks behind a multiplier on port 5 (512 and 4096-
+  byte sectors) seen as LUN 0 and LUN 1 of target 5. A tagged 64 KB
+  pattern written to each through \\.\PhysicalDriveN, read back and
+  compared, then found on the host in the right image file only; the
+  feature test below on both disks.
+- Windows 95: two disks behind a multiplier (512 and 1024-byte sectors,
+  FAT16) as D: and E:; pattern test on both (96 MB / 32 MB), XCOPY with
+  CRC32 compare on D:, images checked on the host - no errors.
+- The other ports, with CAP.SPM set, still find their directly
+  attached disks.
+
+Power management
+- Windows 2000 (UP ACPI HAL, QEMU PIIX4 S3/S4 enabled): hibernation
+  (S4) through SetSuspendState with NCQ active. The driver is stopped
+  through HwAdapterControl, the dump stack loads a second instance
+  (Fast Polling, 4.4 KB device extension) which writes the hibernation
+  file, and on resume ScsiRestartAdapter sets the HBA up again. After
+  resume the four data volumes' CRC32 lists are unchanged, chkdsk is
+  clean and a load test passes. The first try failed: the dump stack
+  could not allocate the 38 KB device extension of the test build
+  (C000009Ah); 1.5 keeps it at 4.4 KB.
+- S3 (standby): Windows 2000 under QEMU/SeaBIOS did not come back from
+  S3 in this setup - also with the system disk on QEMU's IDE controller
+  and with NCQ=0, so the problem is the environment. The driver's
+  part (stop, restart, re-initialization) was logged as expected.
+  Worth a check on real hardware.
+- AHCINT power IOCTL on NT 3.1, NT 4.0 and Windows 2000: POWER_DOWN
+  (flush, standby, ports stopped), the next request brings the HBA
+  back; POWER_DOWN, POWER_UP, read - no errors. Also with the
+  multiplier on Windows 2000 (the PM is enumerated again).
+
+Link speed
+- QEMU patched to leave a Gen1 limit (PxSCTL = 310h) after every port
+  reset, as some firmware does. NT 4.0, system disk and four data disks:
+  every port is renegotiated once at initialization (COMRESET with
+  PxSCTL.SPD = 0), the system boots from AHCI, load test on four volumes,
+  CRC32 lists and the feature test - no errors.
+
+F6 disks, GUI-mode setup
+- Windows XP x64, text-mode setup with F6 (bin\2KXP\floppy_amd64), AHCI
+  disk and setup CD on AHCI: text-mode setup, first boot from AHCI,
+  GUI-mode setup through device installation up to Regional Options
+  without a "Files Needed" prompt. Before, GUI-mode setup asked for
+  OemDir\amd64\ahcint.sys (text-mode setup copies the F6 files flat,
+  the INF pointed to the amd64 subdirectory); the F6 disks now carry a
+  flat INF. Found and checked the same way with nvme2k.
+
+Final binaries (rebuilt with the link speed change)
+- NT 4.0 UP: load test on four volumes, CRC32 lists, feature test on
+  four disks, chkdsk. Windows 2000: feature test on four disks, CRC32
+  lists. Windows 95: 512-byte data disk, pattern test, XCOPY with CRC32
+  compare, image checked on the host. No errors.
+
+Controllers without devices
+- Checked after a report of a hang at "Starting up" with a controller
+  that has no disk (seen with nvme2k, an NVMe controller without
+  namespaces; fixed there). AHCINT: an HBA with no device on any port,
+  a second empty HBA next to the system HBA, and a port with a device
+  that does not answer IDENTIFY DEVICE. Before, the last case was
+  presented as a disk with no capacity; it is now reported as no
+  device. Boot and disk enumeration checked on NT 3.1, NT 4.0 (UP),
+  Windows 2000 (empty AHCI HBA plus an empty NVMe controller next to
+  the system disk, boot to the desktop in 55 s) and Windows 95 (second
+  empty HBA, desktop) - no hang, no phantom drives.
+
+OEMSETUP.INF (NT 3.1 - 4.0)
+- Now also sets Start = 0 for the disk class driver (scsidisk on NT 3.x,
+  disk on NT 4.0). Tested with the same INF code in the nvme2k package:
+  NT 4.0 (Control Panel - SCSI Adapters - Have Disk) and NT 3.1 (Windows
+  NT Setup - Add/Remove SCSI Adapters - Other), each with a class driver
+  key set to Start = 3 beforehand: afterwards Start = 0, the miniport
+  installed as a boot driver and working after the reboot.
+
+Feature test (a small tool, on every data disk of Windows 2000, NT 4.0
+and NT 3.1, and on both disks behind the port multiplier)
+- AHCINT GET_INFO; SMART through "SCSIDISK": VERSION, IDENTIFY, ENABLE,
+  READ ATTRIBUTES, RETURN STATUS (4Fh/C2h).
+- SCSI pass-through: READ CAPACITY, ATA PASS-THROUGH(12) IDENTIFY DEVICE
+  (PIO in), ATA PASS-THROUGH(16) SMART RETURN STATUS with CK_COND
+  (descriptor sense 72h, ATA status return descriptor 09h), REPORT LUNS,
+  MODE SENSE(10) caching page, MODE SELECT(10) write cache off -> MODE
+  SENSE shows it off -> on again, SYNCHRONIZE CACHE, VERIFY(10) of 2048
+  blocks, VERIFY(16), START STOP UNIT stop -> READ -> start.
+
+Regression with 1.5
+- Windows 95 (4.00.950), data disk on AHCI with 512, 1024 and 2048-byte
+  sectors: as described below for 1.4 - no errors.
+- Windows 2000, Windows NT 4.0 (UP and MPS), Windows NT 3.1: see above;
+  the 1.4 tests (CD-ROM, boot paths, LBA48, two controllers) were not
+  all repeated.
+
+Results of 1.4 (unchanged parts of the driver)
+
 Test load used throughout: a CrystalDiskMark-like tool (no buffering,
 write-through, overlapped I/O): 1 MB sequential write/read, 512 KB and
 4 KB random write/read, 4 KB at queue depth 32, then a full re-read.

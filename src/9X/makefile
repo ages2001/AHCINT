@@ -8,7 +8,7 @@ BUILD_TYPE=block
 INCLUDE =.;..;$(INCLUDE)
 
 DEVICE          = ahcint9x
-OBJS            = ahcimain.obj ahcisatl.obj
+OBJS            = ahcimain.obj ahcicmd.obj ahcisatl.obj
 
 ######### Definitions for the debug level #########
 
@@ -57,6 +57,10 @@ $(DEVICE).mpd : $(OBJS) $(LIBS) $(STUB)
 ahcimain.obj: ..\ahcimain.c ..\ahcint.h
 	set CL=$(CFLAGS)
 	$(CL) -Foahcimain.obj ..\ahcimain.c
+
+ahcicmd.obj: ..\ahcicmd.c ..\ahcint.h
+	set CL=$(CFLAGS)
+	$(CL) -Foahcicmd.obj ..\ahcicmd.c
 
 ahcisatl.obj: ..\ahcisatl.c ..\ahcint.h
 	set CL=$(CFLAGS)
