@@ -113,6 +113,11 @@ AhciParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
     dev->TotalSectors.High = 0;
     dev->SectorSize = AHCI_SECTOR_SIZE;
     dev->PhysExponent = 0;
+    dev->Trim = FALSE;
+    dev->TrimZeroes = FALSE;
+    dev->Smart = FALSE;
+    dev->RotationRate = 0;
+    dev->FormFactor = 0;
 
     if (dev->IdentifyValid) {
         ULONG i;
@@ -171,6 +176,17 @@ AhciParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
                          (id[IDW_CMDSET_SUPPORTED_EXT] & IDW83_VALID_MASK) == IDW83_VALID &&
                          (id[IDW_CMDSET_SUPPORTED_EXT] & IDW84_FUA));
 
+    /* TRIM (a 48-bit DMA command) and what the medium is */
+    dev->Trim = (BOOLEAN)(dev->Lba48 && (id[IDW_DSM_SUPPORT] & IDW169_TRIM) && id[IDW_DSM_SUPPORT] != 0xFFFF);
+    dev->TrimZeroes = (BOOLEAN)(dev->Trim && (id[IDW_ADDITIONAL_SUPPORTED] & IDW69_DETERMINISTIC_TRIM) &&
+                                (id[IDW_ADDITIONAL_SUPPORTED] & IDW69_ZERO_AFTER_TRIM));
+    if (id[IDW_ROTATION_RATE] == 1 || (id[IDW_ROTATION_RATE] >= 0x0401 && id[IDW_ROTATION_RATE] <= 0xFFFE)) {
+        dev->RotationRate = id[IDW_ROTATION_RATE];
+    }
+    dev->FormFactor = (UCHAR)(id[IDW_FORM_FACTOR] & 0x0F);
+    dev->Smart = (BOOLEAN)((id[IDW_CMDSET_SUPPORTED_1] & IDW82_SMART) && (id[IDW_CMDSET_ENABLED_1] & IDW82_SMART) &&
+                           id[IDW_CMDSET_SUPPORTED_1] != 0xFFFF);
+
     /* NCQ: device and HBA support it, the disk sits directly on the port
        (command-based switching serializes a port multiplier anyway) */
     if (dev->Lba48 && (id[IDW_SATA_CAPABILITIES] & IDW76_NCQ) &&
@@ -191,6 +207,9 @@ AhciParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
               Port, (ULONG)dev->Pmp, (ULONG)dev->Ncq, (ULONG)dev->NcqDepth,
               dev->Fua ? "yes" : "no",
               (id[IDW_CMDSET_ENABLED_1] & IDW82_WRITE_CACHE) ? "on" : "off"));
+    AHCI_DBG((AHCI_PFX "Port %lu.%lu: TRIM=%s%s rotation %04lX SMART=%s\n", Port, (ULONG)dev->Pmp,
+              dev->Trim ? "yes" : "no", dev->TrimZeroes ? " (zeroes)" : "", (ULONG)dev->RotationRate,
+              dev->Smart ? "yes" : "no"));
 
     if (!dev->LbaSupported) {
         /* SATA mandates LBA; a CHS-only device is not addressable here. */
@@ -362,21 +381,57 @@ AhciExtractAtaString(
 
 /* EVPD: supported-pages list and unit serial number (IDENTIFY 10..19) */
 static VOID
-AhciHandleInquiryVpd(IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+AhciHandleInquiryVpd(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 {
-    UCHAR page[4 + 20];
-    ULONG len;
+    UCHAR page[64];
+    ULONG len, allocLen = ((ULONG)Srb->Cdb[3] << 8) | Srb->Cdb[4];
+    BOOLEAN unmap = (BOOLEAN)(Dev->Trim && HwInit->TrimAllowed);
 
     ZeroMemoryBytes(page, sizeof(page));
     page[0] = Dev->IsAtapi ? READ_ONLY_DIRECT_ACCESS_DEVICE : DIRECT_ACCESS_DEVICE;
     page[1] = Srb->Cdb[2];
 
+    if (Dev->IsAtapi && Srb->Cdb[2] != AHCI_VPD_SUPPORTED_PAGES && Srb->Cdb[2] != AHCI_VPD_SERIAL_NUMBER) {
+        AhciInvalidField(Dev, Srb);
+        return;
+    }
     switch (Srb->Cdb[2]) {
     case AHCI_VPD_SUPPORTED_PAGES:
-        page[3] = 2;
         page[4] = AHCI_VPD_SUPPORTED_PAGES;
         page[5] = AHCI_VPD_SERIAL_NUMBER;
-        len = 4 + 2;
+        len = 6;
+        if (!Dev->IsAtapi) {
+            page[len++] = AHCI_VPD_BLOCK_LIMITS;
+            page[len++] = AHCI_VPD_BLOCK_CHARACTERISTICS;
+            page[len++] = AHCI_VPD_PROVISIONING;
+        }
+        page[3] = (UCHAR)(len - 4);
+        break;
+
+    case AHCI_VPD_BLOCK_LIMITS:
+        page[3] = 0x3C;
+        AhciPutBigEndian32(&page[8], AHCI_MAX_TRANSFER / Dev->SectorSize);
+        AhciPutBigEndian32(&page[12], AHCI_MAX_TRANSFER / Dev->SectorSize);
+        if (unmap) {
+            AhciPutBigEndian32(&page[20], AHCI_UNMAP_MAX_BLOCKS);
+            AhciPutBigEndian32(&page[24], AHCI_UNMAP_MAX_DESCRIPTORS);
+            AhciPutBigEndian32(&page[28], 1UL << Dev->PhysExponent);
+        }
+        len = 4 + 0x3C;
+        break;
+
+    case AHCI_VPD_BLOCK_CHARACTERISTICS:
+        page[3] = 0x3C;
+        page[4] = (UCHAR)(Dev->RotationRate >> 8);
+        page[5] = (UCHAR)Dev->RotationRate;
+        page[7] = Dev->FormFactor;
+        len = 4 + 0x3C;
+        break;
+
+    case AHCI_VPD_PROVISIONING:
+        page[3] = 4;
+        page[5] = (UCHAR)((unmap ? 0x80 : 0) | ((unmap && Dev->TrimZeroes) ? 0x04 : 0));
+        len = 4 + 4;
         break;
 
     case AHCI_VPD_SERIAL_NUMBER:
@@ -395,7 +450,7 @@ AhciHandleInquiryVpd(IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
         return;
     }
 
-    if (len > Srb->Cdb[4]) len = Srb->Cdb[4];
+    if (len > allocLen) len = allocLen;
     AhciCopyToSrb(Srb, page, len);
     AhciGood(Srb);
 }
@@ -410,7 +465,7 @@ AhciHandleInquiry(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_DEVICE Dev, IN PSCSI_
     ULONG i;
 
     if (Srb->Cdb[1] & 0x01) {
-        AhciHandleInquiryVpd(Dev, Srb);
+        AhciHandleInquiryVpd(HwInit, Dev, Srb);
         return;
     }
     if (Srb->Cdb[2] != 0) {                     /* page code without EVPD */
@@ -483,7 +538,7 @@ AhciHandleReadCapacity10(IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 
 /* SERVICE ACTION IN(16) / READ CAPACITY(16): full 64-bit last LBA */
 static VOID
-AhciHandleReadCapacity16(IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+AhciHandleReadCapacity16(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 {
     UCHAR data[AHCI_READ_CAPACITY16_DATA_LEN];
     AHCI_LBA last = AhciLastLba(Dev);
@@ -495,6 +550,9 @@ AhciHandleReadCapacity16(IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
     AhciPutBigEndian32(&data[4], last.Low);
     AhciPutBigEndian32(&data[8], Dev->SectorSize);
     data[13] = (UCHAR)(Dev->PhysExponent & 0x0F);
+    if (Dev->Trim && HwInit->TrimAllowed) {
+        data[14] = (UCHAR)(0x80 | (Dev->TrimZeroes ? 0x40 : 0));        /* LBPME, LBPRZ */
+    }
 
     n = sizeof(data);
     if (n > allocLen) n = allocLen;
@@ -709,6 +767,211 @@ AhciFlushDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
                                    0, AHCI_POLL_TIMEOUT_POWER_SEC) == AHCI_CMD_OK);
 }
 
+/* System shutdown: write cache flushed, then STANDBY IMMEDIATE so the
+   drive parks its heads (or an SSD saves its tables) before the power
+   goes. A request after it spins the drive up again. */
+VOID
+AhciShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
+{
+    PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, Port, Lun);
+
+    if (!dev->Present || dev->IsAtapi || !dev->IdentifyValid) return;
+    AhciFlushDevice(HwInit, Port, Lun);
+    if (AhciRunSimple(HwInit, Port, Lun, IDE_COMMAND_STANDBY_IMMEDIATE, 0, AHCI_POLL_TIMEOUT_POWER_SEC) == AHCI_CMD_OK) {
+        AHCI_DBG((AHCI_PFX "Port %lu.%lu: standby for shutdown\n", Port, (ULONG)dev->Pmp));
+    }
+}
+
+/* DATA SET MANAGEMENT TRIM of Count sectors from Lba: one 512-byte block
+   of up to 64 ranges per command, through the port's bounce buffer */
+static ULONG
+AhciTrim(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun, IN AHCI_LBA Lba, IN ULONG Count)
+{
+    PAHCI_PORT_INFO pi = &HwInit->Ports[Port];
+    PULONG range;
+    ATA_REQUEST req;
+    ULONG n, piece, result;
+
+    while (Count > 0) {
+        range = (PULONG)pi->BounceBuffer;
+        ZeroMemoryBytes(range, AHCI_BOUNCE_SIZE);
+        for (n = 0; n < IDE_DSM_RANGES_PER_BLOCK && Count > 0; n++) {
+            piece = (Count > IDE_DSM_MAX_RANGE) ? IDE_DSM_MAX_RANGE : Count;
+            range[n * 2] = Lba.Low;
+            range[n * 2 + 1] = (Lba.High & 0xFFFF) | (piece << 16);
+            AhciLbaAdd(&Lba, piece);
+            Count -= piece;
+        }
+        ZeroMemoryBytes(&req, sizeof(req));
+        req.Pmp = AHCI_DEVICE_OF(HwInit, Port, Lun)->Pmp;
+        req.Command = IDE_COMMAND_DATA_SET_MANAGEMENT;
+        req.Features = IDE_DSM_TRIM;
+        req.Is48Bit = TRUE;
+        req.SectorCount = 1;
+        req.UseBounce = TRUE;
+        req.DataBufferLen = AHCI_BOUNCE_SIZE;
+        req.IsWrite = TRUE;
+        req.TimeoutSec = AHCI_POLL_TIMEOUT_POWER_SEC;
+        result = AhciRunCommand(HwInit, Port, NULL, &req);
+        if (result != AHCI_CMD_OK) return result;
+    }
+    return AHCI_CMD_OK;
+}
+
+/* TRIM mode: the write's data is the pattern, repeated from the first byte */
+static BOOLEAN
+AhciIsTrimPattern(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR Data, IN ULONG Length)
+{
+    ULONG i, j;
+
+    if (Data == NULL || Length < AHCI_TRIM_PATTERN_SIZE) return FALSE;
+    for (i = 0; i < Length; i += AHCI_TRIM_PATTERN_SIZE) {
+        for (j = 0; j < AHCI_TRIM_PATTERN_SIZE && i + j < Length; j += 4) {
+            if (*(ULONG UNALIGNED *)(Data + i + j) != *(ULONG UNALIGNED *)(&HwInit->TrimPattern[j])) return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+/* UNMAP: the block descriptors become DATA SET MANAGEMENT TRIM ranges */
+static VOID
+AhciAtaUnmap(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQUEST_BLOCK Srb)
+{
+    PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, Port, Srb->Lun);
+    PUCHAR param = (PUCHAR)Srb->DataBuffer;
+    ULONG listLen = ((ULONG)Srb->Cdb[7] << 8) | Srb->Cdb[8], descLen, n, i, count, result;
+    AHCI_LBA lba;
+
+    if (!dev->Trim || !HwInit->TrimAllowed) {
+        AhciFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, AHCI_ASC_INVALID_OPCODE, 0);
+        return;
+    }
+    if (listLen > Srb->DataTransferLength) listLen = Srb->DataTransferLength;
+    if (listLen == 0 || param == NULL) {
+        AhciGood(Srb);
+        return;
+    }
+    if (listLen < 8) {
+        AhciFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, AHCI_ASC_PARAM_LIST_LENGTH, 0);
+        return;
+    }
+    descLen = ((ULONG)param[2] << 8) | param[3];
+    if (descLen > listLen - 8) descLen = listLen - 8;
+    n = descLen / 16;
+    if (n > AHCI_UNMAP_MAX_DESCRIPTORS) {
+        AhciFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, AHCI_ASC_INVALID_PARAM_FIELD, 0);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        lba = AhciLbaFromBigEndian(param + 8 + i * 16, 8);
+        count = AhciBigEndian32(param + 8 + i * 16 + 8);
+        if (count != 0 && (count > AHCI_UNMAP_MAX_BLOCKS || !AhciLbaRangeValid(dev, lba, count))) {
+            AhciFailWithSense(dev, Srb, SCSI_SENSE_ILLEGAL_REQUEST, AHCI_ASC_LBA_OUT_OF_RANGE, 0);
+            return;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        lba = AhciLbaFromBigEndian(param + 8 + i * 16, 8);
+        count = AhciBigEndian32(param + 8 + i * 16 + 8);
+        if (count == 0) continue;
+        result = AhciTrim(HwInit, Port, Srb->Lun, lba, count);
+        if (result != AHCI_CMD_OK) {
+            AhciCompleteResult(HwInit, Port, Srb, result);
+            return;
+        }
+    }
+    AhciGood(Srb);
+}
+
+/* SMART: threshold state and temperature (attribute C2h, else BEh).
+   FALSE when the drive has no SMART or it failed. */
+static BOOLEAN
+AhciSmartHealth(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun, OUT PBOOLEAN Exceeded,
+                OUT PUCHAR Temperature)
+{
+    PAHCI_PORT_INFO pi = &HwInit->Ports[Port];
+    PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, Port, Lun);
+    PUCHAR data = pi->BounceBuffer;
+    ATA_REQUEST req;
+    ULONG i;
+
+    *Exceeded = FALSE;
+    *Temperature = 0xFF;
+    if (!dev->Smart) return FALSE;
+
+    ZeroMemoryBytes(&req, sizeof(req));
+    req.Pmp = dev->Pmp;
+    req.Command = IDE_COMMAND_SMART;
+    req.Features = IDE_SMART_RETURN_STATUS_FEATURE;
+    req.Lba.Low = IDE_SMART_LBA_SIGNATURE;
+    if (AhciRunCommand(HwInit, Port, NULL, &req) != AHCI_CMD_OK) return FALSE;
+    *Exceeded = (BOOLEAN)(pi->Result.Lba1 == 0xF4 && pi->Result.Lba2 == 0x2C);
+
+    ZeroMemoryBytes(&req, sizeof(req));
+    ZeroMemoryBytes(data, AHCI_BOUNCE_SIZE);
+    req.Pmp = dev->Pmp;
+    req.Command = IDE_COMMAND_SMART;
+    req.Features = IDE_SMART_READ_DATA_FEATURE;
+    req.SectorCount = 1;
+    req.Lba.Low = IDE_SMART_LBA_SIGNATURE;
+    req.UseBounce = TRUE;
+    req.DataBufferLen = AHCI_BOUNCE_SIZE;
+    if (AhciRunCommand(HwInit, Port, NULL, &req) == AHCI_CMD_OK) {
+        for (i = 0; i < 30; i++) {
+            PUCHAR a = data + 2 + i * 12;
+            if (a[0] == 0xC2 || (a[0] == 0xBE && *Temperature == 0xFF)) *Temperature = a[5];
+        }
+    }
+    return TRUE;
+}
+
+/* LOG SENSE: supported pages, temperature, informational exceptions */
+static VOID
+AhciAtaLogSense(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQUEST_BLOCK Srb)
+{
+    PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, Port, Srb->Lun);
+    UCHAR pageCode = (UCHAR)(Srb->Cdb[2] & 0x3F), buf[20], temperature;
+    ULONG allocLen = ((ULONG)Srb->Cdb[7] << 8) | Srb->Cdb[8], len;
+    BOOLEAN exceeded;
+
+    ZeroMemoryBytes(buf, sizeof(buf));
+    buf[0] = pageCode;
+    switch (pageCode) {
+    case AHCI_LOG_PAGE_SUPPORTED:
+        buf[4] = AHCI_LOG_PAGE_SUPPORTED;
+        len = 5;
+        if (dev->Smart) buf[len++] = AHCI_LOG_PAGE_TEMPERATURE;
+        buf[len++] = AHCI_LOG_PAGE_INFO_EXCEPTIONS;
+        break;
+    case AHCI_LOG_PAGE_TEMPERATURE:
+        if (!AhciSmartHealth(HwInit, Port, Srb->Lun, &exceeded, &temperature)) {
+            AhciInvalidField(dev, Srb);
+            return;
+        }
+        /* 0000h temperature, 0001h reference temperature (not known) */
+        buf[6] = 0x03; buf[7] = 2; buf[9] = temperature;
+        buf[11] = 0x01; buf[12] = 0x03; buf[13] = 2; buf[15] = 0xFF;
+        len = 16;
+        break;
+    case AHCI_LOG_PAGE_INFO_EXCEPTIONS:
+        AhciSmartHealth(HwInit, Port, Srb->Lun, &exceeded, &temperature);
+        buf[6] = 0x03;
+        buf[7] = 3;
+        if (exceeded) buf[8] = AHCI_ASC_FAILURE_PREDICTION;
+        buf[10] = temperature;
+        len = 11;
+        break;
+    default:
+        AhciInvalidField(dev, Srb);
+        return;
+    }
+    buf[2] = (UCHAR)((len - 4) >> 8);
+    buf[3] = (UCHAR)(len - 4);
+    if (len > allocLen) len = allocLen;
+    AhciCopyToSrb(Srb, buf, len);
+    AhciGood(Srb);
+}
+
 static VOID
 AhciAtaReadWrite(
     IN PHW_DEVICE_EXTENSION HwInit,
@@ -743,6 +1006,13 @@ AhciAtaReadWrite(
         return;
     }
     if (!IsWrite) Fua = FALSE;
+
+    /* TRIM mode: a write of the pattern becomes a TRIM of its sectors */
+    if (IsWrite && HwInit->TrimMode && dev->Trim && HwInit->TrimAllowed &&
+        AhciIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * dev->SectorSize)) {
+        AhciCompleteResult(HwInit, Port, Srb, AhciTrim(HwInit, Port, Srb->Lun, Lba, Count));
+        return;
+    }
 
     /* NCQ: completes in the interrupt */
     if (HwInit->AsyncMode && dev->Ncq && Count <= ATA_LBA48_MAX_SECTORS && !HwInit->DumpMode) {
@@ -1021,7 +1291,7 @@ AhciProcessAtaSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQUES
 
     case AHCI_SCSIOP_SERVICE_ACTION_IN16:
         if ((cdb[1] & 0x1F) == AHCI_SA_READ_CAPACITY16) {
-            AhciHandleReadCapacity16(dev, Srb);
+            AhciHandleReadCapacity16(HwInit, dev, Srb);
             return;
         }
         break;
@@ -1080,6 +1350,14 @@ AhciProcessAtaSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQUES
 
     case AHCI_SCSIOP_VERIFY16:
         AhciAtaVerify(HwInit, Port, Srb, AhciLbaFromBigEndian(&cdb[2], 8), AhciBigEndian32(&cdb[10]));
+        return;
+
+    case AHCI_SCSIOP_UNMAP:
+        AhciAtaUnmap(HwInit, Port, Srb);
+        return;
+
+    case AHCI_SCSIOP_LOG_SENSE:
+        AhciAtaLogSense(HwInit, Port, Srb);
         return;
     }
 
@@ -1522,7 +1800,8 @@ AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
                 info->Capabilities = HwInit->HbaCapabilities;
                 info->PortsImplemented = HwInit->PortsImplemented;
                 info->Flags = (HwInit->AsyncMode ? AHCI_INFO_ASYNC : 0) |
-                              (HwInit->Stopped ? AHCI_INFO_POWERED_DOWN : 0);
+                              (HwInit->Stopped ? AHCI_INFO_POWERED_DOWN : 0) |
+                              (HwInit->TrimMode ? AHCI_INFO_TRIM_MODE : 0);
                 info->SlotsPerPort = HwInit->Slots;
                 for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
                     info->DeviceCount[port] = HwInit->Ports[port].DeviceCount;
@@ -1536,6 +1815,17 @@ AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
             break;
         case AHCI_IOCTL_POWER_UP:
             if (HwInit->Stopped) AhciReinitialize(HwInit);
+            break;
+        case AHCI_IOCTL_TRIM_MODE_ON:
+            if (available < AHCI_TRIM_PATTERN_SIZE || !HwInit->TrimAllowed) {
+                ctl->ReturnCode = 1;
+                break;
+            }
+            CopyMemoryBytes(HwInit->TrimPattern, (PUCHAR)ctl + ctl->HeaderLength, AHCI_TRIM_PATTERN_SIZE);
+            HwInit->TrimMode = TRUE;
+            break;
+        case AHCI_IOCTL_TRIM_MODE_OFF:
+            HwInit->TrimMode = FALSE;
             break;
         default:
             Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;

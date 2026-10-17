@@ -17,4 +17,5 @@ BUFFER_OVERFLOW_CHECKS=0
 
 SOURCES=..\ahcimain.c \
         ..\ahcicmd.c \
-        ..\ahcisatl.c
+        ..\ahcisatl.c \
+        ..\ahcint.rc

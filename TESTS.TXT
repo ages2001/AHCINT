@@ -29,6 +29,33 @@ QEMU used for the 1.5 tests
 
 New in 1.5 - what was tested
 
+TRIM, VPD, LOG SENSE, shutdown standby, version resource
+- Windows 2000 SP4, data disk on ich9-ahci port 1 with QEMU
+  discard=unmap, discard_granularity=512, rotation_rate=1 (an SSD for
+  IDENTIFY: word 169 TRIM, word 217 = 1). Feature test (featst, SCSI
+  pass-through and miniport IOCTLs): READ CAPACITY(16) LBPME 1, VPD
+  00h lists 80h B0h B1h B2h, B0h (max unmap 3FFFC0h, 64 descriptors),
+  B1h rotation 1, B2h LBPU, LOG SENSE 00h (00 0D 2F), 0Dh (temperature
+  31 C from SMART), 2Fh, UNMAP of 16 blocks (they read back as zeros
+  on the host image), UNMAP beyond the end (ILLEGAL REQUEST 21h), TRIM
+  mode (an ordinary write is written, a pattern write becomes a TRIM,
+  after TRIM_MODE_OFF the pattern is written): RESULT OK fails=0. The
+  system disk (no discard on the image) answers the same, except that
+  its blocks keep their data after UNMAP (QEMU ignores the TRIM).
+- System shutdown: "Port 0.0: standby for shutdown" (SRB_FUNCTION_SHUTDOWN
+  reaches the driver since it declares CachesData).
+- File properties of every binary show version 1.5.0.0
+  (OriginalFilename ahcint.sys / ahcint9x.mpd).
+- trimnt on a 256 MB FAT volume on the AHCI disk (discard=unmap, the
+  image with 55 MB of stale blocks): "Scsi2: AHCINT TRIM mode on", the
+  free space trimmed, files deleted; the image went from 63.7 MB to
+  10.6 MB allocated, sumtool FILES 5 ERRORS 0, CHKDSK clean.
+- Release build (bin\ as shipped) on Windows 2000 next to IDENT, MMCSDNT
+  and NVMENT data disks: featst RESULT OK fails=0, trimnt, sumtool and
+  CHKDSK on the volume OK. Windows 95: AHCINT9X installed for the AHCI
+  function (New Hardware Found, driver from disk), sumtool FILES 5
+  ERRORS 0 and w95io RESULT OK on the AHCI volume.
+
 NCQ
 - Windows 2000 (system disk and four data disks with 512, 1024, 2048
   and 4096-byte sectors on one controller, PnP interrupt): NCQ active

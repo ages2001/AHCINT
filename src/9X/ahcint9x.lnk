@@ -8,3 +8,4 @@
 -map:ahcint9x.map
 -export:DriverEntry
 ahcimain.obj ahcicmd.obj ahcisatl.obj C:\DDK\BLOCK\LIB\scsiport.lib
+ahcint9x.res

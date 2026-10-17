@@ -1,0 +1,51 @@
+//
+// ahcint.rc - version resource of ahcint.sys / ahcint9x.mpd
+//
+
+#include <winver.h>
+
+#define AHCI_VER_NUM              1,5,0,0
+#define AHCI_VER_STR              "1.5.0.0"
+
+#ifdef AHCI_W9X
+#define AHCI_FILE_STR             "ahcint9x.mpd"
+#define AHCI_DESCRIPTION_STR      "ahcint9x SATA AHCI Storage Controller Miniport Driver"
+#define AHCI_FILEOS               VOS_DOS_WINDOWS32
+#else
+#define AHCI_FILE_STR             "ahcint.sys"
+#define AHCI_DESCRIPTION_STR      "ahcint SATA AHCI Storage Controller Miniport Driver"
+#define AHCI_FILEOS               VOS_NT_WINDOWS32
+#endif
+
+#ifdef RC_INVOKED
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     AHCI_VER_NUM
+PRODUCTVERSION  AHCI_VER_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          AHCI_FILEOS
+FILETYPE        VFT_DRV
+FILESUBTYPE     VFT2_DRV_SYSTEM
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "ages2001"
+            VALUE "FileDescription",  AHCI_DESCRIPTION_STR
+            VALUE "FileVersion",      AHCI_VER_STR
+            VALUE "InternalName",     AHCI_FILE_STR
+            VALUE "LegalCopyright",   "Copyright (C) 2026 ages2001"
+            VALUE "OriginalFilename", AHCI_FILE_STR
+            VALUE "ProductName",      "AHCINT"
+            VALUE "ProductVersion",   AHCI_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
+
+#endif

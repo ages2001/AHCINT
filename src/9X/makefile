@@ -49,7 +49,7 @@ $(DEVICE).sym: $(DEVICE).map
 
 $(DEVICE).map: $(DEVICE).mpd
 
-$(DEVICE).mpd : $(OBJS) $(LIBS) $(STUB)
+$(DEVICE).mpd : $(OBJS) $(DEVICE).res $(LIBS) $(STUB)
 	$(LINK) @$(DEVICE).lnk
 
 # Shared sources (after the default target above)
@@ -72,3 +72,6 @@ clean:
 	-@del *.map
 	-@del *.pdb
 	-@del *.sym
+
+$(DEVICE).res: ..\ahcint.rc
+	rc -r -DAHCI_W9X -fo$(DEVICE).res ..\ahcint.rc

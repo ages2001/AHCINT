@@ -1,6 +1,39 @@
-# AHCINT - SATA AHCI Driver for Windows NT/2000/XP and Windows 95/98/Me
+# AHCINT — SATA AHCI Driver for Windows 95/98/Me and Windows NT 3.1 to XP x64
 
-An AHCI (Advanced Host Controller Interface) SATA storage controller driver for Windows NT family and the Windows 95/98/Me, targeting operating systems from Windows 95 and Windows NT 3.1 up through Windows XP x64 Edition / Server 2003 x64 — long before Microsoft shipped a native AHCI driver.
+**AHCINT** is a SCSI miniport driver for AHCI SATA controllers. It lets Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP and Server 2003 (x86 and x64) install on, boot from and use SATA disks and optical drives behind an AHCI controller — hardware these systems were never written for, and that Microsoft only supported from Windows Vista on.
+
+| | |
+|---|---|
+| **Version** | 1.5.0.0 |
+| **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86) · Windows XP x64 / Server 2003 x64 |
+| **Hardware** | AHCI SATA host controllers (PCI class code `01-06-01`), up to 8 per system |
+| **Devices** | SATA disks (48-bit LBA, 512-byte to 4 KB logical sectors, SSDs with TRIM), ATAPI CD/DVD drives, disks behind port multipliers |
+| **Binaries** | `ahcint9x.mpd` (Windows 9x/Me) · `ahcint.sys` (NT 3.1–4.0) · `ahcint.sys` (2000/XP/2003, x86 and x64) |
+
+## Highlights
+
+- **Install and boot** on every target: F6 / OEM driver disks for text-mode setup from NT 3.1 to XP x64, Have Disk for installed systems, Device Manager on Windows 9x
+- **NCQ** with up to 32 queued commands per port, completed by interrupt, with an automatic fallback to Fast Polling where interrupts do not arrive
+- **TRIM** for SSDs (SCSI UNMAP as ATA DATA SET MANAGEMENT), plus `tools\trimnt.exe` to trim the free space of a volume on systems that never send TRIM
+- **Port multipliers**, ATAPI optical drives, 48-bit LBA, 16-byte CDBs and logical sectors up to 4 KB on every target
+- **SMART** through the `atapi.sys`-compatible "SCSIDISK" IOCTL, ATA PASS-THROUGH, and LOG SENSE health and temperature pages
+- **Power management**: flush and standby at shutdown, hibernation and crash dumps on 2000/XP, a power-down IOCTL for NT 3.1–4.0 and 9x
+- **One source tree** for all targets; the differences are a handful of `#ifdef`s
+
+## Quick start
+
+| System | Files | How |
+|---|---|---|
+| Windows 95 / 98 / Me | `bin\9X` | [Installing on Windows 95 / 98 / Me](#windows-95--98--me) |
+| Windows NT 3.1 – 4.0 | `bin\NT\floppy` | [Installing on Windows NT](#windows-nt-31--350--351--nt-40) |
+| Windows 2000 / XP / 2003, installed | `bin\2KXP` (Have Disk) | [GUI-mode setup](#gui-mode-setup-windows-2000xpxp-x64server-2003) |
+| Windows 2000 / XP / 2003, new installation | `bin\2KXP\floppy_i386` or `floppy_amd64` (F6) | [Text-mode (F6) setup](#text-mode-f6-setup--windows-2000xpxp-x64server-2003) |
+
+## Contents
+
+- [Overview](#overview) · [Features](#features) · [Architecture](#architecture) · [Feature matrix by target](#feature-matrix-by-target) · [Known Limitations](#known-limitations)
+- [Building from source](#building-from-source) · [Installation](#installation) · [Configuration](#configuration) · [Debugging](#debugging) · [Technical Notes](#technical-notes)
+- [Version history](#version-history) · [Related drivers](#related-drivers) · [License](#license)
 
 ## Overview
 
@@ -28,7 +61,10 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
   - SAT ATA PASS-THROUGH(12)/(16) (non-data, PIO in/out, DMA; CK_COND and "return response information" with descriptor sense)
   - SMART through `IOCTL_SCSI_MINIPORT` ("SCSIDISK" signature, as `atapi.sys`), so `SMART_RCV_DRIVE_DATA` tools work; see [IOCTL interface](#ioctl-interface)
   - 64-bit SCSI on every target: READ CAPACITY(16) (SERVICE ACTION IN), READ/WRITE/VERIFY(16), SYNCHRONIZE CACHE(16), MODE SENSE(10) long LBA block descriptor (LLBAA); READ CAPACITY(10) returns `0xFFFFFFFF` for disks past 2 TB so the upper layer switches to READ CAPACITY(16)
-  - ATA disks report INQUIRY VERSION `05h` (SPC-3 / SBC-2, as nvme9x does), advertising 16-byte CDB support; VPD pages `00h` and `80h` (serial number from IDENTIFY)
+  - ATA disks report INQUIRY VERSION `05h` (SPC-3 / SBC-2, as nvme9x does), advertising 16-byte CDB support; VPD pages `00h`, `80h` (serial number from IDENTIFY), `B0h` (block and unmap limits), `B1h` (rotation rate and form factor, IDENTIFY words 217/168) and `B2h` (logical block provisioning)
+  - **UNMAP** as DATA SET MANAGEMENT / TRIM (IDENTIFY word 169) on SSDs: up to 64 block descriptors, split into TRIM ranges (64 per 512-byte block); READ CAPACITY(16) reports LBPME, and LBPRZ for deterministic zeroes after TRIM (word 69); see [TRIM](#trim)
+  - **LOG SENSE** pages `00h`, `0Dh` (temperature from the SMART attributes) and `2Fh` (informational exceptions: ASC 5Dh when SMART RETURN STATUS reports a threshold exceeded)
+  - **TRIM mode** for Windows versions that send no TRIM: with `tools\trimnt.exe` the free space of a volume is trimmed; see [TRIM](#trim)
   - 28-bit READ/WRITE DMA whenever the request fits; READ/WRITE DMA EXT only on devices whose IDENTIFY DEVICE reports the 48-bit Address feature set (word 83, bit 10)
   - ATAPI (PACKET command) pass-through for CD/DVD-class devices, alongside plain ATA disk support
   - Real ATAPI media status: TEST UNIT READY / MEDIUM REMOVAL are passed through to the drive, REQUEST SENSE returns the drive's own sense data, and MODE SENSE(6) is translated to ATAPI MODE SENSE(10) and back — so media changes and empty trays are reported correctly to the CD-ROM class driver
@@ -46,7 +82,7 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
 
 - **Port multipliers** — command-based switching; every device behind the multiplier is a LUN of its port; see [Port multipliers](#port-multipliers)
 
-- **Power management** — flush and standby on shutdown and on power transitions, `HwAdapterControl` (stop/restart) on 2000/XP, hibernation and crash dump support, automatic re-initialization when the HBA lost its state (sleep, BIOS, another driver), and a power-down/up IOCTL for an ACPI driver on NT 3.1–4.0 and 9x; see [Power management](#power-management)
+- **Power management** — flush and STANDBY IMMEDIATE at system shutdown (`SRB_FUNCTION_SHUTDOWN`) and on power transitions, `HwAdapterControl` (stop/restart) on 2000/XP, hibernation and crash dump support, automatic re-initialization when the HBA lost its state (sleep, BIOS, another driver), and a power-down/up IOCTL for an ACPI driver on NT 3.1–4.0 and 9x; see [Power management](#power-management)
 
 ## Architecture
 
@@ -305,6 +341,7 @@ On the NT family the driver reads the ScsiPort argument string, the `REG_SZ` val
 |---|---|
 | `NCQ=0` | No NCQ: every command is Fast Polling, no interrupt is used (the behaviour of 1.4 and earlier) |
 | `NCQ=1` | Windows NT 3.1 only: connect the controller's INTx line and use NCQ (off by default on NT 3.1, see [Windows NT 3.1 specifics](#windows-nt-31-specifics)) |
+| `TRIM=0` | No UNMAP and no TRIM mode: VPD B2h and READ CAPACITY(16) report no logical block provisioning |
 
 Several values are separated by spaces or semicolons.
 
@@ -368,7 +405,7 @@ Without a multiplier the device answers the reset to port 15 with its own signat
 
 ### Power management
 
-- **Shutdown and flush:** `SRB_FUNCTION_SHUTDOWN` and `SRB_FUNCTION_FLUSH` issue FLUSH CACHE (EXT) to every disk of the target (only when the write cache is present). SYNCHRONIZE CACHE does the same for one disk.
+- **Shutdown and flush:** `SRB_FUNCTION_FLUSH` issues FLUSH CACHE (EXT) to every disk of the target (only when the write cache is present); SYNCHRONIZE CACHE does the same for one disk. `SRB_FUNCTION_SHUTDOWN` flushes and then sends STANDBY IMMEDIATE to every disk of the target, so the disk parks its heads (or an SSD saves its tables) before the power goes: an emergency power-off otherwise. The driver declares `CachesData`, without which ScsiPort passes neither request.
 - **START STOP UNIT:** stop = flush, then STANDBY IMMEDIATE; start = IDLE IMMEDIATE. The next read or write spins the disk up again.
 - **Windows 2000/XP/x64 — `HwAdapterControl`:** `ScsiStopAdapter` (sleep, hibernation, device removal) drains the queues, flushes and puts the disks in standby, stops the ports and disables the interrupts; `ScsiRestartAdapter` sets the HBA up again: ports, devices behind port multipliers, the MODE SELECT settings (write cache, look-ahead).
 - **Hibernation and crash dump (2000/XP/x64):** the dump stack loads the miniport a second time without a driver object (or with `DUMP=` in the argument string). That instance uses Fast Polling only, no queued requests and no port multiplier enumeration, and keeps its device extension small (see [Build-time limits](#build-time-limits)).
@@ -381,12 +418,19 @@ Both are `IOCTL_SCSI_MINIPORT` requests (an `SRB_IO_CONTROL` header followed by 
 
 | Signature | ControlCode | Function |
 |---|---|---|
-| `"AHCINT  "` | `1` GET_INFO | Returns `AHCI_IOCTL_INFO`: driver version (`01050000h`), `CAP`, `PI`, flags (bit 0 NCQ active, bit 1 powered down), tags per port, number of devices per port |
+| `"AHCINT  "` | `1` GET_INFO | Returns `AHCI_IOCTL_INFO`: driver version (`01050000h`), `CAP`, `PI`, flags (bit 0 NCQ active, bit 1 powered down, bit 3 TRIM mode), tags per port, number of devices per port |
+| `"AHCINT  "` | `20h` TRIM_MODE_ON | A 4 KB pattern follows the header: from now on a write whose data is that pattern repeated is not written but trimmed (see [TRIM](#trim)) |
+| `"AHCINT  "` | `21h` TRIM_MODE_OFF | Back to normal writes |
 | `"AHCINT  "` | `10h` POWER_DOWN | Drain, flush, STANDBY IMMEDIATE on every disk, stop all ports, disable interrupts. GET_INFO does not wake the HBA; any other request does |
 | `"AHCINT  "` | `11h` POWER_UP | Set the HBA up again (as after `ScsiRestartAdapter`) |
 | `"SCSIDISK"` | `1B0500h`–`1B050Ch` | SMART, as `IOCTL_SCSI_MINIPORT_SMART_VERSION` ... `_WRITE_LOG` (`NTDDSCSI.H`): IDENTIFY, READ ATTRIBUTES/THRESHOLDS, ENABLE/DISABLE, RETURN STATUS, AUTOSAVE, SAVE ATTRIBUTES, OFFLINE DIAGS, READ/WRITE LOG. `bDriveNumber` is the port; the device map in SMART_VERSION follows `atapi.sys` (bit n ATA, bit n+4 ATAPI, ports 0–3) |
 
 The structures are in `src\ahcint.h` (`AHCI_SRB_IO_CONTROL`, `AHCI_IOCTL_INFO`, `AHCI_SENDCMD_IN/OUT`).
+
+### TRIM
+
+- **UNMAP:** every block descriptor becomes TRIM ranges of DATA SET MANAGEMENT (06h, 48-bit DMA, up to 65535 blocks per range, 64 ranges per 512-byte block); the command is issued like FLUSH (not queued). Offered only on devices whose IDENTIFY word 169 bit 0 reports TRIM; VPD B0h gives 64 descriptors and the maximum LBA count, VPD B2h LBPU. LBPRZ (zeroes after TRIM) follows IDENTIFY word 69 bits 14 and 5.
+- **TRIM mode:** Windows versions before 7 never send TRIM. `TRIM_MODE_ON` gives the driver a 4 KB pattern; while the mode is on, a write whose data is that pattern repeated over the whole request is trimmed instead of written. `tools\trimnt.exe <drive letter>` switches the mode on with a random pattern on every AHCINT, IDENT, MMCSDNT and NVMENT adapter, fills the free space of the volume with files of the pattern (unbuffered, write-through), switches the mode off and deletes the files. Other writes are written normally all the time.
 
 ### ATA command selection
 
@@ -461,6 +505,68 @@ The 2000/XP x86 and XP x64/Server 2003 x64 drivers differ only in the build envi
 - **PRDT** – up to 40 entries per command table; ScsiPort is told 32 physical breaks and 128 KB per I/O, so an unaligned 128 KB buffer (33 pages) still fits
 - **Bounce buffer** – 512 bytes per port in the DMA arena, used for IDENTIFY, READ LOG EXT and the ATAPI REQUEST SENSE / MODE SENSE commands the driver issues itself
 
+## Version history
+
+### 1.5.0.0 — 2026-10-12
+
+- Added NCQ (Native Command Queuing): up to 32 commands per port, completed by interrupt, on Windows NT 3.50 to XP x64 (NT 3.1 with `NCQ=1`). A watchdog falls back to Fast Polling when interrupts are not delivered; `NCQ=0` turns NCQ off.
+- Added port multiplier support: every disk behind a port multiplier is a LUN of its port.
+- Added TRIM support for SSDs (SCSI UNMAP as ATA DATA SET MANAGEMENT), VPD pages B0h/B1h/B2h and logical block provisioning in READ CAPACITY(16).
+- Added TRIM mode and the `trimnt` tool, which trims the free space of a volume on Windows versions that send no TRIM.
+- Added SMART through the "SCSIDISK" IOCTL (as `atapi.sys`), ATA PASS-THROUGH(12/16), and LOG SENSE pages for temperature and SMART status.
+- Added FUA, MODE SELECT (write cache and read look-ahead), START STOP UNIT, REPORT LUNS and VERIFY(12).
+- Added power management: flush and standby at system shutdown and on power transitions, hibernation and crash dump support on Windows 2000/XP, re-initialization when the controller lost its state, and a power-down/up IOCTL for NT 3.1–4.0 and 9x.
+- Fixed SATA links left at a lower speed by the firmware: every port is renegotiated to the fastest speed both ends support.
+- Fixed a port whose device does not answer IDENTIFY: it is now reported as empty instead of as a disk with no capacity.
+- Fixed a command after a failed command failing as well (stale error status).
+- Fixed the "Files Needed" prompt for `ahcint.sys` in GUI-mode setup after an F6 installation on XP x64 (the F6 disks now carry a flat INF).
+- `oemsetup.inf` now also makes the disk class driver a boot driver on NT 3.1–4.0.
+- Added version information to the driver files (file properties show 1.5.0.0).
+
+### 1.4.0.0 — 2026-10-02
+
+- Added Windows NT 3.1 support (the same `ahcint.sys` runs on NT 3.1, 3.50, 3.51 and 4.0).
+- Added support for disks with 1024, 2048 and 4096-byte logical sectors.
+- Fixed a slow disk being reset in the middle of a transfer: Fast Polling now waits as long as the request's own timeout allows.
+- Fixed a race with ScsiPort's request timer on multiprocessor systems.
+- Fixed STOP 0x7B in XP x64 text-mode setup with the driver loaded from the F6 disk.
+
+### 1.3.0.0 — 2026-09-29
+
+- All targets (Windows 9x, NT and 2000/XP x86/x64) are built from one source tree.
+- Added 16-byte CDBs on every target: READ/WRITE/VERIFY(16), READ CAPACITY(16) and SYNCHRONIZE CACHE(16), for disks past 2 TB.
+- ATA disks report SPC-3 in INQUIRY and their serial number in VPD page 80h.
+- 28-bit commands whenever the request fits; 48-bit commands only on devices that support them.
+
+### 1.2.0.0 — 2026-09-25
+
+- Added Windows 95, 98 and Me support.
+- Fixed CD/DVD support.
+- Windows 2000 and XP x86 and x64 are built from the same source code.
+
+### 1.1.0.0 — 2026-09-21
+
+- Fixed 0x0000007B BSOD on the ACPI Uniprocessor and ACPI Multiprocessor HALs of Windows 2000 and XP x86.
+- Added support for up to 8 AHCI controllers.
+- Increased the maximum number of ports from 6 to 8 on NT 3.50, 3.51 and 4.0.
+
+### 1.0.0.0 — 2026-09-16
+
+- Initial release.
+
+## Related drivers
+
+AHCINT, IDENT, MMCSDNT and NVMENT are one family: the same ScsiPort miniport design, SCSI translation layer, IOCTL conventions, Fast Polling fallback and TRIM mode, built from one source tree each for every system from Windows 95 and NT 3.1 to XP x64.
+
+| Driver | Storage |
+|---|---|
+| **AHCINT** | SATA disks and optical drives on AHCI controllers |
+| **IDENT** | PATA disks and optical drives, and SATA controllers in IDE mode |
+| **MMCSDNT** | SD/SDHC/SDXC cards and MMC/eMMC on SD host controllers (SDHCI) |
+| **NVMENT** | NVMe SSDs (based on [nvme2k](https://github.com/techomancer/nvme2k) by DominBear) |
+
+`tools\trimnt.exe`, shipped with each of them, trims the free space of a volume on any of the four.
+
 ## License
 
 Copyright (c) 2026 ages2001. All rights reserved.
@@ -474,11 +580,11 @@ Copyright (c) 2026 ages2001. All rights reserved.
 
 ## Special Thanks
 
-- infuscomus for porting driver to x64
+- infuscomus for porting the driver to x64
 - Dietmar for Fast Polling idea
-- DominBear for [nvme2k project](https://github.com/techomancer/nvme2k)
+- DominBear for the [nvme2k](https://github.com/techomancer/nvme2k) project
 - SweetLow for [nvme9x](https://github.com/LordOfMice/Tools) (Windows 9x VMM debug output and `_MapPhysToLinear` technique)
 - [UniATA project](http://alter.org.ua/soft/win/uni_ata/)
 - Windows 2000 Dev Community
 - Testers
-- And everyone which supports it
+- And everyone who supports it

@@ -1156,6 +1156,7 @@ AhciFindAdapter(
     if (hwInit->AbarMapped != NULL) return SP_RETURN_FOUND;
 
     hwInit->DumpMode = (BOOLEAN)(g_AhciDumpMode || AhciArgPresent(ArgumentString, "DUMP="));
+    hwInit->TrimAllowed = (BOOLEAN)!AhciArgPresent(ArgumentString, "TRIM=0");
 
     AHCI_DBG((AHCI_PFX "FindAdapter: called for bus %lu slot %08lX, %lu access range(s)%s\n",
               ConfigInfo->SystemIoBusNumber, hasSlot ? ConfigInfo->SlotNumber : 0xFFFFFFFF,
@@ -1291,6 +1292,7 @@ AhciFindAdapter(
 #endif
     ConfigInfo->ScatterGather = TRUE;
     ConfigInfo->MaximumTransferLength = AHCI_MAX_TRANSFER;
+    ConfigInfo->CachesData = TRUE;             /* ScsiPort passes SRB_FUNCTION_SHUTDOWN and FLUSH only then */
     ConfigInfo->NumberOfPhysicalBreaks = AHCI_MAX_PHYS_BREAKS;
     ConfigInfo->NumberOfBuses = 1;
     /* ScsiPort skips the initiator ID when scanning: keep it past the last port */
@@ -1402,7 +1404,9 @@ AhciStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         AhciCheckState(hwInit, Srb->TargetId);
         if (Srb->TargetId < MAX_SUPPORTED_PORTS && hwInit->Ports[Srb->TargetId].Implemented) {
             for (lun = 0; lun < hwInit->Ports[Srb->TargetId].DeviceCount; lun++) {
-                if (lun == Srb->Lun || Srb->Function == SRB_FUNCTION_SHUTDOWN) {
+                if (Srb->Function == SRB_FUNCTION_SHUTDOWN) {
+                    AhciShutdownDevice(hwInit, Srb->TargetId, lun);
+                } else if (lun == Srb->Lun) {
                     AhciFlushDevice(hwInit, Srb->TargetId, lun);
                 }
             }

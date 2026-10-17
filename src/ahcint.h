@@ -280,6 +280,13 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define IDE_COMMAND_READ_FPDMA          0x60
 #define IDE_COMMAND_WRITE_FPDMA         0x61
 #define IDE_COMMAND_SMART               0xB0
+#define IDE_COMMAND_DATA_SET_MANAGEMENT 0x06
+#define IDE_DSM_TRIM                    0x0001
+#define IDE_DSM_RANGES_PER_BLOCK        64
+#define IDE_DSM_MAX_RANGE               0xFFFF
+#define IDE_SMART_RETURN_STATUS_FEATURE 0xDA
+#define IDE_SMART_READ_DATA_FEATURE     0xD0
+#define IDE_SMART_LBA_SIGNATURE         0xC24F00
 #define IDE_COMMAND_STANDBY_IMMEDIATE   0xE0
 #define IDE_COMMAND_IDLE_IMMEDIATE      0xE1
 #define IDE_COMMAND_FLUSH_CACHE         0xE7
@@ -334,6 +341,13 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define IDW_CMDSET_ENABLED_2            86
 #define IDW_LBA48_SECTORS               100         /* 100..103 */
 #define IDW_SECTOR_SIZE_INFO            106
+#define IDW_ADDITIONAL_SUPPORTED        69
+#define IDW_FORM_FACTOR                 168
+#define IDW_DSM_SUPPORT                 169
+#define IDW_ROTATION_RATE               217
+#define IDW69_DETERMINISTIC_TRIM        0x4000
+#define IDW69_ZERO_AFTER_TRIM           0x0020
+#define IDW169_TRIM                     0x0001
 #define IDW_LOGICAL_SECTOR_WORDS        117         /* 117..118 */
 
 #define IDW49_LBA_SUPPORTED             0x0200
@@ -387,6 +401,8 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define AHCI_SCSIOP_VERIFY16            0x8F
 #define AHCI_SCSIOP_SYNC_CACHE16        0x91
 #define AHCI_SCSIOP_SERVICE_ACTION_IN16 0x9E
+#define AHCI_SCSIOP_UNMAP               0x42
+#define AHCI_SCSIOP_LOG_SENSE           0x4D
 #define AHCI_SA_READ_CAPACITY16         0x10
 #define AHCI_READ_CAPACITY16_DATA_LEN   32
 
@@ -396,6 +412,16 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 /* VPD pages */
 #define AHCI_VPD_SUPPORTED_PAGES        0x00
 #define AHCI_VPD_SERIAL_NUMBER          0x80
+#define AHCI_VPD_BLOCK_LIMITS           0xB0
+#define AHCI_VPD_BLOCK_CHARACTERISTICS  0xB1
+#define AHCI_VPD_PROVISIONING           0xB2
+
+#define AHCI_LOG_PAGE_SUPPORTED         0x00
+#define AHCI_LOG_PAGE_TEMPERATURE       0x0D
+#define AHCI_LOG_PAGE_INFO_EXCEPTIONS   0x2F
+#define AHCI_ASC_FAILURE_PREDICTION     0x5D
+#define AHCI_UNMAP_MAX_DESCRIPTORS      64
+#define AHCI_UNMAP_MAX_BLOCKS           (IDE_DSM_RANGES_PER_BLOCK * IDE_DSM_MAX_RANGE)
 
 /* Mode pages */
 #define AHCI_MODE_PAGE_CACHING          0x08
@@ -517,9 +543,13 @@ typedef struct _AHCI_SRB_IO_CONTROL {
 #define AHCI_IOCTL_GET_INFO             0x00000001
 #define AHCI_IOCTL_POWER_DOWN           0x00000010  /* flush, standby, stop ports */
 #define AHCI_IOCTL_POWER_UP             0x00000011  /* reinitialize the HBA */
+#define AHCI_IOCTL_TRIM_MODE_ON         0x00000020  /* 4 KB pattern after the header */
+#define AHCI_IOCTL_TRIM_MODE_OFF        0x00000021
+#define AHCI_TRIM_PATTERN_SIZE          4096
 
 #define AHCI_INFO_ASYNC                 0x00000001  /* NCQ with interrupts active */
 #define AHCI_INFO_POWERED_DOWN          0x00000002
+#define AHCI_INFO_TRIM_MODE             0x00000008  /* writes of the TRIM pattern become TRIMs */
 
 typedef struct _AHCI_IOCTL_INFO {
     ULONG Version;                      /* AHCI_DRIVER_VERSION */
@@ -637,6 +667,11 @@ typedef struct _AHCI_DEVICE {
     UCHAR                   NcqDepth;
     UCHAR                   NcqErrors;
     UCHAR                   PhysExponent;   /* log2(logical sectors per physical) */
+    BOOLEAN                 Trim;           /* DATA SET MANAGEMENT TRIM */
+    BOOLEAN                 TrimZeroes;     /* deterministic zeroes after TRIM */
+    BOOLEAN                 Smart;          /* SMART supported and enabled */
+    UCHAR                   FormFactor;
+    USHORT                  RotationRate;   /* 1 = non-rotating */
     AHCI_LBA                TotalSectors;   /* in logical sectors */
     ULONG                   SectorSize;     /* logical sector, bytes */
 
@@ -720,6 +755,10 @@ typedef struct _HW_DEVICE_EXTENSION {
     PUCHAR                  DmaArea;
     ULONG                   DmaLength;
     SCSI_PHYSICAL_ADDRESS   DmaAreaPhysical;
+
+    BOOLEAN                 TrimAllowed;    /* TRIM=0 turns UNMAP off */
+    BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become TRIMs */
+    UCHAR                   TrimPattern[AHCI_TRIM_PATTERN_SIZE];
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
 
 /* One ATA/ATAPI command to put on the wire */
@@ -816,6 +855,7 @@ VOID    AhciParseIdentify(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULON
 VOID    AhciSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb);
 VOID    AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb);
 BOOLEAN AhciFlushDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun);
+VOID    AhciShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun);
 VOID    AhciSatlCompleteAtaError(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQUEST_BLOCK Srb);
 
 #endif /* _AHCINT_H_ */
