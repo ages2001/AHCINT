@@ -380,6 +380,20 @@ AhciExtractAtaString(
 }
 
 /* EVPD: supported-pages list and unit serial number (IDENTIFY 10..19) */
+/* Peripheral device type of an ATAPI device: IDENTIFY PACKET DEVICE word 0
+   bits 12:8 (05h CD/DVD, 00h direct access such as ZIP, LS-120 or
+   SuperDisk, 07h optical memory, 01h tape); 1Fh (unknown) and a device
+   without IDENTIFY data count as CD/DVD */
+static UCHAR
+AhciAtapiDeviceType(IN PAHCI_DEVICE Dev)
+{
+    UCHAR type;
+
+    if (!Dev->IdentifyValid) return READ_ONLY_DIRECT_ACCESS_DEVICE;
+    type = (UCHAR)((Dev->Id[AHCI_ID_CONFIG] >> 8) & 0x1F);
+    return (type == 0x1F) ? (UCHAR)READ_ONLY_DIRECT_ACCESS_DEVICE : type;
+}
+
 static VOID
 AhciHandleInquiryVpd(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -388,7 +402,7 @@ AhciHandleInquiryVpd(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_DEVICE Dev, IN PSC
     BOOLEAN unmap = (BOOLEAN)(Dev->Trim && HwInit->TrimAllowed);
 
     ZeroMemoryBytes(page, sizeof(page));
-    page[0] = Dev->IsAtapi ? READ_ONLY_DIRECT_ACCESS_DEVICE : DIRECT_ACCESS_DEVICE;
+    page[0] = Dev->IsAtapi ? AhciAtapiDeviceType(Dev) : DIRECT_ACCESS_DEVICE;
     page[1] = Srb->Cdb[2];
 
     if (Dev->IsAtapi && Srb->Cdb[2] != AHCI_VPD_SUPPORTED_PAGES && Srb->Cdb[2] != AHCI_VPD_SERIAL_NUMBER) {
@@ -475,8 +489,10 @@ AhciHandleInquiry(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_DEVICE Dev, IN PSCSI_
 
     ZeroMemoryBytes(&inq, sizeof(inq));
 
-    inq.DeviceType = Dev->IsAtapi ? READ_ONLY_DIRECT_ACCESS_DEVICE : DIRECT_ACCESS_DEVICE;
-    inq.RemovableMedia = Dev->IsAtapi ? 1 : ((id[AHCI_ID_CONFIG] & (1 << 7)) ? 1 : 0);
+    inq.DeviceType = Dev->IsAtapi ? AhciAtapiDeviceType(Dev) : DIRECT_ACCESS_DEVICE;
+    /* ATAPI: word 0 bit 7, and every CD/DVD drive as before */
+    inq.RemovableMedia = (Dev->IsAtapi && inq.DeviceType == READ_ONLY_DIRECT_ACCESS_DEVICE) ? 1 :
+                         ((id[AHCI_ID_CONFIG] & (1 << 7)) ? 1 : 0);
     /* ATAPI stays unversioned */
     inq.Versions = Dev->IsAtapi ? 0 : AHCI_INQUIRY_VERSION_SPC3;
     inq.ResponseDataFormat = 2;
@@ -521,15 +537,21 @@ AhciHandleReportLuns(IN PAHCI_PORT_INFO Pi, IN PSCSI_REQUEST_BLOCK Srb)
     AhciGood(Srb);
 }
 
-/* READ CAPACITY(10): last LBA saturates at 0xFFFFFFFF, which tells the
-   class driver to use READ CAPACITY(16). */
+/* READ CAPACITY(10) for 2 TB and more (last LBA FFFFFFFFh or beyond):
+   FFFFFFFFh sends a class driver that knows READ CAPACITY(16) there.
+   One that does not (NT 3.x/4.0, 9x, 2000, XP x86) adds one to it in 32
+   bits and sees a disk of 0 bytes; it gets FFFFFFFEh, the most it can
+   address with READ(10), and sees the first 2 TB. */
 static VOID
-AhciHandleReadCapacity10(IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
+AhciHandleReadCapacity10(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_DEVICE Dev, IN PSCSI_REQUEST_BLOCK Srb)
 {
     UCHAR data[8];
     AHCI_LBA last = AhciLastLba(Dev);
 
-    AhciPutBigEndian32(&data[0], (last.High != 0) ? 0xFFFFFFFF : last.Low);
+    if (last.High != 0 || last.Low == 0xFFFFFFFF) {
+        last.Low = HwInit->Capacity16 ? 0xFFFFFFFF : 0xFFFFFFFE;
+    }
+    AhciPutBigEndian32(&data[0], last.Low);
     AhciPutBigEndian32(&data[4], Dev->SectorSize);
 
     AhciCopyToSrb(Srb, data, sizeof(data));
@@ -767,9 +789,9 @@ AhciFlushDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
                                    0, AHCI_POLL_TIMEOUT_POWER_SEC) == AHCI_CMD_OK);
 }
 
-/* System shutdown: write cache flushed, then STANDBY IMMEDIATE so the
-   drive parks its heads (or an SSD saves its tables) before the power
-   goes. A request after it spins the drive up again. */
+/* System shutdown: write cache flushed. With STANDBY=1 also STANDBY
+   IMMEDIATE, so the drive parks its heads (or an SSD saves its tables)
+   before the power goes; a request after it spins the drive up again. */
 VOID
 AhciShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
 {
@@ -777,6 +799,7 @@ AhciShutdownDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
 
     if (!dev->Present || dev->IsAtapi || !dev->IdentifyValid) return;
     AhciFlushDevice(HwInit, Port, Lun);
+    if (!HwInit->StandbyAtShutdown) return;
     if (AhciRunSimple(HwInit, Port, Lun, IDE_COMMAND_STANDBY_IMMEDIATE, 0, AHCI_POLL_TIMEOUT_POWER_SEC) == AHCI_CMD_OK) {
         AHCI_DBG((AHCI_PFX "Port %lu.%lu: standby for shutdown\n", Port, (ULONG)dev->Pmp));
     }
@@ -1286,7 +1309,7 @@ AhciProcessAtaSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQUES
         return;
 
     case SCSIOP_READ_CAPACITY:
-        AhciHandleReadCapacity10(dev, Srb);
+        AhciHandleReadCapacity10(HwInit, dev, Srb);
         return;
 
     case AHCI_SCSIOP_SERVICE_ACTION_IN16:
@@ -1472,39 +1495,42 @@ AhciAtapiModeSense6(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQU
     PUCHAR bounce = HwInit->Ports[Port].BounceBuffer;
     UCHAR cdb[12];
     UCHAR hdr6[4];
-    ULONG xferLen, i;
+    ULONG xferLen, total, blockDesc, i;
+
+    /* The same request with 4 more bytes for the longer header; DBD, page
+       control and page code as given */
+    xferLen = (ULONG)Srb->Cdb[4] + 4;
+    if (xferLen < 8) xferLen = 8;               /* at least the whole header */
+    if (xferLen > AHCI_BOUNCE_SIZE) xferLen = AHCI_BOUNCE_SIZE;
+    xferLen = (xferLen + 1) & ~1UL;             /* PRD byte counts are even */
 
     ZeroMemoryBytes(cdb, sizeof(cdb));
     cdb[0] = SCSIOP_MODE_SENSE10;
-    cdb[2] = (UCHAR)(Srb->Cdb[2] & 0x3F);       /* page code */
-    cdb[7] = 0;                                 /* ParameterListLengthMsb */
-    cdb[8] = Srb->Cdb[4];                       /* SCSI-6 allocation length */
-
-    /* Same data length as the SRB, through the bounce buffer */
-    xferLen = Srb->DataTransferLength;
-    if (xferLen > AHCI_BOUNCE_SIZE) xferLen = AHCI_BOUNCE_SIZE;
-    xferLen = (xferLen + 1) & ~1UL;             /* PRD byte counts are even */
+    cdb[1] = (UCHAR)(Srb->Cdb[1] & 0x08);
+    cdb[2] = Srb->Cdb[2];
+    cdb[7] = (UCHAR)(xferLen >> 8);
+    cdb[8] = (UCHAR)xferLen;
 
     if (AhciAtapiBounceCommand(HwInit, Port, Srb->Lun, cdb, xferLen) != AHCI_CMD_OK) {
         AhciAtapiFailed(HwInit, Port, Srb);
         return;
     }
 
-    if (Srb->DataTransferLength >= sizeof(MODE_PARAMETER_HEADER_10)) {
-        ULONG payload = Srb->DataTransferLength - sizeof(MODE_PARAMETER_HEADER_10);
-        if (payload > AHCI_BOUNCE_SIZE - sizeof(MODE_PARAMETER_HEADER_10)) {
-            payload = AHCI_BOUNCE_SIZE - sizeof(MODE_PARAMETER_HEADER_10);
-        }
+    /* Header (10) to header (6): data length less 3, medium type, device
+       specific parameter (write protect of a removable disk), block
+       descriptor length; the descriptors and pages follow unchanged */
+    total = (((ULONG)bounce[0] << 8) | bounce[1]) + 2;     /* all the drive has */
+    if (total < 8) total = 8;
+    blockDesc = ((ULONG)bounce[6] << 8) | bounce[7];
+    hdr6[0] = (UCHAR)((total - 5 > 255) ? 255 : total - 5);
+    if (total > xferLen) total = xferLen;                   /* what came back */
+    hdr6[1] = bounce[2];
+    hdr6[2] = bounce[3];
+    hdr6[3] = (UCHAR)((blockDesc > 255) ? 255 : blockDesc);
+    for (i = 8; i < total; i++) bounce[i - 4] = bounce[i];
+    for (i = 0; i < 4; i++) bounce[i] = hdr6[i];
 
-        hdr6[0] = bounce[1];                    /* ModeDataLengthLsb */
-        hdr6[1] = bounce[2];                    /* MediumType */
-        hdr6[2] = 0;                            /* DeviceSpecificParameter */
-        hdr6[3] = 0;                            /* BlockDescriptorLength */
-        for (i = 0; i < payload; i++) bounce[4 + i] = bounce[8 + i];
-        for (i = 0; i < 4; i++) bounce[i] = hdr6[i];
-    }
-
-    AhciCopyToSrb(Srb, bounce, Srb->DataTransferLength);
+    AhciCopyToSrb(Srb, bounce, total - 4);
     AhciGood(Srb);
 }
 
@@ -1514,6 +1540,26 @@ AhciProcessAtapiSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQU
     PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, Port, Srb->Lun);
     ATA_REQUEST req;
     ULONG result;
+
+    /* ATAPI has no READ(6)/WRITE(6) (MMC, SFF-8070i): the same transfer as
+       READ(10)/WRITE(10), for a class driver of a removable disk that
+       sends the short form */
+    if (Srb->Cdb[0] == SCSIOP_READ6 || Srb->Cdb[0] == SCSIOP_WRITE6) {
+        PUCHAR c = Srb->Cdb;
+        ULONG lba = ((ULONG)(c[1] & 0x1F) << 16) | ((ULONG)c[2] << 8) | c[3];
+        ULONG count = (c[4] != 0) ? c[4] : 256;
+        UCHAR op = (UCHAR)((c[0] == SCSIOP_READ6) ? SCSIOP_READ : SCSIOP_WRITE);
+
+        ZeroMemoryBytes(c, 10);
+        c[0] = op;
+        c[2] = (UCHAR)(lba >> 24);
+        c[3] = (UCHAR)(lba >> 16);
+        c[4] = (UCHAR)(lba >> 8);
+        c[5] = (UCHAR)lba;
+        c[7] = (UCHAR)(count >> 8);
+        c[8] = (UCHAR)count;
+        Srb->CdbLength = 10;
+    }
 
     switch (Srb->Cdb[0]) {
     case SCSIOP_INQUIRY:
@@ -1565,11 +1611,11 @@ AhciProcessAtapiSrb(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQU
 VOID
 AhciSatlProcessSrb(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
 {
-    ULONG port = Srb->TargetId;
+    ULONG port = AHCI_PORT_OF(Srb);
     PAHCI_PORT_INFO pi;
     PAHCI_DEVICE dev;
 
-    if (Srb->PathId != 0 || port >= MAX_SUPPORTED_PORTS || !HwInit->Ports[port].Implemented ||
+    if (Srb->TargetId >= AHCI_TARGETS_PER_BUS || port >= HwInit->MaxPorts || !HwInit->Ports[port].Implemented ||
         HwInit->Ports[port].DeviceCount == 0) {
         Srb->SrbStatus = SRB_STATUS_SELECTION_TIMEOUT;
         return;
@@ -1630,11 +1676,11 @@ AhciSmartDevice(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb, IN U
 {
     ULONG port = Drive, lun = 0;
 
-    if (port >= MAX_SUPPORTED_PORTS || HwInit->Ports[port].DeviceCount == 0) {
-        port = Srb->TargetId;
+    if (port >= HwInit->MaxPorts || HwInit->Ports[port].DeviceCount == 0) {
+        port = AHCI_PORT_OF(Srb);
     }
-    if (port >= MAX_SUPPORTED_PORTS) return NULL;
-    if (port == Srb->TargetId) lun = Srb->Lun;
+    if (port >= HwInit->MaxPorts) return NULL;
+    if (port == AHCI_PORT_OF(Srb)) lun = Srb->Lun;
     if (lun >= HwInit->Ports[port].DeviceCount || !AHCI_DEVICE_OF(HwInit, port, lun)->Present) return NULL;
     *Port = port;
     *Lun = lun;
@@ -1773,7 +1819,7 @@ AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
     if (available > ctl->Length) available = ctl->Length;
 
     if (AhciSignatureIs(ctl, AHCI_SMART_SIGNATURE)) {
-        AhciCheckState(HwInit, Srb->TargetId);
+        AhciCheckState(HwInit, AHCI_PORT_OF(Srb));
         if (ctl->ControlCode == AHCI_SMART_VERSION) {
             AhciSmartVersion(HwInit, ctl, available);
         } else if (ctl->ControlCode > AHCI_SMART_VERSION && ctl->ControlCode <= AHCI_SMART_WRITE_LOG) {
@@ -1792,10 +1838,11 @@ AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
         ctl->ReturnCode = 0;
         switch (ctl->ControlCode) {
         case AHCI_IOCTL_GET_INFO:
-            if (available >= sizeof(AHCI_IOCTL_INFO)) {
+            if (available >= AHCI_IOCTL_INFO_SIZE_V1) {
+                /* Ports 8-31 only into a buffer that has room for them */
                 PAHCI_IOCTL_INFO info = (PAHCI_IOCTL_INFO)((PUCHAR)ctl + ctl->HeaderLength);
-                ULONG port;
-                ZeroMemoryBytes(info, sizeof(AHCI_IOCTL_INFO));
+                ULONG port, size = (available >= sizeof(AHCI_IOCTL_INFO)) ? sizeof(AHCI_IOCTL_INFO) : AHCI_IOCTL_INFO_SIZE_V1;
+                ZeroMemoryBytes(info, size);
                 info->Version = AHCI_DRIVER_VERSION;
                 info->Capabilities = HwInit->HbaCapabilities;
                 info->PortsImplemented = HwInit->PortsImplemented;
@@ -1803,8 +1850,11 @@ AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
                               (HwInit->Stopped ? AHCI_INFO_POWERED_DOWN : 0) |
                               (HwInit->TrimMode ? AHCI_INFO_TRIM_MODE : 0);
                 info->SlotsPerPort = HwInit->Slots;
-                for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+                for (port = 0; port < 8; port++) {
                     info->DeviceCount[port] = HwInit->Ports[port].DeviceCount;
+                }
+                for (port = 8; size == sizeof(AHCI_IOCTL_INFO) && port < HwInit->MaxPorts; port++) {
+                    info->DeviceCountHigh[port - 8] = HwInit->Ports[port].DeviceCount;
                 }
             } else {
                 ctl->ReturnCode = 1;
@@ -1817,7 +1867,7 @@ AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
             if (HwInit->Stopped) AhciReinitialize(HwInit);
             break;
         case AHCI_IOCTL_TRIM_MODE_ON:
-            if (available < AHCI_TRIM_PATTERN_SIZE || !HwInit->TrimAllowed) {
+            if (available < AHCI_TRIM_PATTERN_SIZE || !HwInit->TrimAllowed || HwInit->TrimPattern == NULL) {
                 ctl->ReturnCode = 1;
                 break;
             }

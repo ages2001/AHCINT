@@ -8,11 +8,12 @@ Signature="$Windows NT$"
 Class=SCSIAdapter
 ClassGUID={4D36E97B-E325-11CE-BFC1-08002BE10318}
 Provider=%ProviderString%
-DriverVer=10/12/2026,1.5.0.0
+DriverVer=10/19/2026,1.6.0.0
 PnpLockdown=1
 
 [DestinationDirs]
 DefaultDestDir = 12  ; DIRID_DRIVERS
+Ahci_PageFiles = 11  ; DIRID_SYSTEM (Device Manager page)
 
 ;-------------------------------------------------------------------------------
 ;                    Source disks
@@ -29,12 +30,15 @@ DefaultDestDir = 12  ; DIRID_DRIVERS
 
 [SourceDisksFiles]
 AHCINT.sys=1
+ahcipp.dll=1
 
 [SourceDisksFiles.x86]
 AHCINT.sys=1
+ahcipp.dll=1
 
 [SourceDisksFiles.amd64]
 AHCINT.sys=1
+ahcipp.dll=1
 
 ;-------------------------------------------------------------------------------
 ;                    Models
@@ -57,7 +61,8 @@ AHCINT.sys=1
 ;-------------------------------------------------------------------------------
 
 [Ahci_Inst]
-CopyFiles = Ahci_CopyFiles
+CopyFiles = Ahci_CopyFiles, Ahci_PageFiles
+AddReg    = Ahci_PageReg
 
 [Ahci_Inst.Services]
 AddService = AHCINT, %SPSVCINST_ASSOCSERVICE%, Ahci_Service_Inst, Miniport_EventLog_Inst
@@ -72,6 +77,12 @@ AddReg         = Ahci_AddReg
 
 [Ahci_CopyFiles]
 AHCINT.sys
+
+[Ahci_PageFiles]
+ahcipp.dll
+
+[Ahci_PageReg]
+HKR,,EnumPropPages32,,"ahcipp.dll,PortPageProvider"
 
 [Ahci_AddReg]
 HKR, "Parameters\PnpInterface", "5", %REG_DWORD%, 0x00000001

@@ -19,7 +19,7 @@ if errorlevel 1 goto error
 rc -r -foahcint.res ..\ahcint.rc
 if errorlevel 1 goto error
 
-link -nologo -debug -debugtype:both -subsystem:native,3.50 -entry:DriverEntry@8 -driver -base:0x10000 -align:0x200 -out:ahcint.sys ahcimain.obj ahcicmd.obj ahcisatl.obj scsiport.lib ntoskrnl.lib ahcint.res
+link -nologo -debug -debugtype:both -subsystem:native,3.50 -entry:DriverEntry@8 -driver -base:0x10000 -align:0x200 -out:ahcint.sys ahcimain.obj ahcicmd.obj ahcisatl.obj scsiport.lib ntoskrnl.lib hal.lib ahcint.res
 if errorlevel 1 goto error
 
 echo ahcint.sys built.

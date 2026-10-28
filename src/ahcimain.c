@@ -22,6 +22,9 @@ SCSI_ADAPTER_CONTROL_STATUS AhciAdapterControl(IN PVOID DeviceExtension,
 /* Crash dump / hibernation copy of the driver (DriverEntry without a
    driver object): polled, minimal memory, no registry access. */
 static BOOLEAN g_AhciDumpMode;
+/* The disk class driver reads READ CAPACITY(16) when READ CAPACITY(10)
+   reports FFFFFFFFh: Server 2003 SP1 and later, XP x64 */
+static BOOLEAN g_AhciCapacity16;
 
 /* ------------------------------------------------------------------ */
 /* Windows 9x: VMM services                                            */
@@ -391,7 +394,7 @@ AhciAllocateDma(IN PHW_DEVICE_EXTENSION HwInit, IN PPORT_CONFIGURATION_INFORMATI
     phys = HwInit->DmaAreaPhysical.LowPart;
     high = (ULONG)HwInit->DmaAreaPhysical.HighPart;
 
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < HwInit->MaxPorts; port++) {
         PAHCI_PORT_INFO pi = &HwInit->Ports[port];
 
         if (!(HwInit->PortsImplemented & (1UL << port))) continue;
@@ -437,10 +440,10 @@ AhciAllocDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
     ULONG i = Port;
 
     if (Lun != 0) {
-        for (i = MAX_SUPPORTED_PORTS; i < AHCI_MAX_DEVICES; i++) {
+        for (i = HwInit->MaxPorts; i < HwInit->MaxDevices; i++) {
             if (HwInit->Devices[i].Owner == 0) break;
         }
-        if (i >= AHCI_MAX_DEVICES) return FALSE;
+        if (i >= HwInit->MaxDevices) return FALSE;
     }
     ZeroMemoryBytes(&HwInit->Devices[i], sizeof(AHCI_DEVICE));
     HwInit->Devices[i].Owner = (UCHAR)(Port + 1);
@@ -526,6 +529,10 @@ AhciPmAttach(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port)
               Port, pi->PmProduct, (ULONG)pi->PmPorts));
 
     for (p = 0; p < pi->PmPorts && pi->DeviceCount < AHCI_MAX_LUNS; p++) {
+        if (HwInit->PmPortsOff[Port] & (1U << p)) {
+            AHCI_DBG((AHCI_PFX "Port %lu: PM port %lu turned off (OFF=)\n", Port, (ULONG)p));
+            continue;
+        }
         if (!AhciPmLinkUp(HwInit, Port, p)) continue;
         if (!AhciSoftReset(HwInit, Port, p, &sig)) {
             AHCI_DBG((AHCI_PFX "Port %lu: PM port %lu: no signature\n", Port, (ULONG)p));
@@ -559,7 +566,7 @@ AhciSetupPort(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port)
     ULONG lun;
 
     /* Give back the devices this port had */
-    for (lun = 0; lun < AHCI_MAX_DEVICES; lun++) {
+    for (lun = 0; lun < HwInit->MaxDevices; lun++) {
         if (HwInit->Devices[lun].Owner == Port + 1 || lun == Port) {
             ZeroMemoryBytes(&HwInit->Devices[lun], sizeof(AHCI_DEVICE));
         }
@@ -705,7 +712,7 @@ AhciSetInterrupts(IN PHW_DEVICE_EXTENSION HwInit)
 {
     ULONG port, ghc;
 
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < HwInit->MaxPorts; port++) {
         PUCHAR pb;
         if (!HwInit->Ports[port].Implemented) continue;
         pb = AHCI_PORT_BASE(HwInit->AbarMapped, port);
@@ -777,9 +784,17 @@ AhciInitializeHba(IN PHW_DEVICE_EXTENSION HwInit)
     pi = AHCI_READ_REG(HwInit->AbarMapped, AHCI_GEN_PI);
     AHCI_DBG((AHCI_PFX "HwInitialize: GHC=%08lX PI=%08lX\n", ghc, pi));
 
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < HwInit->MaxPorts; port++) {
         if (HwInit->Ports[port].Implemented && (pi & (1UL << port))) {
             AhciInitializePort(HwInit, port);
+        } else if (HwInit->PortsOff & pi & (1UL << port)) {
+            /* Turned off: no commands, no COMRESET. Its DMA engines are
+               stopped (the BIOS may have left them pointing at its own
+               memory) and its interrupts disabled. */
+            PUCHAR pb = AHCI_PORT_BASE(HwInit->AbarMapped, port);
+            AHCI_WRITE_REG(pb, AHCI_PORT_IE, 0);
+            AhciStopPortEngines(HwInit, pb);
+            AHCI_DBG((AHCI_PFX "Port %lu: turned off (OFF=)\n", port));
         }
     }
 
@@ -797,7 +812,7 @@ AhciReinitialize(IN PHW_DEVICE_EXTENSION HwInit)
     ULONG port;
 
     AHCI_DBG((AHCI_PFX "Reinitialize\n"));
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < HwInit->MaxPorts; port++) {
         if (HwInit->Ports[port].Outstanding != 0) {
             AhciFailOutstanding(HwInit, port, SRB_STATUS_BUS_RESET);
         }
@@ -815,11 +830,18 @@ AhciCheckState(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port)
     PUCHAR pb;
     ULONG cmd;
 
+    /* Registers all ones: the HBA is powered off or gone. It is not set up
+       again (every wait would run into its timeout); requests fail. */
+    HwInit->Unreachable = (BOOLEAN)(AHCI_READ_REG(HwInit->AbarMapped, AHCI_GEN_CAP) == 0xFFFFFFFF);
+    if (HwInit->Unreachable) {
+        AHCI_DBG((AHCI_PFX "HBA not reachable (registers read FFFFFFFF)\n"));
+        return;
+    }
     if (HwInit->Stopped) {
         AhciReinitialize(HwInit);
         return;
     }
-    if (Port >= MAX_SUPPORTED_PORTS) return;
+    if (Port >= HwInit->MaxPorts) return;
     pi = &HwInit->Ports[Port];
     if (!pi->Implemented || pi->DeviceCount == 0) {
         if (HwInit->CheckState) AhciReinitialize(HwInit);
@@ -847,7 +869,7 @@ AhciPowerDown(IN PHW_DEVICE_EXTENSION HwInit)
     ULONG port, lun;
 
     AHCI_DBG((AHCI_PFX "PowerDown\n"));
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < HwInit->MaxPorts; port++) {
         PAHCI_PORT_INFO pi = &HwInit->Ports[port];
         if (!pi->Implemented || pi->DeviceCount == 0) continue;
         AhciDrainPort(HwInit, port);
@@ -857,7 +879,7 @@ AhciPowerDown(IN PHW_DEVICE_EXTENSION HwInit)
             AhciRunSimple(HwInit, port, lun, IDE_COMMAND_STANDBY_IMMEDIATE, 0, AHCI_POLL_TIMEOUT_POWER_SEC);
         }
     }
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < HwInit->MaxPorts; port++) {
         if (!HwInit->Ports[port].Implemented) continue;
         AhciStopPortEngines(HwInit, AHCI_PORT_BASE(HwInit->AbarMapped, port));
         AHCI_WRITE_REG(AHCI_PORT_BASE(HwInit->AbarMapped, port), AHCI_PORT_IE, 0);
@@ -887,7 +909,7 @@ AhciDisableAsync(IN PHW_DEVICE_EXTENSION HwInit)
     ULONG port;
 
     AHCI_DBG((AHCI_PFX "NCQ: interrupts not delivered, back to Fast Polling\n"));
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < HwInit->MaxPorts; port++) {
         if (HwInit->Ports[port].Implemented) AhciDrainPort(HwInit, port);
     }
     HwInit->AsyncMode = FALSE;
@@ -905,7 +927,7 @@ AhciTimer(IN PVOID DeviceExtension)
     hwInit->TimerArmed = FALSE;
     if (!hwInit->AsyncMode || hwInit->Stopped) return;
 
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    for (port = 0; port < hwInit->MaxPorts; port++) {
         if (hwInit->Ports[port].Outstanding == 0) continue;
         missed += AhciServicePort(hwInit, port);
         if (hwInit->Ports[port].Outstanding != 0) pending = TRUE;
@@ -948,6 +970,8 @@ typedef struct _AHCI_OBJECT_ATTRIBUTES {
 } AHCI_OBJECT_ATTRIBUTES;
 
 LONG __stdcall ZwOpenKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAttributes);
+BOOLEAN __stdcall PsGetVersion(PULONG MajorVersion, PULONG MinorVersion, PULONG BuildNumber,
+                               PAHCI_UNICODE_STRING CsdVersion);
 LONG __stdcall ZwCreateKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAttributes,
                            ULONG TitleIndex, PVOID Class, ULONG CreateOptions, PULONG Disposition);
 LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
@@ -1031,6 +1055,24 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 
     AHCI_DBG((AHCI_PFX "DriverEntry%s\n", g_AhciDumpMode ? " (dump)" : ""));
 
+#if !defined(AHCI_NT4)
+#if defined(_AMD64_)
+    g_AhciCapacity16 = TRUE;
+#else
+    {
+        ULONG major = 0, minor = 0, build = 0;
+        AHCI_UNICODE_STRING csd;
+        csd.Length = 0;
+        csd.MaximumLength = 0;
+        csd.Buffer = NULL;
+        PsGetVersion(&major, &minor, &build, &csd);
+        g_AhciCapacity16 = (BOOLEAN)(major > 5 || (major == 5 && minor >= 2 && (build > 3790 || csd.Length != 0)));
+        AHCI_DBG((AHCI_PFX "DriverEntry: Windows %lu.%lu.%lu%s\n", major, minor, build,
+                  g_AhciCapacity16 ? ", READ CAPACITY(16) used" : ""));
+    }
+#endif
+#endif
+
     ZeroMemoryBytes(&initData, sizeof(HW_INITIALIZATION_DATA));
 
 #ifdef AHCI_NT31_COMPAT
@@ -1049,7 +1091,9 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 #if !defined(AHCI_NT4)
     initData.HwAdapterControl = AhciAdapterControl;
 #endif
-    initData.DeviceExtensionSize = sizeof(HW_DEVICE_EXTENSION);
+    initData.DeviceExtensionSize = g_AhciDumpMode ?
+        AHCI_EXTENSION_SIZE(AHCI_DUMP_PORTS, AHCI_DUMP_PORTS, 0) :
+        AHCI_EXTENSION_SIZE(MAX_SUPPORTED_PORTS, AHCI_MAX_DEVICES, AHCI_TRIM_PATTERN_SIZE);
     initData.AdapterInterfaceType = PCIBus;
     initData.NumberOfAccessRanges = 1;
     initData.MapBuffers = TRUE;
@@ -1114,6 +1158,94 @@ AhciArgPresent(IN PCHAR Args, IN PCHAR Key)
     return FALSE;
 }
 
+/* Map the ABAR on the bus ScsiPort called us for, else on the PCI bus */
+static PUCHAR
+AhciMapAbar(IN PHW_DEVICE_EXTENSION HwInit, IN PPORT_CONFIGURATION_INFORMATION ConfigInfo,
+            IN ULONG MapBus, IN ULONG PciBus, IN SCSI_PHYSICAL_ADDRESS Phys, IN ULONG Length)
+{
+    PUCHAR va;
+#ifdef AHCI_W9X
+    (VOID)HwInit; (VOID)ConfigInfo; (VOID)MapBus; (VOID)PciBus;
+    va = (PUCHAR)_MapPhysToLinear(Phys.LowPart, Length, MPL_NonCached);
+    if (va == (PUCHAR)0xFFFFFFFF) va = NULL;
+#else
+    va = (PUCHAR)ScsiPortGetDeviceBase(HwInit, ConfigInfo->AdapterInterfaceType, MapBus, Phys, Length, FALSE);
+    if (va == NULL && ConfigInfo->AdapterInterfaceType != PCIBus) {
+        va = (PUCHAR)ScsiPortGetDeviceBase(HwInit, PCIBus, PciBus, Phys, Length, FALSE);
+    }
+#endif
+    return va;
+}
+
+static PCHAR
+AhciParseDecimal(IN PCHAR P, OUT PULONG Value)
+{
+    ULONG v = 0;
+    PCHAR start = P;
+
+    while (*P >= '0' && *P <= '9') v = v * 10 + (ULONG)(*P++ - '0');
+    *Value = v;
+    return (P == start) ? NULL : P;
+}
+
+/* OFF=item[,item...]: ports (and devices behind a port multiplier) the
+   driver leaves alone. item = [bus.device.function:]port[.pmport], all
+   decimal; with the PCI location (as Device Manager shows it) the item
+   applies to that HBA only, without it to every HBA. */
+static VOID
+AhciParseOff(IN PCHAR Args, IN PHW_DEVICE_EXTENSION HwInit)
+{
+    ULONG i, j, n, v[5], count, colon;
+    PCHAR p;
+    CHAR a;
+    PCI_SLOT_NUMBER slot;
+
+    HwInit->PortsOff = 0;
+    ZeroMemoryBytes(HwInit->PmPortsOff, sizeof(HwInit->PmPortsOff));
+    if (Args == NULL) return;
+    slot.u.AsULONG = HwInit->PciSlot;
+    for (i = 0; Args[i] != 0; i++) {
+        static const CHAR key[] = "OFF=";
+        for (j = 0; key[j] != 0; j++) {
+            a = Args[i + j];
+            if (a >= 'a' && a <= 'z') a = (CHAR)(a - 'a' + 'A');
+            if (a != key[j]) break;
+        }
+        if (key[j] != 0) continue;
+        p = &Args[i + j];
+        for (;;) {
+            count = 0;
+            colon = 0;
+            while (count < 5) {
+                p = AhciParseDecimal(p, &n);
+                if (p == NULL) break;
+                v[count++] = n;
+                if (*p == ':' && count == 3 && colon == 0) { colon = 3; p++; continue; }
+                if (*p == '.') { p++; continue; }
+                break;
+            }
+            if (p == NULL) break;
+            if (colon != 0 && (v[0] != HwInit->PciBus || v[1] != slot.u.bits.DeviceNumber ||
+                               v[2] != slot.u.bits.FunctionNumber)) {
+                count = 0;          /* another HBA */
+            }
+            n = count - colon;
+            if (count > colon && v[colon] < MAX_SUPPORTED_PORTS) {
+                if (n == 1) {
+                    HwInit->PortsOff |= 1UL << v[colon];
+                } else if (n == 2 && v[colon + 1] < 16) {
+                    HwInit->PmPortsOff[v[colon]] |= (USHORT)(1U << v[colon + 1]);
+                }
+            }
+            if (*p != ',') break;
+            p++;
+        }
+    }
+    if (HwInit->PortsOff != 0) {
+        AHCI_DBG((AHCI_PFX "FindAdapter: ports turned off (OFF=): %08lX\n", HwInit->PortsOff));
+    }
+}
+
 ULONG
 AhciFindAdapter(
     IN PVOID DeviceExtension,
@@ -1129,7 +1261,7 @@ AhciFindAdapter(
     PACCESS_RANGE accessRanges;
     SCSI_PHYSICAL_ADDRESS basePhys;
     ULONG targetBus, targetSlot;
-    ULONG mapBus;
+    ULONG mapBus, mapLength, pi, lastPort;
     ULONG bar;
     ULONG i, ports, slots;
     BOOLEAN found;
@@ -1144,6 +1276,13 @@ AhciFindAdapter(
     accessRanges = *ConfigInfo->AccessRanges;
     *Again = FALSE;
 
+    /* Tables in the pool at the end of the extension (see DriverEntry) */
+    hwInit->MaxPorts = g_AhciDumpMode ? AHCI_DUMP_PORTS : MAX_SUPPORTED_PORTS;
+    hwInit->MaxDevices = g_AhciDumpMode ? AHCI_DUMP_PORTS : AHCI_MAX_DEVICES;
+    hwInit->Ports = (PAHCI_PORT_INFO)hwInit->Pool;
+    hwInit->Devices = (PAHCI_DEVICE)(hwInit->Ports + hwInit->MaxPorts);
+    hwInit->TrimPattern = g_AhciDumpMode ? NULL : (PUCHAR)(hwInit->Devices + hwInit->MaxDevices);
+
 #ifdef AHCI_NT31_COMPAT
     g_AhciFindAdapterCalled = TRUE;
     AhciPciProbeAccess(hwInit);
@@ -1157,6 +1296,10 @@ AhciFindAdapter(
 
     hwInit->DumpMode = (BOOLEAN)(g_AhciDumpMode || AhciArgPresent(ArgumentString, "DUMP="));
     hwInit->TrimAllowed = (BOOLEAN)!AhciArgPresent(ArgumentString, "TRIM=0");
+    hwInit->StandbyAtShutdown = AhciArgPresent(ArgumentString, "STANDBY=1");
+    hwInit->Capacity16 = g_AhciCapacity16;
+    if (AhciArgPresent(ArgumentString, "RC16=1")) hwInit->Capacity16 = TRUE;
+    if (AhciArgPresent(ArgumentString, "RC16=0")) hwInit->Capacity16 = FALSE;
 
     AHCI_DBG((AHCI_PFX "FindAdapter: called for bus %lu slot %08lX, %lu access range(s)%s\n",
               ConfigInfo->SystemIoBusNumber, hasSlot ? ConfigInfo->SlotNumber : 0xFFFFFFFF,
@@ -1218,43 +1361,46 @@ AhciFindAdapter(
 
     AhciPciEnableDevice(hwInit, targetBus, targetSlot, pciConfig.Command);
 
-#ifdef AHCI_NT4
-    /* Non-PnP ScsiPort: report the range we use so it gets claimed */
-    if (accessRanges != NULL && ConfigInfo->NumberOfAccessRanges > 0) {
-        accessRanges[0].RangeStart = basePhys;
-        accessRanges[0].RangeLength = AHCI_ABAR_MAP_SIZE;
-        accessRanges[0].RangeInMemory = TRUE;
-    }
-#endif
-
     /* Without a slot (NT 3.1) the ABAR is mapped on the bus ScsiPort
        called us for: there is no PCI bus to translate on. */
     mapBus = hasSlot ? targetBus : ConfigInfo->SystemIoBusNumber;
 
-#ifdef AHCI_W9X
-    (VOID)mapBus;
-    hwInit->AbarMapped = (PUCHAR)_MapPhysToLinear(basePhys.LowPart, AHCI_ABAR_MAP_SIZE, MPL_NonCached);
-    if (hwInit->AbarMapped == (PUCHAR)0xFFFFFFFF) {
-        hwInit->AbarMapped = NULL;
-    }
-#else
-    hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(hwInit, ConfigInfo->AdapterInterfaceType,
-                                                       mapBus, basePhys, AHCI_ABAR_MAP_SIZE, FALSE);
-    if (hwInit->AbarMapped == NULL && ConfigInfo->AdapterInterfaceType != PCIBus) {
-        hwInit->AbarMapped = (PUCHAR)ScsiPortGetDeviceBase(hwInit, PCIBus, targetBus, basePhys,
-                                                           AHCI_ABAR_MAP_SIZE, FALSE);
-    }
-#endif
-
+    /* The port registers up to port 7 first (as up to 1.5.0.0); an HBA
+       with more ports is mapped again as far as its last port */
+    mapLength = AHCI_ABAR_MAP_SIZE(8);
+    hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, targetBus, basePhys, mapLength);
     if (hwInit->AbarMapped == NULL) {
         AHCI_DBG((AHCI_PFX "FindAdapter: mapping ABAR %08lX failed\n", basePhys.LowPart));
         return SP_RETURN_ERROR;
     }
+    pi = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_PI);
+    if (hwInit->MaxPorts < 32) pi &= (1UL << hwInit->MaxPorts) - 1;
+    for (lastPort = MAX_SUPPORTED_PORTS; lastPort > 0 && !(pi & (1UL << (lastPort - 1))); lastPort--) ;
+    if (AHCI_ABAR_MAP_SIZE(lastPort) > mapLength) {
+#ifndef AHCI_W9X
+        ScsiPortFreeDeviceBase(hwInit, hwInit->AbarMapped);
+#endif
+        mapLength = AHCI_ABAR_MAP_SIZE(lastPort);
+        hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, targetBus, basePhys, mapLength);
+        if (hwInit->AbarMapped == NULL) {
+            AHCI_DBG((AHCI_PFX "FindAdapter: mapping %lu bytes of ABAR %08lX failed\n", mapLength, basePhys.LowPart));
+            return SP_RETURN_ERROR;
+        }
+    }
+
+#ifdef AHCI_NT4
+    /* Non-PnP ScsiPort: report the range we use so it gets claimed */
+    if (accessRanges != NULL && ConfigInfo->NumberOfAccessRanges > 0) {
+        accessRanges[0].RangeStart = basePhys;
+        accessRanges[0].RangeLength = mapLength;
+        accessRanges[0].RangeInMemory = TRUE;
+    }
+#endif
 
     if (hasSlot) {
         ConfigInfo->SystemIoBusNumber = targetBus;
         ConfigInfo->SlotNumber = targetSlot;
-        ConfigInfo->MaximumNumberOfTargets = MAX_SUPPORTED_PORTS;
+        ConfigInfo->MaximumNumberOfTargets = AHCI_TARGETS_PER_BUS;
 #ifdef AHCI_NT4
         /* When the miniport picks the slot itself, ScsiPort does not look
            up the interrupt for it -- take INTx from config space. */
@@ -1281,9 +1427,31 @@ AhciFindAdapter(
     }
     ConfigInfo->InterruptMode = LevelSensitive;
 
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+    /* The HAL must have a vector for the line: an MPS HAL whose MP table
+       has no entry for the HBA's INTx gives none, and ScsiPort would then
+       fail the whole adapter (0x7B with the system disk on it). Fast
+       Polling needs no interrupt. "IRQ=0" leaves it out in any case. */
+    if (ConfigInfo->BusInterruptLevel != 0 || ConfigInfo->BusInterruptVector != 0) {
+        UCHAR irql = 0;
+        ULONG affinity = 0, vector = 0;
+        if (!AhciArgPresent(ArgumentString, "IRQ=0")) {
+            vector = HalGetInterruptVector(ConfigInfo->AdapterInterfaceType, ConfigInfo->SystemIoBusNumber,
+                                           ConfigInfo->BusInterruptLevel, ConfigInfo->BusInterruptVector,
+                                           &irql, &affinity);
+        }
+        if (vector == 0 || affinity == 0) {
+            AHCI_DBG((AHCI_PFX "FindAdapter: no vector for IRQ level %lu (vector %lu, affinity %lX), Fast Polling\n",
+                      ConfigInfo->BusInterruptLevel, vector, affinity));
+            ConfigInfo->BusInterruptLevel = 0;
+            ConfigInfo->BusInterruptVector = 0;
+        }
+    }
+#endif
+
     hwInit->HbaCapabilities = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_CAP);
-    hwInit->PortsImplemented = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_PI) &
-                               ((1UL << MAX_SUPPORTED_PORTS) - 1);
+    AhciParseOff(ArgumentString, hwInit);
+    hwInit->PortsImplemented = pi & ~hwInit->PortsOff;
 
     ConfigInfo->Master = TRUE;
     ConfigInfo->Dma32BitAddresses = TRUE;
@@ -1294,9 +1462,17 @@ AhciFindAdapter(
     ConfigInfo->MaximumTransferLength = AHCI_MAX_TRANSFER;
     ConfigInfo->CachesData = TRUE;             /* ScsiPort passes SRB_FUNCTION_SHUTDOWN and FLUSH only then */
     ConfigInfo->NumberOfPhysicalBreaks = AHCI_MAX_PHYS_BREAKS;
-    ConfigInfo->NumberOfBuses = 1;
-    /* ScsiPort skips the initiator ID when scanning: keep it past the last port */
-    ConfigInfo->InitiatorBusId[0] = (UCHAR)MAX_SUPPORTED_PORTS;
+    /* Eight ports per bus, as many buses as the last port needs. ScsiPort
+       skips the initiator ID when scanning: keep it past the last target. */
+    ConfigInfo->NumberOfBuses = (UCHAR)((lastPort + AHCI_TARGETS_PER_BUS - 1) / AHCI_TARGETS_PER_BUS);
+    if (ConfigInfo->NumberOfBuses == 0) ConfigInfo->NumberOfBuses = 1;
+    for (i = 0; i < ConfigInfo->NumberOfBuses; i++) {
+        ConfigInfo->InitiatorBusId[i] = (UCHAR)AHCI_TARGETS_PER_BUS;
+    }
+#ifndef AHCI_NT4
+    /* Devices behind a port multiplier are LUNs; 2000 and later take more than eight */
+    ConfigInfo->MaximumNumberOfLogicalUnits = AHCI_MAX_LUNS;
+#endif
 
     /* NCQ needs the interrupt: queued commands complete in HwInterrupt.
        Off in the dump stack, with "NCQ=0", on 9x unless "NCQ=1". */
@@ -1316,7 +1492,11 @@ AhciFindAdapter(
         ports = AhciCountPorts(hwInit->PortsImplemented);
         slots = ((hwInit->HbaCapabilities >> AHCI_CAP_NCS_SHIFT) & AHCI_CAP_NCS_MASK) + 1;
         if (ports != 0) {
-            ULONG fit = ((AHCI_DMA_BUDGET - 1024) / ports - AHCI_PORT_DMA_FIXED) / AHCI_CMDTBL_SIZE;
+            /* 160 KB in all; an HBA with many ports gets up to 8 tags per port beyond it */
+            ULONG budget = AHCI_DMA_BUDGET;
+            ULONG fit;
+            if (budget < AhciArenaLength(ports, 8)) budget = AhciArenaLength(ports, 8);
+            fit = ((budget - 1024) / ports - AHCI_PORT_DMA_FIXED) / AHCI_CMDTBL_SIZE;
             if (slots > fit) slots = fit;
         }
         if (slots > AHCI_MAX_SLOTS) slots = AHCI_MAX_SLOTS;
@@ -1355,7 +1535,7 @@ AhciHwInitialize(IN PVOID DeviceExtension)
 static VOID
 AhciResetTarget(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port)
 {
-    if (Port >= MAX_SUPPORTED_PORTS || !HwInit->Ports[Port].Implemented ||
+    if (Port >= HwInit->MaxPorts || !HwInit->Ports[Port].Implemented ||
         HwInit->Ports[Port].DeviceCount == 0) {
         return;
     }
@@ -1367,14 +1547,19 @@ BOOLEAN
 AhciStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
 {
     PHW_DEVICE_EXTENSION hwInit;
-    ULONG lun;
+    ULONG lun, port;
 
     hwInit = (PHW_DEVICE_EXTENSION)DeviceExtension;
     Srb->SrbStatus = SRB_STATUS_PENDING;
+    port = AHCI_PORT_OF(Srb);
 
     switch (Srb->Function) {
     case SRB_FUNCTION_EXECUTE_SCSI:
-        AhciCheckState(hwInit, Srb->TargetId);
+        AhciCheckState(hwInit, port);
+        if (hwInit->Unreachable) {
+            Srb->SrbStatus = SRB_STATUS_NO_HBA;
+            break;
+        }
         AhciSatlProcessSrb(hwInit, Srb);
         break;
 
@@ -1388,7 +1573,7 @@ AhciStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
         break;
 
     case SRB_FUNCTION_RESET_DEVICE:
-        AhciResetTarget(hwInit, Srb->TargetId);
+        AhciResetTarget(hwInit, port);
         Srb->SrbStatus = SRB_STATUS_SUCCESS;
         break;
 
@@ -1401,13 +1586,13 @@ AhciStartIo(IN PVOID DeviceExtension, IN PSCSI_REQUEST_BLOCK Srb)
     case SRB_FUNCTION_SHUTDOWN:
     case SRB_FUNCTION_FLUSH:
         /* Write cache to the media; for every device on the target */
-        AhciCheckState(hwInit, Srb->TargetId);
-        if (Srb->TargetId < MAX_SUPPORTED_PORTS && hwInit->Ports[Srb->TargetId].Implemented) {
-            for (lun = 0; lun < hwInit->Ports[Srb->TargetId].DeviceCount; lun++) {
+        AhciCheckState(hwInit, port);
+        if (!hwInit->Unreachable && port < hwInit->MaxPorts && hwInit->Ports[port].Implemented) {
+            for (lun = 0; lun < hwInit->Ports[port].DeviceCount; lun++) {
                 if (Srb->Function == SRB_FUNCTION_SHUTDOWN) {
-                    AhciShutdownDevice(hwInit, Srb->TargetId, lun);
+                    AhciShutdownDevice(hwInit, port, lun);
                 } else if (lun == Srb->Lun) {
-                    AhciFlushDevice(hwInit, Srb->TargetId, lun);
+                    AhciFlushDevice(hwInit, port, lun);
                 }
             }
         }
@@ -1446,7 +1631,7 @@ AhciInterrupt(IN PVOID DeviceExtension)
     hbaIs = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_IS);
     if (hbaIs == 0 || hbaIs == 0xFFFFFFFF) return FALSE;
 
-    for (p = 0; p < MAX_SUPPORTED_PORTS; p++) {
+    for (p = 0; p < hwInit->MaxPorts; p++) {
         if (!(hbaIs & (1UL << p))) continue;
         if (hwInit->AsyncMode && hwInit->Ports[p].Outstanding != 0) {
             if (AhciServicePort(hwInit, p) != 0) hwInit->MissedInterrupts = 0;
@@ -1471,19 +1656,23 @@ AhciResetBus(IN PVOID HwDeviceExtension, IN ULONG PathId)
     PHW_DEVICE_EXTENSION hwInit;
     ULONG port, lun;
 
-    (VOID)PathId;
+    ULONG mask = 0;
+
     hwInit = (PHW_DEVICE_EXTENSION)HwDeviceExtension;
 
-    AHCI_DBG((AHCI_PFX "ResetBus\n"));
+    AHCI_DBG((AHCI_PFX "ResetBus %lu\n", PathId));
 
-    for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+    /* The ports of that bus only (eight per bus) */
+    for (port = 0; port < hwInit->MaxPorts; port++) {
         PAHCI_PORT_INFO pi = &hwInit->Ports[port];
+        if (AHCI_PATH_OF_PORT(port) != PathId) continue;
         if (!pi->Implemented || pi->DeviceCount == 0) continue;
         AhciFailOutstanding(hwInit, port, SRB_STATUS_BUS_RESET);
         AhciRestartPort(hwInit, port, FALSE);
         for (lun = 0; lun < pi->DeviceCount; lun++) AHCI_DEVICE_OF(hwInit, port, lun)->SensePending = FALSE;
+        mask |= 1UL << port;
     }
-    AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_IS, 0xFFFFFFFF);
+    AHCI_WRITE_REG(hwInit->AbarMapped, AHCI_GEN_IS, mask);
     return TRUE;
 }
 
@@ -1516,7 +1705,7 @@ AhciAdapterControl(
     case ScsiStopAdapter:
         /* The class drivers have flushed and stopped the disks already */
         AHCI_DBG((AHCI_PFX "AdapterControl: stop\n"));
-        for (port = 0; port < MAX_SUPPORTED_PORTS; port++) {
+        for (port = 0; port < hwInit->MaxPorts; port++) {
             if (!hwInit->Ports[port].Implemented) continue;
             AhciDrainPort(hwInit, port);
             AHCI_WRITE_REG(AHCI_PORT_BASE(hwInit->AbarMapped, port), AHCI_PORT_IE, 0);

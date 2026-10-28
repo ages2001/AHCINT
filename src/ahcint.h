@@ -12,6 +12,17 @@
 #include <miniport.h>
 #include <scsi.h>
 
+/* x64 MinGW: srb.h turns the register functions into plain volatile
+   accesses, which the compiler may reorder against the command lists and
+   FIS areas in memory. Take ScsiPort's exported functions, as the x86
+   build does. */
+#if defined(_AMD64_) && defined(__GNUC__)
+#undef ScsiPortReadRegisterUlong
+#undef ScsiPortWriteRegisterUlong
+ULONG ScsiPortReadRegisterUlong(PULONG Register);
+VOID  ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Target configuration                                                */
 /* ------------------------------------------------------------------ */
@@ -62,7 +73,7 @@
 #define AHCI_DRIVER_NAME        "AHCINT"
 #endif
 
-#define AHCI_DRIVER_VERSION     0x01050000  /* 1.5.0.0 */
+#define AHCI_DRIVER_VERSION     0x01060000  /* 1.6.0.0 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -88,9 +99,18 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 /* Limits                                                              */
 /* ------------------------------------------------------------------ */
 
-#define MAX_SUPPORTED_PORTS             8           /* 1..32; also the initiator ID */
-#define AHCI_MAX_LUNS                   8           /* devices behind one port (port multiplier) */
-#define AHCI_MAX_CONTROLLERS            8
+#define MAX_SUPPORTED_PORTS             32          /* AHCI's own limit */
+#define AHCI_MAX_LUNS                   15          /* devices behind one port (port multiplier) */
+#define AHCI_MAX_CONTROLLERS            32
+
+/* SCSI addressing: eight ports per bus (PathId = port / 8, TargetId =
+   port % 8), as NT 3.1 and 9x take eight targets per bus; ports 0-7 keep
+   the addresses they had. The initiator ID is kept past the last target. */
+#define AHCI_TARGETS_PER_BUS            8
+#define AHCI_MAX_BUSES                  (MAX_SUPPORTED_PORTS / AHCI_TARGETS_PER_BUS)
+#define AHCI_PORT_OF(srb)               ((ULONG)(srb)->PathId * AHCI_TARGETS_PER_BUS + (srb)->TargetId)
+#define AHCI_PATH_OF_PORT(port)         ((UCHAR)((port) / AHCI_TARGETS_PER_BUS))
+#define AHCI_TARGET_OF_PORT(port)       ((UCHAR)((port) % AHCI_TARGETS_PER_BUS))
 #define AHCI_MAX_TRANSFER               0x20000     /* 128 KB */
 #define AHCI_SECTOR_SIZE                512         /* default logical sector */
 #define AHCI_MAX_SECTOR_SIZE            4096        /* largest logical sector taken */
@@ -123,7 +143,8 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 /* Generic host registers plus the port blocks the driver uses. Claimed
    and mapped as is: HBAs often sit only 4 KB apart, so a larger range
    would collide with the next controller's ABAR. */
-#define AHCI_ABAR_MAP_SIZE              (0x100 + 0x80 * MAX_SUPPORTED_PORTS)
+#define AHCI_ABAR_MAP_SIZE(ports)       (0x100 + 0x80 * ((ports) > 8 ? (ports) : 8))
+#define AHCI_ABAR_MAP_MIN               0x100       /* generic registers: CAP, PI */
 
 /* ------------------------------------------------------------------ */
 /* HBA registers                                                       */
@@ -557,8 +578,10 @@ typedef struct _AHCI_IOCTL_INFO {
     ULONG PortsImplemented;
     ULONG Flags;                        /* AHCI_INFO_xxx */
     ULONG SlotsPerPort;
-    UCHAR DeviceCount[MAX_SUPPORTED_PORTS];     /* per port; > 1 behind a PM */
+    UCHAR DeviceCount[8];               /* ports 0-7; > 1 behind a PM */
+    UCHAR DeviceCountHigh[MAX_SUPPORTED_PORTS - 8];     /* ports 8-31, when the buffer has room */
 } AHCI_IOCTL_INFO, *PAHCI_IOCTL_INFO;
+#define AHCI_IOCTL_INFO_SIZE_V1         FIELD_OFFSET(AHCI_IOCTL_INFO, DeviceCountHigh)
 
 /* "SCSIDISK": SMART, as IOCTL_SCSI_MINIPORT_SMART_xxx (NTDDSCSI.H) */
 #define AHCI_SMART_SIGNATURE            "SCSIDISK"
@@ -648,7 +671,7 @@ typedef struct _AHCI_GETVERSION {
 
 /* Device pool: entry n is the device directly on port n (or LUN 0 behind
    its PM); further PM devices take the entries after the ports. */
-#define AHCI_MAX_DEVICES                (MAX_SUPPORTED_PORTS + 8)
+#define AHCI_MAX_DEVICES                (MAX_SUPPORTED_PORTS + 16)
 
 /* One ATA/ATAPI device: directly on a port (LUN 0), or behind a port
    multiplier (LUN = n-th device found behind it). */
@@ -738,28 +761,44 @@ typedef struct _HW_DEVICE_EXTENSION {
     ULONG                   PciBus;
     ULONG                   PciSlot;
     ULONG                   HbaCapabilities;
-    ULONG                   PortsImplemented;
+    ULONG                   PortsImplemented;   /* PI without the ports turned off */
+    ULONG                   PortsOff;       /* OFF=: ports left alone */
+    USHORT                  PmPortsOff[MAX_SUPPORTED_PORTS];    /* OFF=p.m: devices behind a PM left alone */
     ULONG                   Slots;          /* command tables per port */
 
     BOOLEAN                 AsyncMode;      /* NCQ with interrupt completion */
     BOOLEAN                 NcqAllowed;     /* not disabled by NCQ=0 */
     BOOLEAN                 Stopped;        /* ScsiStopAdapter / POWER_DOWN */
+    BOOLEAN                 Unreachable;    /* registers read all ones (powered off, removed) */
     BOOLEAN                 TimerArmed;
     BOOLEAN                 DumpMode;       /* crash dump / hibernation */
     BOOLEAN                 CheckState;     /* verify the HBA before the next request */
     ULONG                   MissedInterrupts;
 
-    AHCI_PORT_INFO          Ports[MAX_SUPPORTED_PORTS];
-    AHCI_DEVICE             Devices[AHCI_MAX_DEVICES];
+    /* In the pool at the end: 32 ports, 48 devices and the TRIM pattern;
+       the crash dump / hibernation instance gets 8 and 8 and no pattern
+       (the dump stack has little memory for the device extension) */
+    PAHCI_PORT_INFO         Ports;
+    PAHCI_DEVICE            Devices;
+    ULONG                   MaxPorts;
+    ULONG                   MaxDevices;
 
     PUCHAR                  DmaArea;
     ULONG                   DmaLength;
     SCSI_PHYSICAL_ADDRESS   DmaAreaPhysical;
 
     BOOLEAN                 TrimAllowed;    /* TRIM=0 turns UNMAP off */
+    BOOLEAN                 Capacity16;     /* class driver follows up with READ CAPACITY(16) */
+    BOOLEAN                 StandbyAtShutdown; /* STANDBY=1: spin down on SRB_FUNCTION_SHUTDOWN */
     BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become TRIMs */
-    UCHAR                   TrimPattern[AHCI_TRIM_PATTERN_SIZE];
+    PUCHAR                  TrimPattern;    /* NULL in the dump instance */
+    ULONGLONG               Pool[1];
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
+
+#define AHCI_DUMP_PORTS                 8
+#define AHCI_EXTENSION_SIZE(ports, devices, trim) \
+    (FIELD_OFFSET(HW_DEVICE_EXTENSION, Pool) + (ports) * sizeof(AHCI_PORT_INFO) + \
+     (devices) * sizeof(AHCI_DEVICE) + (trim))
 
 /* One ATA/ATAPI command to put on the wire */
 #define AHCI_REQ_DATA_NONE      0
@@ -834,6 +873,12 @@ BOOLEAN AhciPowerDown(IN PHW_DEVICE_EXTENSION HwInit);
 
 /* ahcicmd.c */
 VOID    AhciStopPortEngines(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR PortBase);
+
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+/* hal.dll, every NT version; KIRQL and KAFFINITY as UCHAR and ULONG */
+ULONG HalGetInterruptVector(IN INTERFACE_TYPE InterfaceType, IN ULONG BusNumber, IN ULONG BusInterruptLevel,
+                            IN ULONG BusInterruptVector, OUT PUCHAR Irql, OUT PULONG Affinity);
+#endif
 BOOLEAN AhciRestartPort(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN BOOLEAN ForceComReset);
 ULONG   AhciRunCommand(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN PSCSI_REQUEST_BLOCK Srb, IN PATA_REQUEST Req);
 ULONG   AhciRunSimple(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun,

@@ -1,5 +1,72 @@
 AHCINT - test results for this release (QEMU 8.2, ich9-ahci)
 
+Additions to 1.6.0.0 (2026-10-26): 32 ports, OFF=, MPS interrupt check,
+disks of 2 TB and more. QEMU's ich9-ahci was patched for these tests to
+offer up to 32 ports (AHCI_PORTS) with a register range large enough for
+them.
+
+- ATAPI device type (reported: a ZIP 100 IDE drive came up as a
+  CD-ROM). QEMU has no ATAPI disk, so its ide-cd was patched for the
+  test to report peripheral device type 0 (removable direct access) in
+  IDENTIFY PACKET DEVICE, with an image whose 2048-byte blocks carry
+  their LBA. atptest (SCSI pass-through on the PhysicalDrive):
+  INQUIRY type 0 / RMB 1, READ CAPACITY 32767 x 2048, MODE SENSE(6)
+  page 01h with a 4-byte header (length 0Bh, page follows), header
+  only (4 bytes) with the full length, READ(10) and READ(6) of LBA 3
+  equal, drive geometry RemovableMedia, removable drive letter:
+  NT 3.1 and NT 4.0 (AHCINT on an AHCI port, IDENT in the same NT 3.1
+  run), Windows 2000 (both), Windows 95 (IDENT9X and AHCINT9X:
+  removable drive letters). All passed.
+  CD/DVD drives (device type 5) unchanged: still CD-ROM drives with
+  their files listed on Windows 2000. Not tested: writes to a
+  removable ATAPI disk (QEMU's ATAPI device has no write command) and
+  a real ZIP drive.
+- Version number: this release is 1.6.0.0. The runs below were
+  made with the sources numbered 1.5.1.0, before the ATAPI change
+  above; renumbering alone changed only the version resource and the
+  version in the driver's info IOCTL (compared by disassembly). The
+  final build ran the ATAPI tests above, with CD/DVD drives, 32 ports
+  and the 3 TB disk on Windows 2000.
+- GitHub issue #2 (0x7B on NT 3.51 with halmps.dll): reproduced on NT 4.0
+  SP6 with halmps.dll and the ich9-ahci behind a PCI-PCI bridge (SeaBIOS
+  writes MP table entries only for bus 0). halmps.dll returned no vector
+  for the line, ScsiPort failed the adapter and the boot stopped with
+  0x7B. With this build the driver finds no vector, reports no interrupt
+  and boots with Fast Polling.
+- 32 ports: disks on ports above 7 (for example port 9 = SCSI bus 1
+  target 1, port 20 = bus 2 target 4, port 31 = bus 3 target 7) found on
+  NT 3.1, NT 3.51, NT 4.0, Windows 2000, Windows 95 and XP x64 (GUI-mode
+  setup); ports 0-7 keep their old addresses.
+- OFF=: ports turned off on NT 4.0 and Windows 2000 (no disk, no COMRESET;
+  the other ports unchanged).
+- Disks of 2 TB and more (3 TB image): NT 3.1, 3.51, 4.0 and Windows 2000
+  see 2 TB minus one sector (2097149 MB in the listing) instead of 0 bytes;
+  XP x64 (release build, GUI-mode setup) sees the full 3 TB (3145727 MB).
+- Hibernation on Windows 2000 with the pool-based device extension (dump
+  instance 3.4 KB): written and resumed.
+- Release build (bin\ as shipped) on XP x64 with all four drivers, 32
+  ports and the 3 TB disk on port 20: every disk listed, shutdown powered
+  off after 10 s.
+- Device Manager page (ahcipp.dll, Ports tab), Windows 2000, x86 build
+  registered on the installed system: the tab lists the 32 ports with
+  the disks on ports 0, 1, 9 and 20, and "(turned off)" for a port
+  turned off at boot. Clearing port 1 and checking port 9 again (keys
+  only) changed the box to OFF=0.3.0:1,0.3.0:20; OK wrote it and Device
+  Manager asked for a restart (system disk on this controller). After
+  the restart port 1's disk was gone and port 9's back. Through the test
+  entry (PortPageTest) the same for ports 9 and 20, and clearing all
+  items deleted the value.
+- XP x64 GUI-mode setup: ahcint.inf (F6 copy) and the x64 DLL in
+  OemDir; setup installed the DLL into System32 and the page listed the
+  ports.
+- The page DLLs were built with MinGW-w64 (tools\mkpp.sh); the x86 and
+  x64 builds import only functions Windows 2000 exports (checked against
+  its DLLs). Text-mode setup rejected a first build listed in
+  txtsetup.oem ("not a valid Windows system image"): its PE checksum was
+  stale after the header was edited. mkpp.sh now writes the checksum.
+  Not tested: the F6 path on Windows 2000 (only XP x64), Have Disk with
+  the main INF (the F6 copies differ only in their source paths).
+
 bin\NT\ahcint.sys was built from these sources with i686 MinGW (GCC 13)
 against import libraries generated from NT 3.1's own SCSIPORT.SYS and
 NTOSKRNL.EXE exports; it imports nothing NT 3.1 lacks. src\NT\build.bat
@@ -290,3 +357,43 @@ Test environment note
   with multi(), and never while the QEMU monitor was active. It was not
   seen on the previous day's host and is treated as an emulator timing
   artifact; worth one check on VirtualBox or real hardware.
+
+Shutdown on Windows XP x64 (1.6.0.0)
+Looking into a hang at shutdown reported on XP x64 with AHCINT 1.5.0.0
+(XP x86 and 2000 not affected on the same machine, as reported). Not
+reproduced in QEMU in any of these runs, so the changes in this release
+(the one x64-only difference found in the code, and no standby at
+shutdown, which 1.4.0.0 did not send either) are not a confirmed fix.
+- XP x64 SP1, F6 installation with all four drivers on one floppy
+  (system disk on AHCI through AHCINT, an NVMe disk through NVMENT, an
+  SD card on a PCI SDHCI through MMCSDNT, PIIX3 disk and CD through
+  IDENT), GUI-mode setup at Regional Options, debug builds: shutdown
+  from the setup command prompt through NtShutdownSystem (power off) and
+  restart: powered off after 5-10 s, restart back at the driver load
+  after 15 s. Repeated with 4 CPUs, with 2 GB of the 3 GB RAM above
+  4 GB, with a SATA DVD on an AHCI port, with a PCI power management
+  capability added to QEMU's AHCI (which has none; Windows did not take
+  the HBA to D3 at shutdown), and with a QEMU patch that delays every
+  NCQ command after STANDBY IMMEDIATE by 8 s (a disk spinning up): no
+  hang. A traced build showed the order on XP x64: the last writes and
+  SYNCHRONIZE CACHE / FLUSH, then SRB_FUNCTION_SHUTDOWN (flush, standby),
+  and no request after it.
+- Windows 2000 SP4, system on AHCI (AHCINT), NVMe data disk (NVMENT),
+  PIIX3 disk (IDENT): a file copy and a registry change, then shutdown
+  through ExitWindowsEx: powered off, also with the spin-up delay.
+- The x64 builds of AHCINT and NVMENT used srb.h's inline register
+  accesses (plain volatile, no compiler barrier) where the x86 builds
+  call ScsiPort's functions; they now import ScsiPortReadRegisterUlong
+  and ScsiPortWriteRegisterUlong as well (MMCSDNT and IDENT already
+  did). The release builds of this version ran the XP x64 shutdown runs
+  above again (also with RAM above 4 GB): powered off after 5 s.
+- NT 4.0 booted from AHCI with the 1.6.0.0 release build: logon screen
+  reached, as before.
+- Standby at shutdown off by default (as reported, 1.4.0.0 shut XP x64
+  down on the same machine; STANDBY IMMEDIATE on SRB_FUNCTION_SHUTDOWN
+  was new in 1.5.0.0): XP x64 run above with the debug build, no
+  DriverParameters: powered off after 10 s, the log shows no AHCINT
+  standby line after the flush. With DriverParameters STANDBY=1: "Port
+  0.0: standby for shutdown", powered off after 10 s.
+- The new check for registers reading all ones (a powered-off or removed
+  controller) was not triggered in any of these runs.

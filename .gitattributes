@@ -28,6 +28,10 @@ SOURCES    text eol=crlf
 *.def      text eol=crlf
 *.rc       text eol=crlf
 
+# Shell scripts (tools\mkpp.sh, MinGW-w64 cross build): LF, sh does not
+# accept CRLF
+*.sh       text eol=lf
+
 # Install files (bin\)
 *.inf      text eol=crlf
 *.INF      text eol=crlf

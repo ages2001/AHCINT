@@ -53,6 +53,7 @@ id = "PCI\CC_010601", "AHCINT"
 
 driver = d1, AHCINT.sys, AHCINT
 inf    = d1, AHCINT.inf
+dll    = d1, ahcipp.dll
 
 
 [Config.scsi.AHCINT]
