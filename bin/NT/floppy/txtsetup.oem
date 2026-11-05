@@ -1,0 +1,19 @@
+[Disks]
+d1 = "AHCINT SATA AHCI Driver Disk", \disk1, \
+
+[Defaults]
+scsi = AHCINT
+
+[scsi]
+AHCINT = "AHCINT SATA AHCI Storage Controller (ages2001)"
+
+[Files.scsi.AHCINT]
+driver = d1, AHCINT.SYS, AHCINT
+inf    = d1, oemsetup.inf
+
+[Config.scsi.AHCINT]
+value = "", Group, REG_SZ, "SCSI Miniport"
+value = "", Start, REG_DWORD, 0
+value = "", Type, REG_DWORD, 1
+value = "", ErrorControl, REG_DWORD, 1
+value = "", Tag, REG_DWORD, 33
