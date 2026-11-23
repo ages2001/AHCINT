@@ -1,5 +1,305 @@
 AHCINT - test results for this release (QEMU 8.2, ich9-ahci)
 
+AHCINT 1.8 (2026-11-09)
+===========================
+
+Regression with the four release drivers of this round (2026-11-23)
+
+- The QEMU changes these tests use (test hooks, the ICH5, Intel VMD and
+  RST remapping models) are in tests/qemu/qemu-8.2.2-tests.patch
+  (against the QEMU 8.2.2 source).
+- NT 4.0 SP1: AHCINT (system disk and a data disk on ich9-ahci), IDENT
+  (PIIX3 secondary), NVMENT, MMCSDNT (sdhci-pci) in one boot: four data
+  volumes, each TAG.TXT read.
+- NT 3.51 (MPS HAL, 2 CPUs, system disk on the ICH5 PATA model through
+  IDENT, no PIIX IDE): the same four data disks, each TAG.TXT read.
+- NT 3.1 with all four controllers: booted through IDENT to the logon
+  screen (QEMU's Ctrl+Alt+Del did not reach the NT 3.1 logon, so the
+  volumes were not listed).
+- Windows 95: odd95 (24 MB read at +1 and +3, written from +1) on AHCI,
+  NVMe and SD: every byte equal.
+- Windows 2000 SP4 and XP x64: see the Windows 7 section.
+
+
+Windows 7 and Vista, second round (2026-11-23)
+
+- Windows 7 SP1 x86 on a persistent overlay of the same image, the
+  release drivers of this round, data disks as before. Note: in the
+  first round the AHCI and SD disks had been read through msahci and
+  sdbus; pnputil installs no driver over Windows' own signed one, so
+  this round forces each driver with instdrv (SetupAPI, the INF of
+  bin\2KXP).
+- AHCINT as the boot controller: installed on the ich9-ahci (ICH8M
+  2829) with the system disk on the PIIX3, shut down, the system disk
+  moved to that controller's port 0: Windows 7 booted through AHCINT
+  (devst: AHCINT 0180400A), all volumes present; hibernated (S4) and
+  resumed (hibt: "resumed"), volumes read again; then a bug check
+  (crashme.sys): after the restart C:\Windows\MEMORY.DMP (124 MB) and
+  a minidump were there.
+- NVMENT as the boot controller: the system disk moved to the NVMe
+  controller: booted through NVMENT, hibernated and resumed, crash dump
+  written (MEMORY.DMP and a second minidump).
+- IDENT as the boot controller (PIIX3), IDENT also on the ICH5, MMCSDNT
+  on the SDHCI, with AHCINT and NVMENT: one boot with all four drivers,
+  TAG.TXT read on every data disk before and after hibernation; crash
+  dump written through IDENT.
+- Windows Vista SP2 x86 (Microsoft's IE7 test virtual machine, archive.org
+  zip MD5 085353d4ff3f8eb1b6026ff6d74a05d0 as published), QEMU 8.2 TCG:
+  AHCINT, MMCSDNT and IDENT (ICH5) installed with instdrv; IDENT on the
+  PIIX3 asked for a restart and Windows Vista then booted through IDENT;
+  hibernated and resumed, two crash dumps written through IDENT. Vista's
+  pnputil installs nothing on a device without a class (NVMe, VMD);
+  instdrv with the INF's class set on the device first did: NVMENT on
+  the NVMe controller and on the Intel VMD. One boot: TAG.TXT read on
+  the SD, AHCI, IDE, NVMe and VMD disks.
+- Windows 10 x64 (1803, build 17134, MSEdge test VM, UEFI with OVMF):
+  booted to the desktop under TCG; the driver test was not finished in
+  this round.
+
+
+Windows 7 (2026-11-23)
+
+- Windows 7 SP1 Enterprise x86 (Microsoft's IE11 test virtual machine,
+  vmdk from archive.org, MD5 48f7ab9070c7703cf50634479b8ead38 as
+  published), QEMU 8.2 TCG, system disk on the PIIX3 IDE. Data disks of
+  64 MB with a FAT16 volume and a TAG file each, every one with its own
+  MBR disk signature (Windows 7 keeps disks with equal signatures
+  offline).
+- AHCINT on a second ich9-ahci shown as ICH8M (8086:2829), installed
+  over msahci with instdrv (SetupAPI, the INF of bin\2KXP) from an
+  administrator prompt: device started, its disk online in diskpart, its
+  volume got a letter, TAG.TXT read. Together with IDENT, NVMENT and
+  MMCSDNT on their controllers in the same boot.
+- Windows 2000 SP4 and XP x64 (amd64 build with the test signature) with
+  all four drivers and their disks in one boot: every volume present,
+  every TAG.TXT read.
+
+
+Odd data buffers on Windows 9x (AHCINT GitHub issue #4; 2026-11-22)
+
+- QEMU 8.2 patched with a strict AHCI mode (QEMU_AHCI_STRICT): every PRD
+  entry with DBA bit 0 set or an odd byte count is logged and the
+  command fails, as on hardware that does not round.
+- Windows 95 (w95hp image, Startup batch): odd95.exe reads a 24 MB file
+  into a buffer at +1 and at +3 bytes and writes one from +1, through
+  AHCINT9X on port 1, and compares with the expected data. Driver before
+  this release: 46 strict violations, CORRUPT. This release: 0
+  violations, every byte equal ("0/25165824 bad", OK) for the three
+  runs.
+- The same with the controller in RAID mode (class 01-04,
+  QEMU_AHCI_IDS=8086:2829:010400): OK, 0 violations.
+
+RAID mode and Intel RST (2026-11-22)
+
+- QEMU: a second ich9-ahci with ID 8086:2822 and class 01-04
+  (QEMU_AHCI_IDS2). Port 0: a disk with Intel IMSM metadata (one volume)
+  in the second-to-last sector and a FAT16 volume; port 1: a plain disk
+  with PLAIN.TXT.
+- NT 4.0 SP1 (nt4all, AHCINT as atapi.sys, system disk on the first
+  ich9-ahci): debug log "8086:2822 in RAID mode", "Port 0: Intel RST
+  metadata, disk of 1 RAID volume(s): not shown"; D: is the plain disk
+  (PLAIN.TXT), the member has no letter although its FAT volume is
+  intact.
+- Before the fix of this release NT 4.0 never called the driver for the
+  second controller (ScsiPort calls once per PCI bus); now both are
+  found.
+- Windows 2000 SP4: ahcint.inf installed on the RAID function with
+  instdrv (it matched PCI\VEN_8086&DEV_2822&CC_0104; the hardware IDs
+  Windows 2000 generates include VEN&DEV&CC_ccss and VEN&DEV&CC_ccsspp,
+  read from its SYSTEM hive). D: plain disk after the reboot Windows
+  asked for; installed on a fresh RAID function (8086:282A) without a
+  reboot, D: within 30 s.
+- XP x64: the same with the amd64 driver: installed, D: is the plain
+  disk with PLAIN.TXT after the restart, the IMSM member hidden.
+
+Intel VMD (2026-11-23)
+
+- QEMU 8.2 with an Intel VMD model written for this test
+  (hw/pci-host/intel_vmd.c: 8086:9A0B, class 01-04, CFGBAR 32 MB for
+  buses 224-255, MEMBAR1 32 MB, MEMBAR2 1 MB, VMCAP/VMCONFIG with the
+  bus restriction, no INTx; its domain is reached only through the BARs,
+  so SeaBIOS leaves it unprogrammed). An ich9-ahci on the domain's root
+  bus at 17.0 (as the SATA controller sits on real hardware) with a
+  disk, and an NVMe controller behind a root port (pci-bridge) at 1D.0.
+- NT 4.0 SP1, AHCINT and NVMENT: D: on the SATA controller behind the
+  VMD (TWO.TXT), E: on the NVMe controller behind it (PLAIN.TXT). The
+  first driver to start laid the domain out (buses, bridge windows,
+  BARs), the second kept it.
+
+
+TRIM mode and trimnt (IDENT GitHub issue #2; 2026-11-09)
+
+- QEMU 8.2, disks with discard=unmap on raw image files that were filled
+  with random data before partitioning, so that every block of the image
+  was allocated; one FAT16 partition each. Space given back by the
+  emulated disk shows as a smaller allocation of the image file (du).
+- Windows 2000 (w2k-hib, the four 1.3/1.8/3.3 release drivers): 200 MB
+  disks on AHCI port 1 (AHCINT), the PIIX3 primary master (IDENT) and
+  NVMe (NVMENT), a 256 MB SD card on sdhci-pci (MMCSDNT). trimnt D: to
+  G: found each disk's adapter and address through
+  IOCTL_SCSI_GET_ADDRESS ("D:\ is on Scsi0: path 0 target 1 lun 0",
+  ...), switched TRIM mode on on that adapter only, filled 199 MB (SD:
+  255 MB), "volume full", "trimmed 199 MB" (SD: 255 MB) from
+  TRIM_STATUS. Image files: AHCI 204804 KB -> 3420 KB, IDE 204804 KB
+  -> 8216 KB, NVMe 204800 KB -> 7416 KB. The SD image stayed allocated:
+  QEMU 8.2's SD card model takes ERASE but neither changes nor discards
+  the blocks. fsck.fat -n afterwards: no errors, no files left on any.
+- Fragmented free space: a 32 MB FAT16 volume with 512-byte clusters,
+  10000 files of three sectors, every second one deleted (5000 holes of
+  1.5 KB, plus 17 MB in one piece), on the PIIX3 secondary master
+  (IDENT, Windows 2000): "24 MB free, cluster 512 bytes", "filled 24
+  MB", "trimmed 24 MB": every piece, also those of 1.5 KB starting in
+  the middle of a 4 KB block of the 1 MB buffer, was taken for the
+  pattern. (The host gives back whole 4 KB pages only, so the image
+  shrank from 32768 KB to 14728 KB.)
+- The same disk with discard_granularity=0 (no TRIM in IDENTIFY word
+  169): "the disk takes no TRIM through IDENT (no TRIM support, TRIM=0,
+  or IDENT in PIO mode): nothing to do", nothing written.
+- Windows NT 4.0 SP1, IDENT as atapi.sys, the system disk itself as in
+  the issue (FAT16 C:, 8 KB clusters, 277 MB free, its free space filled
+  with random data on the host first): trimnt c from the Run box,
+  output into a file: "C:\ is on Scsi0: path 0 target 0 lun 0", "Scsi0:
+  IDENT TRIM mode on", "volume full", "filled 277 MB in 1 file(s)",
+  "trimmed 277 MB", "TRIM mode off, files deleted"; image 305004 KB ->
+  100252 KB; the system booted and ran normally afterwards.
+- Windows NT 4.0 SP1 (system disk on AHCI port 0 with AHCINT as
+  atapi.sys, MMCSDNT and NVMENT as further miniport services): 160 MB
+  FAT16 disks on AHCI port 1 and NVMe, a 256 MB SD card: trimnt D:, E:,
+  F: each found its own adapter (Scsi0 AHCINT target 1, Scsi1 MMCSDNT,
+  Scsi2 NVMENT), "volume full", "trimmed 159 MB" / "255 MB" / "159 MB";
+  image files AHCI 163844 KB -> 2940 KB, NVMe 163840 KB -> 6128 KB.
+- Windows XP x64 SP1 (system disk on IDENT, PIIX3 primary master; the
+  release drivers of this version): 200 MB FAT16 disks on the PIIX3
+  secondary master (IDENT), AHCI port 0 (AHCINT) and NVMe namespace 1
+  (NVMENT), a 128 MB SD card (MMCSDNT); trimnt.exe (32-bit, under
+  WOW64): each found its adapter, "volume full", trimmed 199 / 199 /
+  199 / 127 MB; image files 204800 KB -> 2624 KB (IDE), 2624 KB (AHCI),
+  7416 KB (NVMe).
+- Windows 2000, the final builds, two runs (Windows gave the FAT disk
+  of the PIIX3 secondary master no letter in the first, the one on AHCI
+  port 1 none in the second): AHCI port 1, the PIIX3 secondary master,
+  NVMe namespace 1 and the SD card each "volume full" and trimmed in
+  full (AHCI and IDE 204800 KB -> 3420 KB, NVMe -> 7416 KB).
+
+512 KB per request on NT 3.1-4.0 (2026-11-09)
+
+- NT 4.0 SP1, a 256 MB disk on AHCI port 1, 136-entry command tables
+  within the 160 KB arena (QEMU's ICH9 implements six
+  ports: 10 NCQ tags per port): bench.exe BENCH OK
+  (also the 1 MB passes at queue depth 1 and 4, one request each).
+  NT 3.51 SP5: bench.exe on AHCI port 1 BENCH OK.
+
+Windows NT 4.0 SP1, the four drivers of this release (2026-11-09)
+
+- System disk on AHCI port 0 with AHCINT copied over atapi.sys, MMCSDNT
+  and NVMENT as two further miniport services (Start 0), 64 MB RAM;
+  started from the Run box, results read from the image afterwards.
+- bench.exe (write stamped data, read back and compare, 64 MB area) at
+  the same time on a 256 MB disk on AHCI port 1 (AHCINT, now 512 KB per
+  request with 136-entry command tables on NT 4.0) and a 256 MB NVMe
+  namespace (NVMENT, four I/O queue pairs): BENCH OK, 0 errors, 0 bad on
+  both. QUERY_INFO afterwards: "queues 4 x 64 entries, deepest 32".
+- bench.exe on a 256 MB SD card (MMCSDNT, 512 KB per request, ADMA2
+  with 160 descriptors): BENCH OK, 0 errors, 0 bad.
+- trimnt on FAT16 volumes of all three (see TRIM mode above).
+
+Regression of AHCINT 1.8, IDENT 1.3, MMCSDNT 1.3 and NVMENT
+3.3 together (2026-11-09)
+
+- bench.exe on raw 256 MB disks (write stamped data, read back and
+  compare; sequential and random, queue depths 1-32), while trimnt
+  filled 200 MB FAT16 disks of each driver (see TRIM above), QEMU 8.2.
+- Windows XP x64 SP1: IDENT system disk (PIIX3 primary master), bench
+  at the same time on the PIIX3 secondary slave (IDENT), AHCI port 1
+  (AHCINT) and NVMe namespace 2 (NVMENT, four I/O queue pairs, deepest
+  queue 32): BENCH OK on all three. cdichk64.exe and cdichk.exe (WOW64),
+  the CrystalDiskInfo paths through \\.\PhysicalDriveN: ATA_PASS_THROUGH
+  IDENTIFY / SMART RETURN STATUS / SMART READ DATA / READ LOG EXT /
+  CHECK POWER MODE, DFP IDENTIFY / READ DATA / THRESHOLDS / ENABLE and
+  IDE_PASS_THROUGH OK on the three IDENT disks and the AHCINT disk, the
+  NVMe namespaces as "NVMe QEMU NVMe Ctrl" with NvmeMini IDENTIFY and the
+  health log OK; the SD card has none (expected). IDENT GET_INFO: 3
+  interrupts that came into a running routine of the driver during the
+  run (see IDENT 1.3), handled; no errors.
+- Windows 2000 SP4 (system disk on AHCINT): bench at the same time on
+  AHCI port 2 (AHCINT), the PIIX3 primary master (IDENT) and NVMe
+  namespace 2 (NVMENT): BENCH OK on all three; cdichk.exe OK as on
+  XP x64.
+- Windows NT 4.0 SP1: see "Windows NT 4.0 SP1, the four drivers of this
+  release" (AHCINT, MMCSDNT, NVMENT) and the IDENT throughput runs.
+- Windows NT 3.51 SP5 (-icount shift=auto,sleep=off, which the stock
+  NT 3.x kernels need in this emulator): system disk on AHCI port 0
+  with AHCINT as atapi.sys, IDENT, NVMENT and MMCSDNT as three further
+  miniport services. trimnt D: (200 MB FAT16 on the PIIX3 secondary
+  master, IDENT with queued requests): "volume full", "trimmed 199 MB",
+  image 204800 KB -> 3420 KB. bench.exe one after the other on AHCI
+  port 1 (AHCINT), the PIIX3 primary master (IDENT), the NVMe namespace
+  (NVMENT, 4 queues x 64, deepest 12) and the SD card (MMCSDNT): BENCH
+  OK on all four.
+  The first boot of that setup with IDENT 1.2's logic turned the
+  "atapi" service (AHCINT) off and the next boot stopped with 0x7B; with
+  NotInboxDriver (see IDENT 1.3) it is left alone. NT 4.0 SP1 with
+  the same set (AHCINT as atapi, IDENT added): after two boots "atapi"
+  still Start 0 with NotInboxDriver 1, IDENT saved only atdisk.
+- Windows NT 3.1 (stock kernel, -icount): system disk on the PIIX3
+  primary master through IDENT (queued requests and 512 KB per request
+  now on NT 3.1 too; atdisk off, scsidisk a boot driver), a 256 MB disk
+  on the secondary master: boots to the logon screen. The keyboard did
+  not answer in this setup, so nothing was run after the logon screen.
+- Windows 95 (system disk on the PIIX3 IDE, the ICH9 AHCI shown as
+  ICH8M with prog-if 0, a 64 MB FAT disk on AHCI port 1, AHCINT9X of
+  this version): copy to D: and FC /B of WIN.COM and REGEDIT.EXE: no
+  differences. IDENT9X, MMCSD9X and NVMENT9X were not run in this
+  round.
+
+Short round on every system, release builds (2026-11-09)
+
+- The binaries of bin\ (AHCINT 1.8, IDENT 1.3, NVMENT 3.3,
+  MMCSDNT 1.3), QEMU 8.2. TRIM disks: random-filled raw images with
+  one FAT partition (discard=unmap); bench disks: 256 MB raw images
+  (write, verify, sequential and random reads at queue depth 1 to 32,
+  random writes, queued verify).
+- Windows 2000 (system disk on AHCI): trimnt on AHCI (FAT32), IDE, NVMe
+  and SD: "volume full", trimmed 196 / 199 / 199 / 127 MB; images
+  204800 KB -> 6460 / 3420 / 7416 KB (the SD image stays allocated, as
+  before). bench on AHCI, IDE and NVMe: BENCH OK. cdichk: all SMART paths
+  OK on the ATA disks, NvmeMini identify and health log on both NVMe
+  namespaces. NVMENT: 4 queues x 64 entries, deepest 16.
+- XP x64 (system disk on IDE through IDENT): the same; trimmed 199 (IDE)
+  / 196 (AHCI, FAT32) / 127 (SD) / 199 (NVMe) MB, BENCH OK on AHCI, IDE
+  and NVMe, cdichk64 and cdichk (WOW64) alike, IDENT nested 0.
+- Windows NT 4.0 SP1 (AHCINT as atapi.sys on the system disk, IDENT as
+  Ultra14f, NVMENT as Ultra24f, MMCSDNT as Ultra124): trimnt on AHCI,
+  IDE and NVMe trimmed 159 MB each (images 163840 KB -> 2940 / 2940 /
+  6128 KB); bench OK on AHCI, IDE, NVMe and SD.
+- Windows NT 3.51 (same mapping, -icount): trimnt on AHCI, IDE and NVMe
+  trimmed 159 MB each; bench OK on AHCI, IDE, NVMe and SD.
+- Windows NT 3.1 (IDENT as Aha154x on the system disk, AHCINT as
+  Ultra124, MMCSDNT as Ultra14f, NVMENT as Ultra24f; no -icount: with
+  it NT 3.1 ignores the keyboard at the logon box, without it the logon
+  works): trimnt stopped at once with "write error 123": its file names
+  (TRIM00000.TMP) were not 8.3, and FAT on NT 3.1 has no long names.
+  With TRIM0000.TMP .. TRIMFFFF.TMP: trimmed 159 MB on IDE, AHCI and
+  NVMe. bench OK on SD and NVMe; on IDE and AHCI the 1 MB reads at queue
+  depth 4 had requests that ReadFile refused at once with error 8
+  (ERROR_NOT_ENOUGH_MEMORY, before the driver saw them; no wrong data).
+  IDENT 1.2 with AHCINT 1.7 gave the same, more often (64 MB
+  guest). The first boot with AHCINT loading before IDENT stopped with
+  0x7B: on NT 3.x the first adapter that loads holds Harddisk0, which
+  multi(0)disk(0)rdisk(0) names, so the driver of the system disk has to
+  load first (lowest Tag in its group).
+- Windows 95 RTM (system disk on the PIIX3): MMCSD9X and NVMENT9X
+  installed through New Hardware Found (Have Disk), IDENT9X on the PCI
+  IDE controller (Device Manager, Change Driver, Have Disk; the system
+  disk and a data disk on the secondary channel then run through it,
+  Performance: "configured for optimal performance"). fio95 (a 40 MB
+  file written in 64 KB pieces, read back and compared, 2000 random 4 KB
+  rewrites, compared again; tools of the test bench) on a 64 MB FAT16
+  data disk of each: AHCINT9X, IDENT9X, MMCSD9X, NVMENT9X FIO OK, no
+  errors, no bad data (write 10.9 / 13.8 / 2.5 / 9.1 MB/s, 500 / 908 /
+  352 / 456 random writes per second). Copy and FC /B of WIN.COM and
+  REGEDIT.EXE as well: no differences.
+
 Hibernation on Windows 2000 and XP x64 (2026-11-03)
 
 - Display: S4 needs a driver on the display adapter. Windows 2000 with
@@ -36,7 +336,7 @@ Hibernation on Windows 2000 and XP x64 (2026-11-03)
   resumepassword, XP x64) the same program powered off at once after a
   resume. Windows behaviour, not the drivers'.
 
-SMART through the disk on XP x64 (added to 1.7.0.0, 2026-11-03)
+SMART through the disk on XP x64 (added to 1.7, 2026-11-03)
 
 - SMART through \\.\PhysicalDriveN (disk.sys) on XP x64: the request
   goes to the disk's PDO as IOCTL_SCSI_MINIPORT, which XP x64's ScsiPort
@@ -67,7 +367,7 @@ SMART through the disk on XP x64 (added to 1.7.0.0, 2026-11-03)
   (the 2000 ScsiPort passed these on before as well); bench, DRIVER.CAB
   and FC, SMART, hot plug and card change as before.
 
-Link power management and DevSleep by default (added to 1.7.0.0,
+Link power management and DevSleep by default (added to 1.7,
 2026-11-02)
 
 QEMU's AHCI has neither; it was patched for these runs
@@ -102,7 +402,7 @@ not change the link state itself (PxSSTS.IPM stays active).
   IPM 8 as linked).
 
 Interrupt completion, Windows 95 Init Failure, 512 KB transfers, link
-power, SMART, dump instance (added to 1.7.0.0, 2026-11-02)
+power, SMART, dump instance (added to 1.7, 2026-11-02)
 
 Every command now completes by interrupt where the system has one:
 queued (NCQ) and non-queued reads and writes (NCQ=0, or a disk without
@@ -185,7 +485,7 @@ crash dump / hibernation instance and the short commands at start-up.
   see "Link power management and DevSleep by default" above.
 - SPINDOWN=n (IDLE with a standby timer at start-up): not tested.
 
-Hot plug (added to 1.7.0.0, 2026-11-02; on by default on NT, HOTPLUG=0)
+Hot plug (added to 1.7, 2026-11-02; on by default on NT, HOTPLUG=0)
 
 QEMU 8.2.2 patched for these runs: while a file named after a drive's
 serial number exists, that drive reads as pulled (AHCI: PxSSTS DET 0,
@@ -226,7 +526,7 @@ test program writes, reads and verifies the raw disk (queue depths 1 to
 - The NCQ watchdog and the hot-plug check share one timer; a request
   while one is pending is not passed on. All runs above used that.
 
-Additions to 1.7.0.0 (2026-11-02): 4K=1, port program, GET_LOCATION
+Additions to 1.7 (2026-11-02): 4K=1, port program, GET_LOCATION
 
 - 4K=1 (Windows 2000, image on ICH9 AHCI port 1): a sparse 3 TB image; the disk shows
   4096 bytes per sector and 3145727 MB. A test program wrote 64 KB
@@ -247,7 +547,7 @@ Additions to 1.7.0.0 (2026-11-02): 4K=1, port program, GET_LOCATION
   link without libgcc (no 64-bit division helpers, whose calling
   convention differs under -mrtd).
 
-Additions to 1.6.0.0 (2026-10-26): 32 ports, OFF=, MPS interrupt check,
+Additions to 1.6 (2026-10-26): 32 ports, OFF=, MPS interrupt check,
 disks of 2 TB and more. QEMU's ich9-ahci was patched for these tests to
 offer up to 32 ports (AHCI_PORTS) with a register range large enough for
 them.
@@ -268,7 +568,7 @@ them.
   their files listed on Windows 2000. Not tested: writes to a
   removable ATAPI disk (QEMU's ATAPI device has no write command) and
   a real ZIP drive.
-- Version number: this release is 1.6.0.0. The runs below were
+- Version number: this release is 1.6. The runs below were
   made with the sources numbered 1.5.1.0, before the ATAPI change
   above; renumbering alone changed only the version resource and the
   version in the driver's info IOCTL (compared by disassembly). The
@@ -358,7 +658,7 @@ TRIM, VPD, LOG SENSE, shutdown standby, version resource
   its blocks keep their data after UNMAP (QEMU ignores the TRIM).
 - System shutdown: "Port 0.0: standby for shutdown" (SRB_FUNCTION_SHUTDOWN
   reaches the driver since it declares CachesData).
-- File properties of every binary show version 1.5.0.0
+- File properties of every binary show version 1.5
   (OriginalFilename ahcint.sys / ahcint9x.mpd).
 - trimnt on a 256 MB FAT volume on the AHCI disk (discard=unmap, the
   image with 55 MB of stale blocks): "Scsi2: AHCINT TRIM mode on", the
@@ -605,12 +905,12 @@ Test environment note
   seen on the previous day's host and is treated as an emulator timing
   artifact; worth one check on VirtualBox or real hardware.
 
-Shutdown on Windows XP x64 (1.6.0.0)
-Looking into a hang at shutdown reported on XP x64 with AHCINT 1.5.0.0
+Shutdown on Windows XP x64 (1.6)
+Looking into a hang at shutdown reported on XP x64 with AHCINT 1.5
 (XP x86 and 2000 not affected on the same machine, as reported). Not
 reproduced in QEMU in any of these runs, so the changes in this release
 (the one x64-only difference found in the code, and no standby at
-shutdown, which 1.4.0.0 did not send either) are not a confirmed fix.
+shutdown, which 1.4 did not send either) are not a confirmed fix.
 - XP x64 SP1, F6 installation with all four drivers on one floppy
   (system disk on AHCI through AHCINT, an NVMe disk through NVMENT, an
   SD card on a PCI SDHCI through MMCSDNT, PIIX3 disk and CD through
@@ -634,11 +934,11 @@ shutdown, which 1.4.0.0 did not send either) are not a confirmed fix.
   and ScsiPortWriteRegisterUlong as well (MMCSDNT and IDENT already
   did). The release builds of this version ran the XP x64 shutdown runs
   above again (also with RAM above 4 GB): powered off after 5 s.
-- NT 4.0 booted from AHCI with the 1.6.0.0 release build: logon screen
+- NT 4.0 booted from AHCI with the 1.6 release build: logon screen
   reached, as before.
-- Standby at shutdown off by default (as reported, 1.4.0.0 shut XP x64
+- Standby at shutdown off by default (as reported, 1.4 shut XP x64
   down on the same machine; STANDBY IMMEDIATE on SRB_FUNCTION_SHUTDOWN
-  was new in 1.5.0.0): XP x64 run above with the debug build, no
+  was new in 1.5): XP x64 run above with the debug build, no
   DriverParameters: powered off after 10 s, the log shows no AHCINT
   standby line after the flush. With DriverParameters STANDBY=1: "Port
   0.0: standby for shutdown", powered off after 10 s.

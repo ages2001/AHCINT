@@ -1,3 +1,4 @@
+#define VMD_CORE_IMPLEMENTATION                 /* vmdcore.h: the functions here */
 #include "ahcint.h"
 
 /* ahcimain.c - DriverEntry, adapter discovery, HBA/port init, ScsiPort entry points, power */
@@ -143,27 +144,125 @@ AhciClaimDevice(IN ULONG Bus, IN ULONG Slot)
 #define AHCI_PCI_HEADER_LENGTH          64
 #define AHCI_PCI_MULTIFUNCTION          0x80
 
+/* AHCI functions by vendor and device ID: the explicit entries of Linux's
+   drivers/ata/ahci.c (ahci_pci_tbl). Most of them have the AHCI class code
+   anyway; the rest report RAID (01 04), SATA with another programming
+   interface (01 06 xx) or "other" (01 80): Intel RST in RAID mode, Marvell
+   and ASMedia RAID-mode AHCI, nVidia MCP. Sorted, vendor << 16 | device. */
+static const ULONG g_AhciKnownIds[] = {
+    0x00147A08UL, 0x10024380UL, 0x10024390UL, 0x10024391UL, 0x10024392UL, 0x10024393UL,
+    0x10024394UL, 0x10024395UL, 0x10227800UL, 0x10227801UL, 0x10227900UL, 0x10227901UL,
+    0x10390186UL, 0x10391184UL, 0x10391185UL, 0x104ACC06UL, 0x105A3781UL, 0x105A3F20UL,
+    0x10B95288UL, 0x10DE044CUL, 0x10DE044DUL, 0x10DE044EUL, 0x10DE044FUL, 0x10DE045CUL,
+    0x10DE045DUL, 0x10DE045EUL, 0x10DE045FUL, 0x10DE0550UL, 0x10DE0551UL, 0x10DE0552UL,
+    0x10DE0553UL, 0x10DE0554UL, 0x10DE0555UL, 0x10DE0556UL, 0x10DE0557UL, 0x10DE0558UL,
+    0x10DE0559UL, 0x10DE055AUL, 0x10DE055BUL, 0x10DE0580UL, 0x10DE0581UL, 0x10DE0582UL,
+    0x10DE0583UL, 0x10DE0584UL, 0x10DE0585UL, 0x10DE0586UL, 0x10DE0587UL, 0x10DE0588UL,
+    0x10DE0589UL, 0x10DE058AUL, 0x10DE058BUL, 0x10DE058CUL, 0x10DE058DUL, 0x10DE058EUL,
+    0x10DE058FUL, 0x10DE07F0UL, 0x10DE07F1UL, 0x10DE07F2UL, 0x10DE07F3UL, 0x10DE07F4UL,
+    0x10DE07F5UL, 0x10DE07F6UL, 0x10DE07F7UL, 0x10DE07F8UL, 0x10DE07F9UL, 0x10DE07FAUL,
+    0x10DE07FBUL, 0x10DE0AB4UL, 0x10DE0AB5UL, 0x10DE0AB6UL, 0x10DE0AB7UL, 0x10DE0AB8UL,
+    0x10DE0AB9UL, 0x10DE0ABAUL, 0x10DE0ABBUL, 0x10DE0ABCUL, 0x10DE0ABDUL, 0x10DE0ABEUL,
+    0x10DE0ABFUL, 0x10DE0AD0UL, 0x10DE0AD1UL, 0x10DE0AD2UL, 0x10DE0AD3UL, 0x10DE0AD4UL,
+    0x10DE0AD5UL, 0x10DE0AD6UL, 0x10DE0AD7UL, 0x10DE0AD8UL, 0x10DE0AD9UL, 0x10DE0ADAUL,
+    0x10DE0ADBUL, 0x10DE0D84UL, 0x10DE0D85UL, 0x10DE0D86UL, 0x10DE0D87UL, 0x10DE0D88UL,
+    0x10DE0D89UL, 0x10DE0D8AUL, 0x10DE0D8BUL, 0x10DE0D8CUL, 0x10DE0D8DUL, 0x10DE0D8EUL,
+    0x10DE0D8FUL, 0x11030642UL, 0x11030645UL, 0x11063349UL, 0x11066287UL, 0x11AB6121UL,
+    0x11AB6145UL, 0x144D1600UL, 0x144DA800UL, 0x197B2362UL, 0x197B236FUL, 0x1B210601UL,
+    0x1B210602UL, 0x1B210611UL, 0x1B210612UL, 0x1B210621UL, 0x1B210622UL, 0x1B210624UL,
+    0x1B211062UL, 0x1B211064UL, 0x1B211164UL, 0x1B211165UL, 0x1B211166UL, 0x1B4B9123UL,
+    0x1B4B9125UL, 0x1B4B9172UL, 0x1B4B917AUL, 0x1B4B9182UL, 0x1B4B9192UL, 0x1B4B91A0UL,
+    0x1B4B91A2UL, 0x1B4B91A3UL, 0x1B4B9215UL, 0x1B4B9230UL, 0x1B4B9235UL, 0x1C360031UL,
+    0x1C448000UL, 0x808602D3UL, 0x808602D7UL, 0x808606D6UL, 0x808606D7UL, 0x80860F22UL,
+    0x80860F23UL, 0x808619B0UL, 0x808619B1UL, 0x808619B2UL, 0x808619B3UL, 0x808619B4UL,
+    0x808619B5UL, 0x808619B6UL, 0x808619B7UL, 0x808619BEUL, 0x808619BFUL, 0x808619C0UL,
+    0x808619C1UL, 0x808619C2UL, 0x808619C3UL, 0x808619C4UL, 0x808619C5UL, 0x808619C6UL,
+    0x808619C7UL, 0x808619CEUL, 0x808619CFUL, 0x80861C02UL, 0x80861C03UL, 0x80861C04UL,
+    0x80861C05UL, 0x80861C06UL, 0x80861C07UL, 0x80861D02UL, 0x80861D04UL, 0x80861D06UL,
+    0x80861E02UL, 0x80861E03UL, 0x80861E04UL, 0x80861E05UL, 0x80861E06UL, 0x80861E07UL,
+    0x80861E0EUL, 0x80861F22UL, 0x80861F23UL, 0x80861F24UL, 0x80861F25UL, 0x80861F26UL,
+    0x80861F27UL, 0x80861F2EUL, 0x80861F2FUL, 0x80861F32UL, 0x80861F33UL, 0x80861F34UL,
+    0x80861F35UL, 0x80861F36UL, 0x80861F37UL, 0x80861F3EUL, 0x80861F3FUL, 0x808622A3UL,
+    0x80862323UL, 0x808623A3UL, 0x80862652UL, 0x80862653UL, 0x80862681UL, 0x80862682UL,
+    0x80862683UL, 0x808627C1UL, 0x808627C3UL, 0x808627C5UL, 0x808627C6UL, 0x80862821UL,
+    0x80862822UL, 0x80862823UL, 0x80862824UL, 0x80862826UL, 0x80862827UL, 0x80862829UL,
+    0x8086282AUL, 0x8086282FUL, 0x80862922UL, 0x80862923UL, 0x80862924UL, 0x80862925UL,
+    0x80862927UL, 0x80862929UL, 0x8086292AUL, 0x8086292BUL, 0x8086292CUL, 0x8086292FUL,
+    0x8086294DUL, 0x8086294EUL, 0x808634D3UL, 0x80863A05UL, 0x80863A22UL, 0x80863A25UL,
+    0x80863B22UL, 0x80863B23UL, 0x80863B24UL, 0x80863B25UL, 0x80863B29UL, 0x80863B2BUL,
+    0x80863B2CUL, 0x80863B2FUL, 0x808643D4UL, 0x808643D5UL, 0x808643D6UL, 0x808643D7UL,
+    0x80864B63UL, 0x8086502AUL, 0x8086502BUL, 0x80865AE3UL, 0x80868C02UL, 0x80868C03UL,
+    0x80868C04UL, 0x80868C05UL, 0x80868C06UL, 0x80868C07UL, 0x80868C0EUL, 0x80868C0FUL,
+    0x80868C82UL, 0x80868C83UL, 0x80868C84UL, 0x80868C85UL, 0x80868C86UL, 0x80868C87UL,
+    0x80868C8EUL, 0x80868C8FUL, 0x80868D02UL, 0x80868D04UL, 0x80868D06UL, 0x80868D0EUL,
+    0x80868D62UL, 0x80868D64UL, 0x80868D66UL, 0x80868D6EUL, 0x80869C02UL, 0x80869C03UL,
+    0x80869C04UL, 0x80869C05UL, 0x80869C06UL, 0x80869C07UL, 0x80869C0EUL, 0x80869C0FUL,
+    0x80869C83UL, 0x80869C85UL, 0x80869C87UL, 0x80869C8FUL, 0x80869D03UL, 0x80869D05UL,
+    0x80869D07UL, 0x80869DD3UL, 0x8086A102UL, 0x8086A103UL, 0x8086A105UL, 0x8086A106UL,
+    0x8086A107UL, 0x8086A10FUL, 0x8086A182UL, 0x8086A186UL, 0x8086A1D2UL, 0x8086A1D6UL,
+    0x8086A202UL, 0x8086A206UL, 0x8086A252UL, 0x8086A256UL, 0x8086A356UL, 0x8086A386UL,
+};
+
+static BOOLEAN
+AhciKnownId(IN USHORT Vendor, IN USHORT Device)
+{
+    ULONG key = ((ULONG)Vendor << 16) | Device;
+    LONG lo = 0, hi = (LONG)(sizeof(g_AhciKnownIds) / sizeof(g_AhciKnownIds[0])) - 1;
+    while (lo <= hi) {
+        LONG mid = (lo + hi) / 2;
+        if (g_AhciKnownIds[mid] == key) return TRUE;
+        if (g_AhciKnownIds[mid] < key) lo = mid + 1; else hi = mid - 1;
+    }
+    return FALSE;
+}
+
+#define AHCI_PCI_SUBCLASS_RAID          0x04
+#define AHCI_PCI_SUBCLASS_OTHER         0x80
+
+/* An AHCI function: the AHCI class code, or a known AHCI device in RAID
+   (or another non-IDE storage) mode, as Linux's ahci driver takes them.
+   RAID mode without a RAID volume ("non-RAID"): the disks are plain AHCI
+   ports. Disks that belong to a RAID volume are left alone (see
+   AhciRaidMember). The register set is checked once the ABAR is mapped. */
 static BOOLEAN
 AhciPciConfigIsAhci(IN PPCI_COMMON_CONFIG PciConfig)
 {
-    if (PciConfig->BaseClass == PCI_CLASS_MASS_STORAGE &&
-        PciConfig->SubClass == PCI_SUBCLASS_AHCI &&
-        PciConfig->ProgIf == PCI_PROGIF_AHCI) {
+    if (PciConfig->BaseClass != PCI_CLASS_MASS_STORAGE) return FALSE;
+    if (PciConfig->SubClass == PCI_SUBCLASS_AHCI && PciConfig->ProgIf == PCI_PROGIF_AHCI) {
         return TRUE;
     }
-
-    /* AHCI HBAs that report a RAID/other class code in some BIOS modes */
-    if (PciConfig->VendorID == 0x1022 &&
-        (PciConfig->DeviceID == 0x7901 || PciConfig->DeviceID == 0x43EB ||
-         PciConfig->DeviceID == 0x43C8)) {
+    /* JMicron JMB362B/C: an AHCI function with the IDE class code (Linux);
+       the ABAR is checked once mapped */
+    if (PciConfig->SubClass == PCI_SUBCLASS_IDE && PciConfig->VendorID == 0x197B &&
+        (PciConfig->DeviceID == 0x2362 || PciConfig->DeviceID == 0x236F)) {
         return TRUE;
     }
-    if (PciConfig->VendorID == 0x8086 &&
-        (PciConfig->DeviceID == 0x2829 || PciConfig->DeviceID == 0x2828 ||
-         PciConfig->DeviceID == 0x2922 || PciConfig->DeviceID == 0x2681)) {
+    /* Other IDE-class functions are IDENT's */
+    if (PciConfig->SubClass != AHCI_PCI_SUBCLASS_RAID && PciConfig->SubClass != PCI_SUBCLASS_AHCI &&
+        PciConfig->SubClass != AHCI_PCI_SUBCLASS_OTHER) {
+        return FALSE;
+    }
+    if (AhciKnownId(PciConfig->VendorID, PciConfig->DeviceID)) return TRUE;
+    /* AMD uses the RAID class only for AHCI controllers (Linux) */
+    if (PciConfig->VendorID == 0x1022 && PciConfig->SubClass == AHCI_PCI_SUBCLASS_RAID) return TRUE;
+    /* Dell S140/S150: Intel RST RAID with a Dell subsystem (Linux) */
+    if (PciConfig->VendorID == 0x8086 && PciConfig->SubClass == AHCI_PCI_SUBCLASS_RAID &&
+        PciConfig->u.type0.SubVendorID == 0x1028) {
         return TRUE;
     }
     return FALSE;
+}
+
+/* The register set behind the ABAR of a function taken by ID: AHCI 0.95
+   to 1.3.1, a port, a sane capability register */
+static BOOLEAN
+AhciRegistersValid(IN PUCHAR Abar)
+{
+    ULONG vs = AHCI_READ_REG(Abar, AHCI_GEN_VS);
+    ULONG cap = AHCI_READ_REG(Abar, AHCI_GEN_CAP);
+    ULONG pi = AHCI_READ_REG(Abar, AHCI_GEN_PI);
+    if (cap == 0xFFFFFFFF || pi == 0 || pi == 0xFFFFFFFF) return FALSE;
+    return (BOOLEAN)(vs == 0x00000905 || (vs >> 16) == 1);
 }
 
 #ifdef AHCI_NT31_COMPAT
@@ -244,6 +343,11 @@ AhciPciEnableDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Bus, IN ULONG Slot,
 {
     USHORT pciCmd = (USHORT)((Command | 0x0006) & ~(1 << 10));
 
+    if (HwInit->VmdChildCfg != NULL) {
+        /* behind an Intel VMD: its domain's configuration space */
+        VmdCfgWrite(HwInit->VmdChildCfg, 0x04, pciCmd);
+        return;
+    }
 #ifdef AHCI_NT31_COMPAT
     /* No ScsiPortSetBusDataByOffset to import on NT 3.1: write the command
        register through the ports, and only when the BIOS left it off. */
@@ -337,6 +441,154 @@ AhciScanPciForAhci(
     return FALSE;
 }
 
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+/* ------------------------------------------------------------------ */
+/* HBAs behind an Intel VMD (NT 3.1-4.0)                               */
+/* ------------------------------------------------------------------ */
+
+/* With VMD on (Intel RST "VMD controller"), the SATA controller can move
+   into the VMD's own PCI domain, which the HAL does not see (see
+   vmdcore.h). Without PnP the driver finds it there itself; on Windows
+   2000 and later the VMD belongs to NVMENT. Such an HBA is known by a bus
+   number of its own: AHCI_VMD_BUS | VMD bus << 8 | its bus in the domain,
+   slot VMD slot << 8 | its device/function. It has no INTx: Fast Polling. */
+#define AHCI_VMD_BUS                    0x10000
+
+static PVOID
+AhciVmdMap(IN PVOID Context, IN ULONGLONG Phys, IN ULONG Length)
+{
+    PHW_DEVICE_EXTENSION HwInit = (PHW_DEVICE_EXTENSION)Context;
+    SCSI_PHYSICAL_ADDRESS pa;
+    PVOID va;
+    if ((Phys >> 32) != 0) return NULL;
+    pa.QuadPart = (LONGLONG)Phys;
+    va = ScsiPortGetDeviceBase(HwInit, HwInit->VmdMapType, HwInit->VmdMapBus, pa, Length, FALSE);
+    if (va == NULL && HwInit->VmdMapType != PCIBus) {
+        va = ScsiPortGetDeviceBase(HwInit, PCIBus, HwInit->VmdHostBus, pa, Length, FALSE);
+    }
+    return va;
+}
+
+static ULONG
+AhciVmdHostRead(IN PVOID Context, IN ULONG Offset)
+{
+    PHW_DEVICE_EXTENSION HwInit = (PHW_DEVICE_EXTENSION)Context;
+    ULONG v = 0xFFFFFFFF;
+#ifdef AHCI_NT31_COMPAT
+    if (g_AhciPciViaPorts) return AhciPciReadPortDword(HwInit->VmdHostBus, HwInit->VmdHostSlot, Offset);
+#endif
+    ScsiPortGetBusData(HwInit, PCIConfiguration, HwInit->VmdHostBus, HwInit->VmdHostSlot, (PVOID)&v, 0);
+    {
+        ULONG buf[64];
+        if (ScsiPortGetBusData(HwInit, PCIConfiguration, HwInit->VmdHostBus, HwInit->VmdHostSlot, buf,
+                               sizeof(buf)) == sizeof(buf)) {
+            v = buf[(Offset & 0xFC) / 4];
+        }
+    }
+    return v;
+}
+
+static VOID
+AhciVmdHostWrite(IN PVOID Context, IN ULONG Offset, IN ULONG Value)
+{
+    PHW_DEVICE_EXTENSION HwInit = (PHW_DEVICE_EXTENSION)Context;
+#ifdef AHCI_NT31_COMPAT
+    /* NT 3.1 has no ScsiPortSetBusDataByOffset to import: the ports */
+    (VOID)HwInit;
+    AhciPciSelect(HwInit->VmdHostBus, HwInit->VmdHostSlot, Offset);
+    ScsiPortWritePortUlong((PULONG)AHCI_PCI_CONFIG_DATA, Value);
+#else
+    ScsiPortSetBusDataByOffset(HwInit, PCIConfiguration, HwInit->VmdHostBus, HwInit->VmdHostSlot, &Value,
+                               Offset & 0xFC, sizeof(ULONG));
+#endif
+}
+
+/* The header of a function in the domain */
+static VOID
+AhciVmdHeader(IN PUCHAR Cfg, OUT PPCI_COMMON_CONFIG PciConfig)
+{
+    PULONG d = (PULONG)PciConfig;
+    ULONG i;
+    for (i = 0; i < AHCI_PCI_HEADER_LENGTH / sizeof(ULONG); i++) d[i] = VmdCfgRead(Cfg, i * 4);
+}
+
+static BOOLEAN
+AhciVmdMatch(IN PVOID Context, IN PUCHAR Cfg)
+{
+    PCI_COMMON_CONFIG c;
+    (VOID)Context;
+    AhciVmdHeader(Cfg, &c);
+    return AhciPciConfigIsAhci(&c);
+}
+
+/* The next unclaimed AHCI HBA behind a VMD: *FoundBus/*FoundSlot its
+   numbers (AHCI_VMD_BUS), HwInit->VmdChildCfg its configuration space */
+static BOOLEAN
+AhciScanVmdForAhci(IN PHW_DEVICE_EXTENSION HwInit, IN PPORT_CONFIGURATION_INFORMATION ConfigInfo,
+                   IN BOOLEAN HasSlot, OUT PULONG FoundBus, OUT PULONG FoundSlot, OUT PPCI_COMMON_CONFIG PciConfig)
+{
+    PCI_SLOT_NUMBER slot;
+    ULONG bus, device, function, idx;
+    BOOLEAN busMissing, multiFunction;
+    PCI_COMMON_CONFIG host;
+
+    for (bus = 0; bus < 256; bus++) {
+        for (device = 0; device < 32; device++) {
+            multiFunction = FALSE;
+            for (function = 0; function < 8; function++) {
+                if (function > 0 && !multiFunction) break;
+                slot.u.AsULONG = 0;
+                slot.u.bits.DeviceNumber = device;
+                slot.u.bits.FunctionNumber = function;
+                if (!AhciReadPciHeader(HwInit, bus, slot.u.AsULONG, &host, &busMissing)) {
+                    if (busMissing && device == 0 && function == 0) return FALSE;
+                    if (function == 0) break;
+                    continue;
+                }
+                if (function == 0) multiFunction = (BOOLEAN)((host.HeaderType & AHCI_PCI_MULTIFUNCTION) != 0);
+                if (!VmdIsVmd(host.VendorID, host.DeviceID, host.BaseClass)) continue;
+
+                HwInit->VmdHostBus = bus;
+                HwInit->VmdHostSlot = slot.u.AsULONG;
+                HwInit->VmdMapType = HasSlot ? PCIBus : ConfigInfo->AdapterInterfaceType;
+                HwInit->VmdMapBus = HasSlot ? bus : ConfigInfo->SystemIoBusNumber;
+                HwInit->Vmd.Context = HwInit;
+                HwInit->Vmd.Map = AhciVmdMap;
+                HwInit->Vmd.HostRead = AhciVmdHostRead;
+                HwInit->Vmd.HostWrite = AhciVmdHostWrite;
+                HwInit->Vmd.Match = AhciVmdMatch;
+                if (!VmdOpen(&HwInit->Vmd, host.VendorID, host.DeviceID)) {
+                    AHCI_DBG((AHCI_PFX "FindAdapter: VMD %04X at bus %lu slot %08lX: not usable\n",
+                              host.DeviceID, bus, slot.u.AsULONG));
+                    continue;
+                }
+                for (idx = 0; idx < 8; idx++) {
+                    ULONG cbus = 0, cdevfn = 0, count = 0, vbus, vslot;
+                    BOOLEAN assigned = FALSE;
+                    PUCHAR cfg;
+                    if (!VmdFindFunction(&HwInit->Vmd, idx, &cbus, &cdevfn, &count, &assigned)) break;
+                    vbus = AHCI_VMD_BUS | (bus << 8) | cbus;
+                    vslot = (slot.u.AsULONG << 8) | cdevfn;
+                    if (AhciIsDeviceClaimed(vbus, vslot)) continue;
+                    cfg = VmdCfgSpace(&HwInit->Vmd, cbus, cdevfn);
+                    if (cfg == NULL) break;
+                    HwInit->VmdChildCfg = cfg;
+                    AhciVmdHeader(cfg, PciConfig);
+                    PciConfig->u.type0.InterruptLine = 0xFF;    /* no INTx in the domain */
+                    *FoundBus = vbus;
+                    *FoundSlot = vslot;
+                    AHCI_DBG((AHCI_PFX "FindAdapter: VMD %04X at bus %lu slot %08lX (%s): HBA %lu of %lu at %02lX:%02lX.%lu\n",
+                              host.DeviceID, bus, slot.u.AsULONG, assigned ? "domain assigned" : "set-up kept",
+                              idx, count, cbus, cdevfn >> 3, cdevfn & 7));
+                    return TRUE;
+                }
+            }
+        }
+    }
+    return FALSE;
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* DMA arena                                                           */
 /* ------------------------------------------------------------------ */
@@ -356,9 +608,10 @@ AhciCountPorts(IN ULONG Pi)
 }
 
 static ULONG
-AhciArenaLength(IN ULONG Ports, IN ULONG Slots, IN ULONG TableSize)
+AhciArenaLength(IN ULONG Ports, IN ULONG Slots, IN ULONG TableSize, IN BOOLEAN DumpMode)
 {
-    return Ports * (AHCI_PORT_DMA_FIXED + Slots * TableSize) + 1024;
+    return Ports * (AHCI_PORT_DMA_FIXED + Slots * TableSize) + 1024 +
+           (DumpMode ? 0 : AHCI_XBOUNCE_SIZE + 512);
 }
 
 /* Crash dump / hibernation instance: the ports with a link (as the
@@ -407,7 +660,8 @@ AhciAllocateDma(IN PHW_DEVICE_EXTENSION HwInit, IN PPORT_CONFIGURATION_INFORMATI
 
     if (HwInit->DmaArea != NULL) return TRUE;
 
-    HwInit->DmaLength = AhciArenaLength(AhciCountPorts(HwInit->PortsImplemented), HwInit->Slots, HwInit->TableSize);
+    HwInit->DmaLength = AhciArenaLength(AhciCountPorts(HwInit->PortsImplemented), HwInit->Slots, HwInit->TableSize,
+                                        HwInit->DumpMode);
     HwInit->DmaArea = (PUCHAR)ScsiPortGetUncachedExtension(HwInit, ConfigInfo, HwInit->DmaLength);
     if (HwInit->DmaArea == NULL) {
         AHCI_DBG((AHCI_PFX "AllocateDma: ScsiPortGetUncachedExtension(%lu) failed\n", HwInit->DmaLength));
@@ -457,6 +711,12 @@ AhciAllocateDma(IN PHW_DEVICE_EXTENSION HwInit, IN PPORT_CONFIGURATION_INFORMATI
         pi->Implemented = TRUE;
     }
 
+    if (!HwInit->DumpMode) {
+        HwInit->XBounce = AhciAlignDma(&virt, &phys, 512);
+        HwInit->XBouncePhysical = phys;
+        HwInit->XBouncePhysicalUpper = high;
+    }
+
     AHCI_DBG((AHCI_PFX "AllocateDma: %lu bytes at %08lX:%08lX, %lu slot(s) per port\n",
               HwInit->DmaLength, high, HwInit->DmaAreaPhysical.LowPart, HwInit->Slots));
     return TRUE;
@@ -485,6 +745,75 @@ AhciAllocDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
     return TRUE;
 }
 
+/* One 512-byte sector of an ATA disk into the port's bounce buffer */
+static BOOLEAN
+AhciReadSector(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun, IN AHCI_LBA Lba)
+{
+    PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, Port, Lun);
+    ATA_REQUEST req;
+
+    ZeroMemoryBytes(&req, sizeof(req));
+    req.Pmp = dev->Pmp;
+    req.UseBounce = TRUE;
+    req.DataBufferLen = 512;
+    req.Lba = Lba;
+    req.SectorCount = 1;
+    if (Lba.High == 0 && Lba.Low < 0x0FFFFFFF) {
+        req.Command = IDE_COMMAND_READ_DMA;
+    } else if (dev->Lba48) {
+        req.Is48Bit = TRUE;
+        req.Command = IDE_COMMAND_READ_DMA_EXT;
+    } else {
+        return FALSE;
+    }
+    return (BOOLEAN)(AhciRunCommand(HwInit, Port, NULL, &req) == AHCI_CMD_OK);
+}
+
+/* A disk of a RAID volume on a controller in RAID mode, by the metadata
+   the RAID BIOS writes at the end of the disk (the formats Linux's mdadm
+   and dmraid read): Intel Matrix Storage (RST) "Intel Raid ISM Cfg Sig."
+   in the second-to-last sector with at least one RAID volume; SNIA DDF
+   (used by AMD RAIDXpert2 and others), anchor DE11DE11h in the last
+   sector. Such a disk is not shown: written to as a single disk it would
+   break its volume. A spare or a disk without a volume is shown. */
+static BOOLEAN
+AhciRaidMember(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun)
+{
+    PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, Port, Lun);
+    PUCHAR b = AHCI_PORTINFO(HwInit, Port)->BounceBuffer;
+    static const char imsm[] = "Intel Raid ISM Cfg Sig. ";
+    AHCI_LBA last;
+    ULONG i;
+
+    if (!HwInit->RaidMode || HwInit->RaidDisks || dev->IsAtapi || !dev->IdentifyValid ||
+        dev->SectorSize != 512 || dev->LbaShift != 0) {
+        return FALSE;
+    }
+    last = dev->TotalSectors;
+    if (last.Low == 0 && last.High == 0) return FALSE;
+    if (last.Low == 0) last.High--;
+    last.Low--;
+
+    /* SNIA DDF anchor: the last sector */
+    if (AhciReadSector(HwInit, Port, Lun, last) &&
+        b[0] == 0xDE && b[1] == 0x11 && b[2] == 0xDE && b[3] == 0x11) {
+        AHCI_DBG((AHCI_PFX "Port %lu: DDF RAID metadata, disk of a RAID volume: not shown\n", Port));
+        return TRUE;
+    }
+    /* Intel MPB: the sector before; num_raid_devs at byte 57 */
+    if (last.Low == 0) last.High--;
+    last.Low--;
+    if (AhciReadSector(HwInit, Port, Lun, last)) {
+        for (i = 0; i < sizeof(imsm) - 1 && b[i] == (UCHAR)imsm[i]; i++) ;
+        if (i == sizeof(imsm) - 1 && b[57] != 0) {
+            AHCI_DBG((AHCI_PFX "Port %lu: Intel RST metadata, disk of %u RAID volume(s): not shown\n",
+                      Port, (ULONG)b[57]));
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 /* IDENTIFY a device whose type came from a signature; when that fails,
    try the other command once (a stale or missing signature). */
 static BOOLEAN
@@ -504,6 +833,10 @@ AhciProbeDevice(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun, IN 
     }
 
     AhciParseIdentify(HwInit, Port, Lun);
+    if (AhciRaidMember(HwInit, Port, Lun)) {
+        dev->Present = FALSE;
+        return FALSE;
+    }
     AhciApplyDeviceSettings(HwInit, Port, Lun);
     return TRUE;
 }
@@ -1296,6 +1629,61 @@ AhciEnsurePnpInterface(IN PVOID RegistryPath)
 }
 #endif
 
+#if !defined(AHCI_W9X)
+/* NT family: NotInboxDriver = 1 in the driver's own service key. IDENT
+   turns the in-box atdisk and atapi services off on NT 3.1-4.0; an
+   "atapi" service that is this driver copied over atapi.sys carries the
+   value, and IDENT leaves it alone. Declared here: miniport.h has no
+   registry API. */
+typedef struct { USHORT Length; USHORT MaximumLength; USHORT *Buffer; } AHCI_MARK_STRING;
+typedef struct { ULONG Length; PVOID RootDirectory; AHCI_MARK_STRING *ObjectName; ULONG Attributes;
+                 PVOID SecurityDescriptor; PVOID SecurityQualityOfService; } AHCI_MARK_ATTRIBUTES;
+LONG __stdcall ZwOpenKey(PVOID *KeyHandle, ULONG DesiredAccess, PVOID ObjectAttributes);
+LONG __stdcall ZwSetValueKey(PVOID KeyHandle, PVOID ValueName, ULONG TitleIndex, ULONG Type,
+                             PVOID Data, ULONG DataSize);
+LONG __stdcall ZwClose(PVOID Handle);
+static USHORT g_AhciNotInboxName[] = L"NotInboxDriver";
+
+static VOID
+AhciMarkNotInbox(IN PVOID RegistryPath)
+{
+    AHCI_MARK_ATTRIBUTES oa;
+    AHCI_MARK_STRING name;
+    PVOID key;
+    ULONG one = 1;
+
+    if (RegistryPath == NULL) return;
+    oa.Length = sizeof(oa);
+    oa.RootDirectory = NULL;
+    oa.ObjectName = (AHCI_MARK_STRING *)RegistryPath;
+#if defined(AHCI_NT4)
+    oa.Attributes = 0x00000040;             /* OBJ_CASE_INSENSITIVE (NT 4.0 rejects OBJ_KERNEL_HANDLE) */
+#else
+    oa.Attributes = 0x00000240;             /* OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE */
+#endif
+    oa.SecurityDescriptor = NULL;
+    oa.SecurityQualityOfService = NULL;
+    if (ZwOpenKey(&key, 0x0002001F, &oa) < 0) return;  /* KEY_READ | KEY_WRITE */
+    name.Buffer = g_AhciNotInboxName;
+    name.Length = (USHORT)(sizeof(g_AhciNotInboxName) - sizeof(USHORT));
+    name.MaximumLength = (USHORT)sizeof(g_AhciNotInboxName);
+    ZwSetValueKey(key, &name, 0, 4, &one, sizeof(one));    /* REG_DWORD */
+    ZwClose(key);
+}
+#endif
+
+#ifdef AHCI_W9X
+/* The Windows 9x loader does not clear the uninitialized data of a .MPD
+   (its RAM holds whatever was there): every global that has to start at
+   zero is cleared before anything reads it */
+static VOID
+AhciClearGlobals9x(VOID)
+{
+    ZeroMemoryBytes(&g_AhciCapacity16, sizeof(g_AhciCapacity16));
+    ZeroMemoryBytes(&g_AhciClaimedDevices, sizeof(g_AhciClaimedDevices));
+}
+#endif
+
 ULONG
 DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 {
@@ -1307,6 +1695,9 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 
     /* The crash dump / hibernation stack calls the miniport without a
        driver object */
+#ifdef AHCI_W9X
+    AhciClearGlobals9x();
+#endif
     g_AhciDumpMode = (BOOLEAN)(DriverObject == NULL);
 
     AHCI_DBG((AHCI_PFX "DriverEntry%s\n", g_AhciDumpMode ? " (dump)" : ""));
@@ -1373,6 +1764,9 @@ DriverEntry(IN PVOID DriverObject, IN PVOID Argument2)
 
 #if !defined(AHCI_NT4)
     if (!g_AhciDumpMode) AhciEnsurePnpInterface(Argument2);
+#endif
+#if !defined(AHCI_W9X)
+    if (!g_AhciDumpMode) AhciMarkNotInbox(Argument2);
 #endif
 
     status = ScsiPortInitialize(DriverObject, Argument2, &initData, NULL);
@@ -1558,7 +1952,7 @@ AhciFindAdapter(
     PACCESS_RANGE accessRanges;
     SCSI_PHYSICAL_ADDRESS basePhys;
     ULONG targetBus, targetSlot;
-    ULONG mapBus, mapLength, pi, lastPort;
+    ULONG mapBus, pciBus, mapLength, pi, lastPort;
     ULONG bar;
     ULONG i, ports, slots;
     BOOLEAN found;
@@ -1643,6 +2037,14 @@ AhciFindAdapter(
         found = AhciScanPciForAhci(hwInit, &targetBus, &targetSlot, &pciConfig);
     }
 
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+    /* Step 3: behind an Intel VMD */
+    hwInit->VmdChildCfg = NULL;
+    if (!found && !g_AhciDumpMode && !AhciArgPresent(ArgumentString, "VMD=0")) {
+        found = AhciScanVmdForAhci(hwInit, ConfigInfo, hasSlot, &targetBus, &targetSlot, &pciConfig);
+    }
+#endif
+
     if (!found) {
         AHCI_DBG((AHCI_PFX "FindAdapter: no AHCI HBA found\n"));
         return SP_RETURN_NOT_FOUND;
@@ -1655,6 +2057,13 @@ AhciFindAdapter(
     bar = pciConfig.u.type0.BaseAddresses[AHCI_ABAR_INDEX];
     basePhys.LowPart = (bar & 0x1) ? 0 : (bar & 0xFFFFFFF0);
     basePhys.HighPart = 0;
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+    if (hwInit->VmdChildCfg != NULL) {
+        ULONG length;
+        ULONGLONG abar = VmdFunctionBar(&hwInit->Vmd, hwInit->VmdChildCfg, AHCI_ABAR_INDEX, &length);
+        basePhys.QuadPart = (LONGLONG)abar;
+    }
+#endif
 
     /* Config space unreadable/unassigned but PnP handed us resources for
        our own function: use the first memory range from ConfigInfo. */
@@ -1676,14 +2085,29 @@ AhciFindAdapter(
     AhciClaimDevice(targetBus, targetSlot);
     hwInit->PciBus = targetBus;
     hwInit->PciSlot = targetSlot;
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+    /* NT 3.5-4.0 call us once per PCI bus: an HBA we found by our own scan
+       may have more after it (an Intel RST controller in RAID mode next to
+       an add-in card), so ask to be called again; the next call that finds
+       none ends it. */
+    if (hasSlot && !ownSlot && !g_AhciDumpMode) *Again = TRUE;
+#endif
 
     AhciPciEnableDevice(hwInit, targetBus, targetSlot, pciConfig.Command);
 
     /* Without a slot (NT 3.1) the ABAR is mapped on the bus ScsiPort
        called us for: there is no PCI bus to translate on. */
     mapBus = hasSlot ? targetBus : ConfigInfo->SystemIoBusNumber;
+    pciBus = targetBus;
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+    if (hwInit->VmdChildCfg != NULL) {
+        /* mapped and reported on the VMD's bus and slot */
+        mapBus = hwInit->VmdMapBus;
+        pciBus = hwInit->VmdHostBus;
+    }
+#endif
 
-    /* The port registers up to port 7 first (as up to 1.5.0.0); an HBA
+    /* The port registers up to port 7 first (as up to 1.5); an HBA
        with more ports is mapped again as far as its last port */
     mapLength = AHCI_ABAR_MAP_SIZE(8);
     hwInit->AbarMapped = NULL;
@@ -1693,16 +2117,23 @@ AhciFindAdapter(
            An HBA with more than 8 ports was mapped as far as its last
            port; find that length. */
         for (i = MAX_SUPPORTED_PORTS; i > 8 && hwInit->AbarMapped == NULL; i--) {
-            hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, targetBus, basePhys, AHCI_ABAR_MAP_SIZE(i));
+            hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, pciBus, basePhys, AHCI_ABAR_MAP_SIZE(i));
             if (hwInit->AbarMapped != NULL) mapLength = AHCI_ABAR_MAP_SIZE(i);
         }
     }
     if (hwInit->AbarMapped == NULL) {
-        hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, targetBus, basePhys, mapLength);
+        hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, pciBus, basePhys, mapLength);
     }
     if (hwInit->AbarMapped == NULL) {
         AHCI_DBG((AHCI_PFX "FindAdapter: mapping ABAR %08lX failed\n", basePhys.LowPart));
         return SP_RETURN_ERROR;
+    }
+    if (!(pciConfig.SubClass == PCI_SUBCLASS_AHCI && pciConfig.ProgIf == PCI_PROGIF_AHCI) &&
+        !AhciRegistersValid(hwInit->AbarMapped)) {
+        AHCI_DBG((AHCI_PFX "FindAdapter: %04X:%04X (class %02X%02X%02X) has no AHCI registers (VS %08lX)\n",
+                  pciConfig.VendorID, pciConfig.DeviceID, pciConfig.BaseClass, pciConfig.SubClass, pciConfig.ProgIf,
+                  AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_VS)));
+        return SP_RETURN_NOT_FOUND;
     }
     pi = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_PI);
     if (hwInit->MaxPorts < 32) pi &= (1UL << hwInit->MaxPorts) - 1;
@@ -1712,7 +2143,7 @@ AhciFindAdapter(
         ScsiPortFreeDeviceBase(hwInit, hwInit->AbarMapped);
 #endif
         mapLength = AHCI_ABAR_MAP_SIZE(lastPort);
-        hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, targetBus, basePhys, mapLength);
+        hwInit->AbarMapped = AhciMapAbar(hwInit, ConfigInfo, mapBus, pciBus, basePhys, mapLength);
         if (hwInit->AbarMapped == NULL) {
             AHCI_DBG((AHCI_PFX "FindAdapter: mapping %lu bytes of ABAR %08lX failed\n", mapLength, basePhys.LowPart));
             return SP_RETURN_ERROR;
@@ -1731,6 +2162,12 @@ AhciFindAdapter(
     if (hasSlot) {
         ConfigInfo->SystemIoBusNumber = targetBus;
         ConfigInfo->SlotNumber = targetSlot;
+#if defined(AHCI_NT4) && !defined(AHCI_W9X)
+        if (hwInit->VmdChildCfg != NULL) {
+            ConfigInfo->SystemIoBusNumber = hwInit->VmdHostBus;
+            ConfigInfo->SlotNumber = hwInit->VmdHostSlot;
+        }
+#endif
         ConfigInfo->MaximumNumberOfTargets = AHCI_TARGETS_PER_BUS;
 #ifdef AHCI_NT4
         /* When the miniport picks the slot itself, ScsiPort does not look
@@ -1784,6 +2221,12 @@ AhciFindAdapter(
 #endif
 
     hwInit->HbaCapabilities = AHCI_READ_REG(hwInit->AbarMapped, AHCI_GEN_CAP);
+    hwInit->RaidMode = (BOOLEAN)(pciConfig.SubClass == AHCI_PCI_SUBCLASS_RAID);
+    hwInit->RaidDisks = AhciArgPresent(ArgumentString, "RAIDDISKS=1");
+    if (hwInit->RaidMode) {
+        AHCI_DBG((AHCI_PFX "FindAdapter: %04X:%04X in RAID mode: plain AHCI ports, RAID volume disks left alone\n",
+                  pciConfig.VendorID, pciConfig.DeviceID));
+    }
     AhciParseOff(ArgumentString, hwInit);
     hwInit->PortsImplemented = pi & ~hwInit->PortsOff;
     if (g_AhciDumpMode) AhciDumpPorts(hwInit);
@@ -1794,14 +2237,21 @@ AhciFindAdapter(
     ConfigInfo->Dma64BitAddresses = (hwInit->HbaCapabilities & AHCI_CAP_S64A) ? TRUE : FALSE;
 #endif
     ConfigInfo->ScatterGather = TRUE;
-    /* 512 KB per request on 2000/XP/x64; 128 KB on the older systems
-       (their contiguous memory for the command tables is scarcer), in the
-       dump stack (little memory) and with "MAXXFER=128" */
+    /* A PRD entry takes a word-aligned address and an even byte count
+       (AHCI 1.3, 4.2.3.3: DBA bit 0 reserved, DBC bit 0 must be 1). An HBA
+       ignores bit 0, so a buffer at an odd address would be transferred
+       one byte off; the I/O system double-buffers such requests when told
+       (GitHub issue #4: corrupted files on Windows 98 SE in VirtualBox). */
+    ConfigInfo->AlignmentMask = 0x1;
+    /* 512 KB per request on NT 3.1-4.0 and 2000/XP/x64; 128 KB on 9x, in
+       the dump stack (little memory) and with "MAXXFER=128". NT 3.1-4.0
+       keep the smaller DMA budget (contiguous memory is scarcer there):
+       an HBA with many ports gets fewer NCQ tags per port. */
     hwInit->MaxTransfer = AHCI_MAX_TRANSFER;
     hwInit->PrdtEntries = AHCI_PRDT_ENTRIES;
     hwInit->TableSize = AHCI_CMDTBL_SIZE;
     ConfigInfo->NumberOfPhysicalBreaks = AHCI_MAX_PHYS_BREAKS;
-#ifndef AHCI_NT4
+#ifndef AHCI_W9X
     if (!hwInit->DumpMode && !AhciArgPresent(ArgumentString, "MAXXFER=128")) {
         hwInit->MaxTransfer = AHCI_MAX_TRANSFER_LARGE;
         hwInit->PrdtEntries = AHCI_PRDT_ENTRIES_LARGE;
@@ -1841,9 +2291,13 @@ AhciFindAdapter(
         slots = ((hwInit->HbaCapabilities >> AHCI_CAP_NCS_SHIFT) & AHCI_CAP_NCS_MASK) + 1;
         if (ports != 0) {
             /* 160 KB in all (512 KB with the large tables); an HBA with many ports gets up to 8 tags per port beyond it */
+#ifdef AHCI_NT4
+            ULONG budget = AHCI_DMA_BUDGET;
+#else
             ULONG budget = (hwInit->TableSize == AHCI_CMDTBL_SIZE) ? AHCI_DMA_BUDGET : AHCI_DMA_BUDGET_LARGE;
+#endif
             ULONG fit;
-            if (budget < AhciArenaLength(ports, 8, hwInit->TableSize)) budget = AhciArenaLength(ports, 8, hwInit->TableSize);
+            if (budget < AhciArenaLength(ports, 8, hwInit->TableSize, TRUE)) budget = AhciArenaLength(ports, 8, hwInit->TableSize, TRUE);
             fit = ((budget - 1024) / ports - AHCI_PORT_DMA_FIXED) / hwInit->TableSize;
             if (slots > fit) slots = fit;
         }

@@ -4,9 +4,9 @@
 
 | | |
 |---|---|
-| **Version** | 1.7.0.0 |
-| **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86) · Windows XP x64 / Server 2003 x64 |
-| **Hardware** | AHCI SATA host controllers (PCI class code `01-06-01`), up to 32 per system, all 32 ports of each |
+| **Version** | 1.8 |
+| **Operating systems** | Windows 95 / 98 / Me · Windows NT 3.1 / 3.50 / 3.51 / 4.0 · Windows 2000 / XP / Server 2003 (x86) · Windows XP x64 / Server 2003 x64 · Windows Vista / 7 (x86 tested; x64 with a test signature) |
+| **Hardware** | AHCI SATA host controllers (PCI class code `01-06-01`), up to 32 per system, all 32 ports of each; also AHCI controllers in RAID mode (Intel RST, AMD) for their non-RAID disks, JMicron JMB362B/C, and on NT 3.1–4.0 SATA controllers behind an Intel VMD |
 | **Devices** | SATA disks (48-bit LBA, 512-byte to 4 KB logical sectors, SSDs with TRIM), ATAPI CD/DVD drives and removable ATAPI disks, disks behind port multipliers |
 | **Binaries** | `ahcint9x.mpd` (Windows 9x/Me) · `ahcint.sys` (NT 3.1–4.0) · `ahcint.sys` (2000/XP/2003, x86 and x64) · `ahcicfg.exe` (port program, NT 3.1–4.0 and 9x/Me) |
 
@@ -14,11 +14,11 @@
 
 - **Install and boot** on every target: F6 / OEM driver disks for text-mode setup from NT 3.1 to XP x64, Have Disk for installed systems, Device Manager on Windows 9x
 - **Every command completed by interrupt** on every target (NT 3.1 and 9x included), **NCQ** with up to 32 queued commands per port, and an automatic fallback to Fast Polling where interrupts do not arrive
-- **512 KB per request** on 2000/XP/x64, **link power management** (HIPM/DIPM Partial, DevSleep) on by default where HBA and disk have it, and a **spin-down timer** on request
+- **512 KB per request** on NT 3.1–4.0 and 2000/XP/x64, **link power management** (HIPM/DIPM Partial, DevSleep) on by default where HBA and disk have it, and a **spin-down timer** on request
 - **TRIM** for SSDs (SCSI UNMAP as ATA DATA SET MANAGEMENT), plus `tools\trimnt.exe` to trim the free space of a volume on systems that never send TRIM
 - **Port multipliers**, ATAPI optical drives, 48-bit LBA, 16-byte CDBs and logical sectors up to 4 KB on every target
 - **Up to 32 ports per controller and 32 controllers**, and single ports (or devices behind a port multiplier) can be turned off with `OFF=`
-- **SMART** through the `atapi.sys`-compatible "SCSIDISK" IOCTL, ATA PASS-THROUGH, and LOG SENSE health and temperature pages
+- **SMART** through the `atapi.sys`-compatible "SCSIDISK" IOCTL, ATA PASS-THROUGH (SCSI, and `IOCTL_ATA_PASS_THROUGH` / `IOCTL_IDE_PASS_THROUGH` on `\\.\PhysicalDriveN` for CrystalDiskInfo on 2000/XP/x64), and LOG SENSE health and temperature pages
 - **Power management**: flush at shutdown (standby with `STANDBY=1`), hibernation and crash dumps on 2000/XP, a power-down IOCTL for NT 3.1–4.0 and 9x
 - **One source tree** for all targets; the differences are a handful of `#ifdef`s
 
@@ -85,6 +85,13 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
 
 - **Port multipliers** — command-based switching; every device behind the multiplier is a LUN of its port; see [Port multipliers](#port-multipliers)
 
+- **Controllers outside the AHCI class code** (after Linux `drivers/ata/ahci.c`); see [RAID mode and Intel VMD](#raid-mode-and-intel-vmd)
+  - AHCI controllers in RAID mode or with another storage class code, by the 306 device IDs of Linux's `ahci` driver (Intel RST, AMD, NVIDIA, ATI, VIA, SiS, Marvell, ASMedia, JMicron and others), any AMD controller of the RAID class, and Intel RAID controllers with a Dell subsystem (S140/S150); the ABAR must hold an AHCI register set (version 0.95 to 1.3.1, at least one port)
+  - Disks that belong to a RAID volume (Intel RST/IMSM metadata in the second-to-last sector, SNIA DDF anchor in the last) are not shown, so a volume is never written through one of its members; the other disks are plain disks. `RAIDDISKS=1` shows the members too
+  - JMicron JMB362B/C: the AHCI function that carries the IDE class code is taken (IDENT leaves it alone)
+  - Intel VMD (NT 3.1–4.0): a SATA controller in the VMD's own PCI domain is found and driven in Fast Polling; the domain is shared with NVMENT
+  - NT 3.5x/4.0 find every AHCI controller of the system (before: only the first of a PCI bus)
+
 - **Power management** — flush at system shutdown (`SRB_FUNCTION_SHUTDOWN`, STANDBY IMMEDIATE too with `STANDBY=1`), flush and STANDBY IMMEDIATE on power transitions, `HwAdapterControl` (stop/restart) on 2000/XP, hibernation and crash dump support, automatic re-initialization when the HBA lost its state (sleep, BIOS, another driver), and a power-down/up IOCTL for an ACPI driver on NT 3.1–4.0 and 9x; see [Power management](#power-management)
 
 ## Architecture
@@ -110,7 +117,7 @@ Because plenty of real hardware only exposes its SATA ports in AHCI mode, and 9x
 - **src\ahcimain.c** – Driver entry, PCI discovery (with bus-scan fallback), DMA arena, adapter/port initialization and re-initialization, port multiplier enumeration, `HwStartIo`, `HwInterrupt`, `HwResetBus`, `HwAdapterControl`, the NCQ interrupt watchdog; on 9X also `HwAdapterState`, the `_MapPhysToLinear` ABAR mapping and the VMM debug-print helper
 - **src\ahcicmd.c** – The command engine: port start/stop/COMRESET, PRDT construction, the Fast Polling path, software reset, port multiplier register access, NCQ issue/completion/error recovery
 - **src\ahcisatl.c** – SCSI command dispatch, SCSI↔ATA/ATAPI translation, 28/48-bit command selection, INQUIRY/READ CAPACITY/MODE SENSE/MODE SELECT, ATA PASS-THROUGH, sense handling, the IOCTL interface (SMART, power)
-- **src\ahcipdo.c** – 2000/XP/x64 only: the `IRP_MJ_DEVICE_CONTROL` front end that passes the SMART requests of `disk.sys` on to the miniport (see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics))
+- **src\ahcipdo.c** – 2000/XP/x64 only: the `IRP_MJ_DEVICE_CONTROL` front end that passes the SMART requests of `disk.sys` and `IOCTL_ATA_PASS_THROUGH` / `IOCTL_IDE_PASS_THROUGH` on a disk on to the miniport (see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics))
 - **src\ahcint.h** – Target switches (`AHCI_W9X`, `AHCI_NT4`), AHCI register layout, command/FIS structures, device extension, shared constants
 - **src\9X\** – `build.bat`, NMAKE `makefile` (includes the DDK's `MASTER.MK`) and `ahcint9x.lnk` for Windows 9x/Me
 - **src\NT\** – `build.bat` for NT 3.1/3.50/3.51/4.0
@@ -148,14 +155,17 @@ All targets compile the same four files in `src\` (2000/XP/x64 also `ahcipdo.c`)
 | Hot-plug | Off; `HOTPLUG=1` turns it on (as on NT 3.1–4.0; not tested on 9x) | On by default (`HOTPLUG=0` turns it off). A disk plugged in again on its port is usable again; Windows is not told of disks that come or go | On by default (`HOTPLUG=0` turns it off). Disks come and go in the system (`BusChangeDetected`) |
 | PRDT entries per command | 40 (33 at most in use: 32 physical breaks) | 40 | 136 (129 at most in use: 128 physical breaks); 40 in the dump stack |
 | DMA arena size | Sized at run time: per port 3.5 KB plus one 768-byte command table per NCQ tag, at most 160 KB in all (see [Memory Allocation](#memory-allocation)) | Same | Same with 2304-byte command tables, at most 512 KB |
-| Max transfer size per I/O | 128 KB | 128 KB | 512 KB (128 KB with `MAXXFER=128` and in the dump stack) |
+| Max transfer size per I/O | 128 KB | 512 KB (128 KB with `MAXXFER=128`) | 512 KB (128 KB with `MAXXFER=128` and in the dump stack) |
 | Debug output | VMM `_Debug_Printf_Service` (`DEBUG=1` builds), prefix `[ahcint9x]` | `DbgPrint`, prefix `[AHCINT]` | `DbgPrint`, prefix `[AHCINT]` |
 
 ## Known Limitations
 
+- Windows Vista and later: tested on Windows Vista SP2 x86 and Windows 7 SP1 x86 (as a data and as the boot controller, with hibernation and crash dumps); Windows 10 x64 testing was not finished; the x64 build needs test mode there (`bcdedit /set testsigning on`); Windows 8 and later were not tested
 - No MSI/MSI-X; interrupts use the legacy INTx line
+- RAID volumes are not supported: in RAID mode the driver takes the disks that belong to no volume and hides the members (see [RAID mode and Intel VMD](#raid-mode-and-intel-vmd))
+- Intel VMD: on 2000/XP/x64 and 9x the VMD device belongs to NVMENT, so a SATA controller behind a VMD is reached on NT 3.1–4.0 only; there it runs in Fast Polling (the VMD domain has no INTx)
 - Commands the driver issues itself (IDENTIFY, set-up after a reset, SMART through the IOCTL, the ATAPI REQUEST SENSE / MODE SENSE translation, a FUA write followed by a flush) and the crash dump stack use Fast Polling (see [I/O Model](#io-model))
-- 128 KB per request on NT 3.1–4.0 and 9x (their contiguous memory for larger command tables is scarcer); 512 KB on 2000/XP/x64
+- 128 KB per request on 9x; 512 KB on NT 3.1–4.0 and 2000/XP/x64. NT 3.1–4.0 keep the 160 KB DMA arena (their contiguous memory is scarcer), so an HBA with more than two ports gets fewer NCQ tags per port there (16 with 4 ports, 10 with 6, at least 8)
 - Hot-plug: NT 3.1–4.0 and 9x are not told of a disk that comes or goes, devices behind a port multiplier are not followed one by one, and on 9x it is off unless `HOTPLUG=1` (see [Hot plug](#hot-plug))
 - No FIS-based switching for port multipliers and no NCQ behind a port multiplier; the multiplier's own hot-plug notification (`PxIS.PCS`/SDB "N" bit) is not used
 - Link power management and DevSleep (on by default, `ALPM=0` / `DEVSLP=0` turn them off) were run against a QEMU patched to report them, not on real hardware; see [Power management](#power-management)
@@ -325,6 +335,14 @@ Use `bin\2KXP\ahcint.inf` with **"Have Disk"** during a manual driver install. T
 
 Copy the contents of `bin\2KXP\floppy_i386\` (x86) or `bin\2KXP\floppy_amd64\` (x64) onto a floppy disk (or a virtual floppy image for VM installs), press **F6** at the start of text-mode setup, and select **AHCINT SATA AHCI Storage Controller (ages2001)** — or **AHCINT SATA AHCI Storage Controller x64 (ages2001)** on x64. Required whenever the install disk itself sits behind the AHCI controller.
 
+#### Windows Vista / 7 and later
+
+The 2000/XP files in `bin\2KXP` also run on Windows Vista and Windows 7 (ScsiPort is still part of them); tested on Windows Vista SP2 x86 and Windows 7 SP1 x86. Windows 8, 8.1, 10 and 11 were not tested.
+
+- **x86:** Device Manager → the controller → **Update Driver Software** → **Browse my computer** → **Let me pick** → **Have Disk**, `bin\2KXP\ahcint.inf`, and confirm *Install this driver software anyway*. For a controller without a driver, `pnputil -i -a ahcint.inf` from an administrator prompt installs it as well on Windows 7 (not on Vista, whose pnputil leaves such a device alone: use Device Manager there). Windows' own signed driver (msahci (Vista/7) or storahci (8 and later)) is preferred by Windows, so the driver has to be picked explicitly.
+- **x64:** 64-bit Vista and later load only signed kernel drivers. The `amd64` driver carries a test signature (SHA-1, certificate `bin\2KXP\ages2001test.cer`); turn test mode on with `bcdedit /set testsigning on` from an administrator prompt and restart, then install as on x86. Without test mode Windows refuses to load it.
+- Windows Vista and later take a disk offline whose MBR disk signature equals that of another disk (for example two copies of one image); `diskpart`'s `online disk` brings it back. That is not the driver.
+
 #### Windows NT 3.1 / 3.50 / 3.51 / NT 4.0
 
 NT uses the older OEM Setup mechanism (`oemsetup.inf`) rather than a standard `.inf`/`.cat` pair. Use **"Have Disk"** during setup (GUI-mode) or the equivalent F6 OEM prompt (text-mode), point it at `bin\NT\floppy\`, and select **AHCINT SATA AHCI Storage Controller (ages2001)**.
@@ -352,13 +370,15 @@ On the NT family the driver reads the ScsiPort argument string, the `REG_SZ` val
 | Value | Effect |
 |---|---|
 | `NCQ=0` | No NCQ: disk reads and writes go one at a time in slot 0, still completed by interrupt |
-| `MAXXFER=128` | 2000/XP/x64: 128 KB per request (40-entry command tables, a smaller DMA arena) instead of 512 KB |
+| `MAXXFER=128` | NT 3.1–4.0, 2000/XP/x64: 128 KB per request (40-entry command tables, a smaller DMA arena or more NCQ tags per port within it) instead of 512 KB |
 | `ALPM=0` / `ALPM=2` | Aggressive link power management (`PxCMD.ALPE`), on by default: an idle link goes to Partial (`ALPM=2`: Slumber), and device-initiated power management is turned on where the disk has it; a command wakes the link. Only where the HBA reports `CAP.SALP` and the state and the disk takes host-initiated requests (IDENTIFY word 76 bit 9); not with a port multiplier. `ALPM=0` turns it off |
 | `DEVSLP=0` | DevSleep after 1 s without commands, on by default where the HBA (`CAP2.SDS` and `SADM`), the port (`PxDEVSLP.DSP`) and the disk (IDENTIFY word 78 bit 8) have it; `DEVSLP=0` turns it off |
 | `SPINDOWN=n` | The disk's own standby timer (IDLE with a count): it spins down after `n` idle minutes (1–20 in whole minutes, up to 330 in 30-minute steps) on any Windows version; not sent to disks that report no rotation (SSDs) |
-| `STANDBY=1` | STANDBY IMMEDIATE after the flush at system shutdown (the default up to 1.5.0.0; off since 1.6.0.0, see [Power management](#power-management)) |
+| `STANDBY=1` | STANDBY IMMEDIATE after the flush at system shutdown (the default up to 1.5; off since 1.6, see [Power management](#power-management)) |
 | `TRIM=0` | No UNMAP and no TRIM mode: VPD B2h and READ CAPACITY(16) report no logical block provisioning |
 | `OFF=list` | Ports the driver leaves alone, separated by commas: `OFF=2,5` turns off ports 2 and 5 of every controller; `p.m` a device behind the port multiplier on port `p` (PM port `m`); a PCI location `bus.device.function:` in front (decimal, as Device Manager shows it) limits an item to one controller: `OFF=0.31.2:4`. A port turned off gets no command and no COMRESET; its DMA engines are stopped and its interrupts disabled (the BIOS may have left them running) |
+| `RAIDDISKS=1` | A controller in RAID mode: also the disks that carry RAID metadata (Intel IMSM, SNIA DDF), which are hidden by default. Only for a disk taken out of its volume; writing to a member of a working volume damages the volume |
+| `VMD=0` | NT 3.1–4.0: no SATA controllers behind an Intel VMD |
 | `IRQ=0` | No interrupt at all: every command is Fast Polling and NCQ is off (for a machine whose interrupt routing is wrong; the watchdog would get there on its own after five missed interrupts; see [Interrupt check](#interrupt-check-nt-35x40)) |
 | `RC16=1` / `RC16=0` | READ CAPACITY(10) reports `FFFFFFFFh` for a disk of 2 TB or more (`RC16=1`, for a class driver or filter that then reads READ CAPACITY(16)), or `FFFFFFFEh` (`RC16=0`); the default depends on the Windows version, see [Disks of 2 TB and more](#disks-of-2-tb-and-more) |
 | `4K=1` | A disk of 2 TB or more with 512-byte sectors is shown with 4096-byte blocks (eight sectors each), so the systems that address 32-bit block numbers (NT 3.1–4.0, 9x, 2000, XP x86) reach up to 16 TB of it instead of the first 2 TB. For data disks partitioned after the switch; see [Disks of 2 TB and more](#disks-of-2-tb-and-more) |
@@ -447,7 +467,7 @@ Without a multiplier the device answers the reset to port 15 with its own signat
 
 ### Power management
 
-- **Shutdown and flush:** `SRB_FUNCTION_FLUSH` issues FLUSH CACHE (EXT) to every disk of the target (only when the write cache is present); SYNCHRONIZE CACHE does the same for one disk. `SRB_FUNCTION_SHUTDOWN` flushes every disk of the target; with `STANDBY=1` it then sends STANDBY IMMEDIATE, so the disk parks its heads (or an SSD saves its tables) before the power goes instead of an emergency power-off. Off by default: 1.4.0.0 sent nothing at shutdown, and the reported hang at shutdown on XP x64 came with 1.5.0.0. The driver declares `CachesData`, without which ScsiPort passes neither request.
+- **Shutdown and flush:** `SRB_FUNCTION_FLUSH` issues FLUSH CACHE (EXT) to every disk of the target (only when the write cache is present); SYNCHRONIZE CACHE does the same for one disk. `SRB_FUNCTION_SHUTDOWN` flushes every disk of the target; with `STANDBY=1` it then sends STANDBY IMMEDIATE, so the disk parks its heads (or an SSD saves its tables) before the power goes instead of an emergency power-off. Off by default: 1.4 sent nothing at shutdown, and the reported hang at shutdown on XP x64 came with 1.5. The driver declares `CachesData`, without which ScsiPort passes neither request.
 - **START STOP UNIT:** stop = flush, then STANDBY IMMEDIATE; start = IDLE IMMEDIATE. The next read or write spins the disk up again.
 - **Windows 2000/XP/x64 — `HwAdapterControl`:** `ScsiStopAdapter` (sleep, hibernation, device removal) drains the queues, flushes and puts the disks in standby, stops the ports and disables the interrupts; `ScsiRestartAdapter` sets the HBA up again: ports, devices behind port multipliers, the MODE SELECT settings (write cache, look-ahead).
 - **Hibernation and crash dump (2000/XP/x64):** the dump stack loads the miniport a second time without a driver object (or with `DUMP=` in the argument string). That instance uses Fast Polling only, no queued requests and no port multiplier enumeration, and keeps its device extension small (see [Build-time limits](#build-time-limits)). It maps the ABAR with the length the running driver mapped (the dump stack hands out only those mappings) and sets up the ports that have a link, so the system disk can be on any port, also above 7. Tested on Windows 2000 and XP x64 (two hibernation cycles each). S3/S4 need every device to agree; a VGA adapter without a driver (VgaSave) vetoes them, which has nothing to do with AHCINT; under QEMU, `-vga cirrus` with the in-box Cirrus Logic 5446 driver (Windows 2000) or the in-box *Standard VGA Graphics Adapter* (`display.inf`, `vgapnp.sys`) on the std VGA (XP x64, installed by hand when Windows did not pick it) lets S4 through.
@@ -478,6 +498,7 @@ Both are `IOCTL_SCSI_MINIPORT` requests (an `SRB_IO_CONTROL` header followed by 
 | `"AHCINT  "` | `2` GET_LOCATION | Returns a `ULONG`: the controller's PCI location, bus in bits 31:16, device in 15:8, function in 7:0 (for the port program on NT 3.1–4.0) |
 | `"AHCINT  "` | `20h` TRIM_MODE_ON | A 4 KB pattern follows the header: from now on a write whose data is that pattern repeated is not written but trimmed (see [TRIM](#trim)) |
 | `"AHCINT  "` | `21h` TRIM_MODE_OFF | Back to normal writes |
+| `"AHCINT  "` | `22h` TRIM_STATUS | `AHCI_TRIM_STATUS` after the header: in the path, target and LUN of a disk; out whether it is there (bit 0), whether its pattern writes become TRIMs (bit 1) and whether the mode is on (bit 2), its block size, and the bytes the adapter trimmed and wrote as data (pattern writes to a disk without TRIM) since `TRIM_MODE_ON` |
 | `"AHCINT  "` | `10h` POWER_DOWN | Drain, flush, STANDBY IMMEDIATE on every disk, stop all ports, disable interrupts. GET_INFO does not wake the HBA; any other request does |
 | `"AHCINT  "` | `11h` POWER_UP | Set the HBA up again (as after `ScsiRestartAdapter`) |
 | `"SCSIDISK"` | `1B0500h`–`1B050Ch` | SMART, as `IOCTL_SCSI_MINIPORT_SMART_VERSION` ... `_WRITE_LOG` (`NTDDSCSI.H`): IDENTIFY, READ ATTRIBUTES/THRESHOLDS, ENABLE/DISABLE, RETURN STATUS, AUTOSAVE, SAVE ATTRIBUTES, OFFLINE DIAGS, READ/WRITE LOG. `bDriveNumber` is the port; the device map in SMART_VERSION follows `atapi.sys` (bit n ATA, bit n+4 ATAPI, ports 0–3) |
@@ -487,7 +508,7 @@ The structures are in `src\ahcint.h` (`AHCI_SRB_IO_CONTROL`, `AHCI_IOCTL_INFO`, 
 ### TRIM
 
 - **UNMAP:** every block descriptor becomes TRIM ranges of DATA SET MANAGEMENT (06h, 48-bit DMA, up to 65535 blocks per range, 64 ranges per 512-byte block); the command is issued like FLUSH (not queued). Offered only on devices whose IDENTIFY word 169 bit 0 reports TRIM; VPD B0h gives 64 descriptors and the maximum LBA count, VPD B2h LBPU. LBPRZ (zeroes after TRIM) follows IDENTIFY word 69 bits 14 and 5.
-- **TRIM mode:** Windows versions before 7 never send TRIM. `TRIM_MODE_ON` gives the driver a 4 KB pattern; while the mode is on, a write whose data is that pattern repeated over the whole request is trimmed instead of written. `tools\trimnt.exe <drive letter>` switches the mode on with a random pattern on every AHCINT, IDENT, MMCSDNT and NVMENT adapter, fills the free space of the volume with files of the pattern (unbuffered, write-through), switches the mode off and deletes the files. Other writes are written normally all the time.
+- **TRIM mode:** Windows versions before 7 never send TRIM. `TRIM_MODE_ON` gives the driver a 4 KB pattern; while the mode is on, a write whose data is that pattern repeated from its first byte is trimmed instead of written. Any length counts: a file system splits a write where the free space is fragmented, and every piece of the 512-byte-periodic pattern still matches. On a disk that cannot TRIM (no DATA SET MANAGEMENT TRIM, or `TRIM=0`) the pattern writes are written and counted. `tools\trimnt.exe <drive letter>` finds the disk the volume is on (`IOCTL_SCSI_GET_ADDRESS` through the file system), asks its driver with `TRIM_STATUS` whether that disk takes TRIM (and stops with a message when it does not), switches the mode on with a random pattern (512 random bytes repeated to 4 KB) on that adapter, fills the free space of the volume with files of the pattern in a `TRIMNT.TMP` directory (unbuffered and write-through, so every write reaches the driver), shows the free space before, the amount filled and the amount the driver trimmed, switches the mode off and deletes the files. A full volume (`ERROR_DISK_FULL`, error 112) is the normal end of the fill, not an error. When the disk of the volume cannot be found (a volume set, an older system) the mode goes on on every AHCINT, IDENT, MMCSDNT and NVMENT adapter, as before. Ctrl+C stops it early; the mode is switched off and the files deleted as usual. Other writes are written normally all the time.
 
 ### ATA command selection
 
@@ -526,7 +547,7 @@ NT 3.1's ScsiPort and HAL predate PCI support in non-PnP miniports. The NT build
 - **PCI configuration space:** NT 3.1's `HalGetBusData` only knows CMOS and EISA data, so `ScsiPortGetBusData(PCIConfiguration)` returns nothing. The driver then uses configuration mechanism #1 (ports `CF8h`/`CFCh`) for the bus scan. `ScsiPortSetBusDataByOffset` does not exist on NT 3.1, so on the whole NT build the PCI command register is written through the same ports, and only when the BIOS left memory space or bus mastering off.
 - **`PORT_CONFIGURATION_INFORMATION`:** 58h bytes on NT 3.1, without `SlotNumber` and `MaximumNumberOfTargets` (the access ranges follow right after it). The driver checks `ConfigInfo->Length` before touching those fields.
 - **DMA:** NT 3.1's HAL gives an ISA bus master map registers below 16 MB in every case (it ignores `Dma32BitAddresses`), so with more RAM every transfer is bounced, and the copy-back overwrites the data the SATL itself writes into the request (INQUIRY, READ CAPACITY, ...): scsidisk sees garbage and the boot ends in `0x7B`. Before taking the uncached extension the driver therefore reports `Eisa` as the interface type; the HAL gives a scatter/gather master on EISA no map registers, and the HBA sees real physical addresses. Tested up to 3 GB RAM.
-- **Interrupt:** NT 3.1 has no PCI bus, so ScsiPort does not look up the HBA's interrupt; the driver reports the INTx line from config space (level-sensitive, on the EISA bus it already reports for DMA). If the adapter then fails to start (a line another driver holds without sharing it), `DriverEntry` calls `ScsiPortInitialize` once more without the interrupt, and the HBA runs with Fast Polling; if the interrupts do not arrive, the watchdog goes back to Fast Polling (see [NCQ](#ncq)). `IRQ=0` leaves the line out from the start. (Up to 1.7.0.0 the interrupt was opt-in with `NCQ=1`.)
+- **Interrupt:** NT 3.1 has no PCI bus, so ScsiPort does not look up the HBA's interrupt; the driver reports the INTx line from config space (level-sensitive, on the EISA bus it already reports for DMA). If the adapter then fails to start (a line another driver holds without sharing it), `DriverEntry` calls `ScsiPortInitialize` once more without the interrupt, and the HBA runs with Fast Polling; if the interrupts do not arrive, the watchdog goes back to Fast Polling (see [NCQ](#ncq)). `IRQ=0` leaves the line out from the start. (Up to 1.7 the interrupt was opt-in with `NCQ=1`.)
 - **Several controllers:** each HBA asks to be called again (`*Again = TRUE`); the next call scans for the next unclaimed HBA.
 
 ### Interrupt check (NT 3.5x/4.0)
@@ -548,6 +569,7 @@ The choice is made once at load time: the NT and 9x builds always clip; the 2000
 ### Windows 2000/XP/x64 specifics
 
 - **SMART through the disk:** `disk.sys` sends `SMART_GET_VERSION`, `SMART_RCV_DRIVE_DATA` and `SMART_SEND_DRIVE_COMMAND` (and its own failure prediction) as `IOCTL_SCSI_MINIPORT` to the disk's PDO. The ScsiPort of XP x64 / Server 2003 SP1 x64 (5.2.3790.1830; the XP and Server 2003 x86 ScsiPorts were not examined, the Windows 2000 one passes it on) accepts that IOCTL only on the adapter's device object and answers it on a PDO with `STATUS_INVALID_DEVICE_REQUEST`, so `\\.\PhysicalDriveN` had no SMART there (`\\.\ScsiN:` had). `DriverEntry` installs a front end on `IRP_MJ_DEVICE_CONTROL` (`src\ahcipdo.c`): an `IOCTL_SCSI_MINIPORT` on a PDO (any device object of the driver that is not `FILE_DEVICE_CONTROLLER`) at `PASSIVE_LEVEL` is sent through that PDO as the `SRB_FUNCTION_IO_CONTROL` request ScsiPort builds for the adapter (with an MDL for the buffer), and ScsiPort puts the disk's address into it. The miniport sees the same request on every 2000/XP version.
+- **ATA PASS-THROUGH through the disk:** CrystalDiskInfo and other SMART tools send `IOCTL_ATA_PASS_THROUGH` (older ones `IOCTL_IDE_PASS_THROUGH`) to `\\.\PhysicalDriveN`. `disk.sys` passes both on to the PDO unchanged, and ScsiPort knows neither (Windows XP sends them only to an ATA port driver, Windows 2000 has no ATA pass-through at all), so tools fell back to other paths or showed no SMART. The front end (`src\ahcipdo.c`) sends the command through the PDO as SCSI ATA PASS-THROUGH (16) with CK_COND, which the miniport's SAT layer carries out, and returns the result registers from the sense data (`CurrentTaskFile`, for 48-bit commands also `PreviousTaskFile`): PIO, DMA and non-data commands with up to 128 KB of data, 32-bit callers on XP x64 (WOW64) included. An ATA error completes the IOCTL with success and ERR in the returned status, as the ATA port driver does. `IOCTL_ATA_PASS_THROUGH_DIRECT` stays unsupported.
 - **Text-mode setup (F6):** the setup kernel boots with a bare `AHCINT` service key; the `[Config.scsi.AHCINT]` values of `txtsetup.oem` are written only to the installed system. Without `Parameters\PnpInterface\5`, the XP x64 / Server 2003 x64 ScsiPort fails `IRP_MN_START_DEVICE` before `HwFindAdapter` is called, so setup stops with STOP 0x7B (the x86 ScsiPort tolerates the missing value). `DriverEntry` therefore creates `Parameters\PnpInterface\5 = 1` under its service key when the `PnpInterface` key does not exist yet, before `ScsiPortInitialize`. An existing key is left as it is. Both F6 `txtsetup.oem` files also set the value in `[Config.scsi.AHCINT]`, so a system installed through F6 gets it from setup as well.
 
 ### Command timeout
@@ -574,15 +596,37 @@ When a command does time out, the port restart issues a COMRESET if the command 
 
 The 2000/XP x86 and XP x64/Server 2003 x64 drivers differ only in the build environment; there are no architecture-specific code paths.
 
+### RAID mode and Intel VMD
+
+A controller in RAID mode (Intel RST, AMD RAIDXpert and others) is an AHCI controller with another class code (`01-04`, sometimes `01-80` or `01-06` with prog-if 0). The driver takes it by its device ID, as Linux's `ahci` driver does: `g_AhciKnownIds` holds the 306 IDs of that driver, sorted, and any AMD function of the RAID class and an Intel RAID function with a Dell subsystem (S140/S150) are taken too. A function taken by ID must show an AHCI register set behind its ABAR, or it is left alone. The INF files list the IDs with the class codes `01-04`, `01-06` and `01-80` (`PCI\VEN_v&DEV_d&CC_ccss`, which Windows 2000 and later generate), so that a function in IDE mode with the same ID stays with the IDE driver; the 9x INF lists the IDs alone, without those IDs that the same chip uses in IDE mode (ATI SB600/SB700, AMD Hudson/FCH).
+
+RAID volumes themselves are firmware RAID (the BIOS and the vendor's driver keep them); this driver does not assemble them. A disk that carries RAID metadata — Intel IMSM (`Intel Raid ISM Cfg Sig.` in the second-to-last sector, with at least one volume) or SNIA DDF (anchor `DE11DE11` in the last sector) — is not shown, so a volume is never written through one of its members. The other disks of the controller are plain disks. `RAIDDISKS=1` shows the members as well.
+
+With **Intel VMD** on (RST "VMD controller", 11th generation Core and later), the SATA controller and the NVMe root ports can move into the VMD's own PCI domain, which the firmware and the HAL do not see. On NT 3.1–4.0 the driver looks there after the ordinary PCI scan: it reads the VMD's BARs (CFGBAR, MEMBAR1, MEMBAR2), its bus restriction (VMCONFIG bits 9:8: first bus 0, 128 or 224) and, for a pass-through guest, the shadow registers, keeps the firmware's bus numbers and windows when the controllers are reachable through them, and otherwise lays the domain out itself (buses depth-first, BARs upwards from MEMBAR1, bridge windows on 1 MB). The same code (`src\vmdcore.h`) is in NVMENT, so both drivers lay a domain out the same way, whichever starts first. The domain has no INTx, so the controller runs in Fast Polling. On 2000/XP/x64 and 9x the VMD is one PnP device and belongs to NVMENT; a SATA controller behind it is not reached there.
+
 ### Memory Allocation
 
-- **DMA arena** – one uncached allocation per controller, sized in `HwFindAdapter` for the ports `PI` reports (without those turned off with `OFF=`): per port a 1 KB command list, a 256-byte received-FIS area, a 512-byte bounce buffer and one command table per slot (one without NCQ, one per NCQ tag), plus alignment. Command tables are 768 bytes (40 PRDs) on NT 3.1–4.0, 9x and in the dump stack: with 6 ports 22 KB without NCQ and 157 KB with 31 tags, kept within 160 KB (`AHCI_DMA_BUDGET`) by reducing the tags per port. On 2000/XP/x64 they are 2304 bytes (136 PRDs): 450 KB with 6 ports and 32 tags, kept within 512 KB (`AHCI_DMA_BUDGET_LARGE`)
+- **DMA arena** – one uncached allocation per controller, sized in `HwFindAdapter` for the ports `PI` reports (without those turned off with `OFF=`): per port a 1 KB command list, a 256-byte received-FIS area, a 512-byte bounce buffer and one command table per slot (one without NCQ, one per NCQ tag), plus alignment. Command tables are 768 bytes (40 PRDs) on 9x, in the dump stack and with `MAXXFER=128`: with 6 ports 22 KB without NCQ and 157 KB with 31 tags, kept within 160 KB (`AHCI_DMA_BUDGET`) by reducing the tags per port. Otherwise they are 2304 bytes (136 PRDs): on 2000/XP/x64 450 KB with 6 ports and 32 tags, kept within 512 KB (`AHCI_DMA_BUDGET_LARGE`); on NT 3.1–4.0 kept within the 160 KB budget (one or two ports keep 32 tags, 4 ports get 16, 6 ports 10)
 - **PRDT** – ScsiPort is told 32 physical breaks and 128 KB per I/O with 40-entry tables, 128 breaks and 512 KB with 136-entry tables, so an unaligned buffer of the full size (33 or 129 pages) still fits. A disk without 48-bit LBA gets a request of more than 256 sectors in pieces
 - **Bounce buffer** – 512 bytes per port in the DMA arena, used for IDENTIFY, READ LOG EXT and the ATAPI REQUEST SENSE / MODE SENSE commands the driver issues itself
 
 ## Version history
 
-### 1.7.0.0 — 2026-11-02
+### 1.8 — 2026-11-09
+
+- Windows Vista and 7: the 2000/XP driver installs and runs there (Windows 7 SP1 x86: the second AHCI controller (ICH8M ID) with a disk, files read through the driver). The amd64 driver carries a test signature for 64-bit Vista and later in test mode (`bin\2KXP\ages2001test.cer`). See [Windows Vista / 7 and later](#windows-vista--7-and-later).
+- Windows 9x (AHCINT GitHub issue #4, data corruption): a data buffer at an odd address reached the PRD table as it was. AHCI requires an even address and an even byte count in every PRD entry (DBA bit 0 reserved, DBC bit 0 set); the controller rounded the address down and the transfer was off by one byte. `SCSIPORT.PDR` ignores the miniport's `AlignmentMask`, so such buffers do arrive (the NT family's ScsiPort aligns them). A request with an odd buffer now goes through a 64 KB bounce buffer in the DMA arena, in pieces of up to 64 KB, copied in for writes and back for reads; the 2000/XP/x64 and NT builds ask ScsiPort for even buffers (`AlignmentMask = 1`). Tested on Windows 95 with a QEMU HBA that checks every PRD entry: 46 violations before, none after, file data identical.
+- RAID mode: controllers in RAID mode (Intel RST, AMD and others) by the 306 device IDs of Linux's `ahci` driver, any AMD function of the RAID class, Intel RAID functions with a Dell subsystem; disks with Intel IMSM or SNIA DDF RAID metadata are hidden (`RAIDDISKS=1` shows them). The INF files and the text-mode `txtsetup.oem` list the IDs with their class codes. JMicron JMB362B/C: the AHCI function with the IDE class code is taken. See [RAID mode and Intel VMD](#raid-mode-and-intel-vmd).
+- NT 3.5x/4.0: only the first AHCI controller of a PCI bus was found (ScsiPort calls the driver once per bus unless asked again). The driver now asks to be called again after a controller found by its own scan, and every controller is found.
+- Intel VMD on NT 3.1–4.0: SATA controllers in the VMD's domain, Fast Polling (`VMD=0` turns it off).
+- `trimnt` (IDENT GitHub issue #2, "stopped: error 112" under NT 4.0; the tool is shared by the four drivers): a full volume (`ERROR_DISK_FULL`, 112) is reported as the normal end of the fill, with the free space before and the amount the driver actually trimmed. The tool finds the disk of the volume (`IOCTL_SCSI_GET_ADDRESS`), asks the new `TRIM_STATUS` IOCTL whether it takes TRIM (a disk without DATA SET MANAGEMENT TRIM or with `TRIM=0` is reported instead of filled to no effect), switches TRIM mode on only on that adapter, writes into a `TRIMNT.TMP` directory (8.3 names, `TRIM0000.TMP` to `TRIMFFFF.TMP`, so FAT under NT 3.1, which has no long names, works too; the earlier `TRIM00000.TMP` failed there with error 123) and fills the last space cluster by cluster. See [TRIM](#trim).
+- TRIM mode: a pattern write of any length is trimmed (before: at least 4 KB, and only the pieces of a fragmented fill that began on a 4 KB boundary of the pattern); `trimnt`'s pattern repeats every 512 bytes, so every piece the file system makes still matches. Pattern writes to a disk that cannot trim are written and counted. `TRIM_STATUS` (`22h`) returns, for a disk address, whether its pattern writes become TRIMs and the bytes trimmed and written since `TRIM_MODE_ON`.
+- 512 KB per request on NT 3.1–4.0 too (128 KB before; 2000/XP/x64 since 1.7), with the 136-entry command tables kept within the 160 KB DMA arena of these systems: one or two ports keep 32 NCQ tags, more ports get fewer (16 with 4 ports, 10 with 6, at least 8). `MAXXFER=128` brings back 128 KB and the smaller tables; 9x keeps 128 KB.
+- CrystalDiskInfo and other SMART tools: `IOCTL_ATA_PASS_THROUGH` and `IOCTL_IDE_PASS_THROUGH` to `\\.\PhysicalDriveN` work on 2000, XP and XP x64 (32- and 64-bit callers): the front end on `IRP_MJ_DEVICE_CONTROL` sends them through the disk's PDO as ATA PASS-THROUGH (16) and returns the result registers, since ScsiPort knows neither IOCTL. See [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics).
+- NT family: the driver marks its own service key with `NotInboxDriver = 1` (REG_DWORD) at every start. IDENT 1.3, which turns the in-box `atdisk` and `atapi` off on NT 3.1–4.0, leaves an `atapi` service with that value alone, so this driver copied over `atapi.sys` (with the system disk on it) is not switched off when IDENT is installed next to it (IDENT 1.2 did that; on NT 3.51 the next boot stopped with `0x7B`).
+- Windows 9x: the 9x loader does not clear a driver's uninitialized data (found in IDENT, GitHub pull request #3 there). `DriverEntry` of the 9x build now clears every global it reads before setting it, and the MinGW build of the `.mpd` keeps no uninitialized section (`.bss` goes into `.data`, zeros in the file).
+
+### 1.7 — 2026-11-02
 
 - XP x64: SMART through `\\.\PhysicalDriveN` (`disk.sys`), which that ScsiPort refused on the disk's PDO; see [Windows 2000/XP/x64 specifics](#windows-2000xpx64-specifics).
 - `4K=1`: a disk of 2 TB or more with 512-byte sectors is shown with 4096-byte blocks, so NT 3.1–4.0, 9x, 2000 and XP x86, which address 32-bit block numbers, reach up to 16 TB of it instead of the first 2 TB. Opt-in, for data disks partitioned after the switch; see [Disks of 2 TB and more](#disks-of-2-tb-and-more).
@@ -601,19 +645,19 @@ The 2000/XP x86 and XP x64/Server 2003 x64 drivers differ only in the build envi
 - SMART through the "SCSIDISK" IOCTL: sent to a disk (`\\.\PhysicalDriveN`) it reaches that disk also on ports 8–31 and behind a port multiplier (`disk.sys` puts the disk's TargetId into `bDriveNumber`, which pointed to the wrong port above 7); through the adapter, bit 7 set selects LUN (bits 3–6) behind a multiplier on ports 0–7.
 - Link power management (HIPM Partial, `ALPM=2` Slumber) and DevSleep, on by default where HBA and disk have them (`ALPM=0`, `DEVSLP=0` turn them off); the link at full power before a shutdown and a power transition. `SPINDOWN=n` (the disk's standby timer) on request.
 
-### 1.6.0.0 — 2026-10-19
+### 1.6 — 2026-10-19
 
 - ATAPI devices other than CD/DVD drives (Iomega ZIP, LS-120/SuperDisk, MO): INQUIRY reported every ATAPI device as a CD-ROM, so a removable ATAPI disk got a CD-ROM drive letter (found with a ZIP 100 on IDENT). The device type now comes from IDENTIFY PACKET DEVICE (word 0 bits 12:8, removable bit 7): such a device is a removable disk. For those, READ(6)/WRITE(6) are sent as READ(10)/WRITE(10), which ATAPI devices understand, and the MODE SENSE(6) translation now keeps the device-specific parameter (write protect of the medium), the block descriptor length and the mode data length, and asks the drive for the whole requested length.
 - Device Manager page (**Ports** tab, `ahcipp.dll`) for 2000/XP/x64: ports turned off with check boxes instead of `OFF=` typed into the registry; installed by `ahcint.inf` and the F6 disks.
 - Windows XP x64 / Server 2003 x64: the HBA registers are read and written through ScsiPort's exported functions, as in the x86 build. The x64 build used inline accesses without a compiler barrier, so the compiler could move accesses to the command lists and received-FIS areas across them. This was the one x64-only difference found while looking into a reported hang at shutdown on XP x64; the hang itself could not be reproduced in QEMU (see `TESTS.TXT`).
-- System shutdown flushes the write cache only, as before NCQ and power management came in: STANDBY IMMEDIATE on `SRB_FUNCTION_SHUTDOWN`, new in 1.5.0.0, is now opt-in (`STANDBY=1`). 1.4.0.0, which sent nothing at shutdown, had no reported hang on XP x64; this is the shutdown-only change between the two.
+- System shutdown flushes the write cache only, as before NCQ and power management came in: STANDBY IMMEDIATE on `SRB_FUNCTION_SHUTDOWN`, new in 1.5, is now opt-in (`STANDBY=1`). 1.4, which sent nothing at shutdown, had no reported hang on XP x64; this is the shutdown-only change between the two.
 - NT 3.50–4.0 with an MPS HAL (GitHub issue #2, NT 3.51 on an X99 board, `0x7B` at boot): when the HAL has no vector for the HBA's interrupt (no MP table entry for it), the driver now runs it with Fast Polling instead of letting ScsiPort fail the adapter. `IRQ=0` turns the interrupt off by hand. See [Interrupt check](#interrupt-check-nt-35x40).
 - All 32 ports of an AHCI controller (8 before) and up to 32 controllers (8 before); ports above 7 are on SCSI buses 1–3, eight per bus, ports 0–7 keep their addresses. Up to 15 devices behind a port multiplier on Windows 2000 and later. Memory and mapping grow only with the ports a controller has; the crash dump / hibernation instance needs less than before (3.4 KB extension).
 - `OFF=` turns off single ports, or devices behind a port multiplier, optionally on one controller only (by its PCI location).
 - Disks of 2 TB and more: READ CAPACITY(10) reported `FFFFFFFFh`, which the class drivers of NT 3.1–4.0, 9x, 2000 and XP x86 turned into a disk of 0 bytes; they now get `FFFFFFFEh` and see the first 2 TB. XP x64 and Server 2003 SP1 and later still get `FFFFFFFFh` and read the full size with READ CAPACITY(16). `RC16=0/1` overrides.
 - An HBA whose registers read all ones (powered off or removed) is no longer set up again: requests fail at once instead of running through the timeouts of a full re-initialization, and flush and shutdown requests complete without commands.
 
-### 1.5.0.0 — 2026-10-12
+### 1.5 — 2026-10-12
 
 - Added NCQ (Native Command Queuing): up to 32 commands per port, completed by interrupt, on Windows NT 3.50 to XP x64 (NT 3.1 with `NCQ=1`). A watchdog falls back to Fast Polling when interrupts are not delivered; `NCQ=0` turns NCQ off.
 - Added port multiplier support: every disk behind a port multiplier is a LUN of its port.
@@ -627,9 +671,9 @@ The 2000/XP x86 and XP x64/Server 2003 x64 drivers differ only in the build envi
 - Fixed a command after a failed command failing as well (stale error status).
 - Fixed the "Files Needed" prompt for `ahcint.sys` in GUI-mode setup after an F6 installation on XP x64 (the F6 disks now carry a flat INF).
 - `oemsetup.inf` now also makes the disk class driver a boot driver on NT 3.1–4.0.
-- Added version information to the driver files (file properties show 1.5.0.0).
+- Added version information to the driver files (file properties show 1.5).
 
-### 1.4.0.0 — 2026-10-02
+### 1.4 — 2026-10-02
 
 - Added Windows NT 3.1 support (the same `ahcint.sys` runs on NT 3.1, 3.50, 3.51 and 4.0).
 - Added support for disks with 1024, 2048 and 4096-byte logical sectors.
@@ -637,26 +681,26 @@ The 2000/XP x86 and XP x64/Server 2003 x64 drivers differ only in the build envi
 - Fixed a race with ScsiPort's request timer on multiprocessor systems.
 - Fixed STOP 0x7B in XP x64 text-mode setup with the driver loaded from the F6 disk.
 
-### 1.3.0.0 — 2026-09-29
+### 1.3 — 2026-09-29
 
 - All targets (Windows 9x, NT and 2000/XP x86/x64) are built from one source tree.
 - Added 16-byte CDBs on every target: READ/WRITE/VERIFY(16), READ CAPACITY(16) and SYNCHRONIZE CACHE(16), for disks past 2 TB.
 - ATA disks report SPC-3 in INQUIRY and their serial number in VPD page 80h.
 - 28-bit commands whenever the request fits; 48-bit commands only on devices that support them.
 
-### 1.2.0.0 — 2026-09-25
+### 1.2 — 2026-09-25
 
 - Added Windows 95, 98 and Me support.
 - Fixed CD/DVD support.
 - Windows 2000 and XP x86 and x64 are built from the same source code.
 
-### 1.1.0.0 — 2026-09-21
+### 1.1 — 2026-09-21
 
 - Fixed 0x0000007B BSOD on the ACPI Uniprocessor and ACPI Multiprocessor HALs of Windows 2000 and XP x86.
 - Added support for up to 8 AHCI controllers.
 - Increased the maximum number of ports from 6 to 8 on NT 3.50, 3.51 and 4.0.
 
-### 1.0.0.0 — 2026-09-16
+### 1.0 — 2026-09-16
 
 - Initial release.
 

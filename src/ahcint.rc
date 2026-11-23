@@ -4,8 +4,8 @@
 
 #include <winver.h>
 
-#define AHCI_VER_NUM              1,7,0,0
-#define AHCI_VER_STR              "1.7.0.0"
+#define AHCI_VER_NUM              1,8,0,0
+#define AHCI_VER_STR              "1.8"
 
 #ifdef AHCI_W9X
 #define AHCI_FILE_STR             "ahcint9x.mpd"

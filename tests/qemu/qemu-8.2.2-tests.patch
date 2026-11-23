@@ -1,0 +1,1739 @@
+diff -ruN a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+--- a/accel/tcg/cputlb.c	2024-03-04 20:48:15.000000000 +0300
++++ b/accel/tcg/cputlb.c	2026-11-16 02:12:00.514620649 +0300
+@@ -2030,10 +2030,15 @@
+     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
+     mr = section->mr;
+ 
+-    qemu_mutex_lock_iothread();
++    bool bql_taken = !qemu_mutex_iothread_locked();
++    if (bql_taken) {
++        qemu_mutex_lock_iothread();
++    }
+     ret = int_ld_mmio_beN(cpu, full, ret_be, addr, size, mmu_idx,
+                           type, ra, mr, mr_offset);
+-    qemu_mutex_unlock_iothread();
++    if (bql_taken) {
++        qemu_mutex_unlock_iothread();
++    }
+ 
+     return ret;
+ }
+@@ -2054,12 +2059,17 @@
+     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
+     mr = section->mr;
+ 
+-    qemu_mutex_lock_iothread();
++    bool bql_taken = !qemu_mutex_iothread_locked();
++    if (bql_taken) {
++        qemu_mutex_lock_iothread();
++    }
+     a = int_ld_mmio_beN(cpu, full, ret_be, addr, size - 8, mmu_idx,
+                         MMU_DATA_LOAD, ra, mr, mr_offset);
+     b = int_ld_mmio_beN(cpu, full, ret_be, addr + size - 8, 8, mmu_idx,
+                         MMU_DATA_LOAD, ra, mr, mr_offset + size - 8);
+-    qemu_mutex_unlock_iothread();
++    if (bql_taken) {
++        qemu_mutex_unlock_iothread();
++    }
+ 
+     return int128_make128(b, a);
+ }
+@@ -2577,10 +2587,15 @@
+     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
+     mr = section->mr;
+ 
+-    qemu_mutex_lock_iothread();
++    bool bql_taken = !qemu_mutex_iothread_locked();
++    if (bql_taken) {
++        qemu_mutex_lock_iothread();
++    }
+     ret = int_st_mmio_leN(cpu, full, val_le, addr, size, mmu_idx,
+                           ra, mr, mr_offset);
+-    qemu_mutex_unlock_iothread();
++    if (bql_taken) {
++        qemu_mutex_unlock_iothread();
++    }
+ 
+     return ret;
+ }
+@@ -2601,12 +2616,17 @@
+     section = io_prepare(&mr_offset, cpu, full->xlat_section, attrs, addr, ra);
+     mr = section->mr;
+ 
+-    qemu_mutex_lock_iothread();
++    bool bql_taken = !qemu_mutex_iothread_locked();
++    if (bql_taken) {
++        qemu_mutex_lock_iothread();
++    }
+     int_st_mmio_leN(cpu, full, int128_getlo(val_le), addr, 8,
+                     mmu_idx, ra, mr, mr_offset);
+     ret = int_st_mmio_leN(cpu, full, int128_gethi(val_le), addr + 8,
+                           size - 8, mmu_idx, ra, mr, mr_offset + 8);
+-    qemu_mutex_unlock_iothread();
++    if (bql_taken) {
++        qemu_mutex_unlock_iothread();
++    }
+ 
+     return ret;
+ }
+diff -ruN a/hw/i386/pc_piix.c b/hw/i386/pc_piix.c
+--- a/hw/i386/pc_piix.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/i386/pc_piix.c	2026-11-16 02:26:00.569909821 +0300
+@@ -300,10 +300,15 @@
+         rtc_state = ISA_DEVICE(object_resolve_path_component(OBJECT(pci_dev),
+                                                              "rtc"));
+         piix4_pm = object_resolve_path_component(OBJECT(pci_dev), "pm");
+-        dev = DEVICE(object_resolve_path_component(OBJECT(pci_dev), "ide"));
+-        pci_ide_create_devs(PCI_DEVICE(dev));
+-        idebus[0] = qdev_get_child_bus(dev, "ide.0");
+-        idebus[1] = qdev_get_child_bus(dev, "ide.1");
++        if (getenv("QEMU_NO_PIIX_IDE") && *getenv("QEMU_NO_PIIX_IDE")) {
++            idebus[0] = NULL;
++            idebus[1] = NULL;
++        } else {
++            dev = DEVICE(object_resolve_path_component(OBJECT(pci_dev), "ide"));
++            pci_ide_create_devs(PCI_DEVICE(dev));
++            idebus[0] = qdev_get_child_bus(dev, "ide.0");
++            idebus[1] = qdev_get_child_bus(dev, "ide.1");
++        }
+     } else {
+         isa_bus = isa_bus_new(NULL, system_memory, system_io,
+                               &error_abort);
+diff -ruN a/hw/ide/ahci.c b/hw/ide/ahci.c
+--- a/hw/ide/ahci.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/ide/ahci.c	2026-11-23 00:08:24.905485326 +0300
+@@ -112,6 +112,9 @@
+     [AHCI_PORT_IRQ_BIT_CPDS] = "CPDS"
+ };
+ 
++/* Test patch (QEMU_AHCI_LPM): link power management and DevSleep
++   registers that keep what is written, and a log of the changes */
++static uint32_t test_devslp[32];
+ static uint32_t ahci_port_read(AHCIState *s, int port, int offset)
+ {
+     uint32_t val;
+@@ -142,13 +145,15 @@
+         val = pr->cmd;
+         break;
+     case AHCI_PORT_REG_TFDATA:
+-        val = pr->tfdata;
++        val = ide_test_unplugged(&s->dev[port].port.ifs[0]) ? 0x7f : pr->tfdata;
+         break;
+     case AHCI_PORT_REG_SIG:
+-        val = pr->sig;
++        val = ide_test_unplugged(&s->dev[port].port.ifs[0]) ? 0xffffffff : pr->sig;
+         break;
+     case AHCI_PORT_REG_SCR_STAT:
+-        if (s->dev[port].port.ifs[0].blk) {
++        if (ide_test_unplugged(&s->dev[port].port.ifs[0])) {
++            val = SATA_SCR_SSTATUS_DET_NODEV;
++        } else if (s->dev[port].port.ifs[0].blk) {
+             val = SATA_SCR_SSTATUS_DET_DEV_PRESENT_PHY_UP |
+                   SATA_SCR_SSTATUS_SPD_GEN1 | SATA_SCR_SSTATUS_IPM_ACTIVE;
+         } else {
+@@ -171,6 +176,7 @@
+         trace_ahci_port_read_default(s, port, AHCIPortReg_lookup[regnum],
+                                      offset);
+         val = 0;
++        if (offset == 0x44 && getenv("QEMU_AHCI_LPM")) val = test_devslp[port] | 2;   /* DSP */
+     }
+ 
+     trace_ahci_port_read(s, port, AHCIPortReg_lookup[regnum], offset, val);
+@@ -340,6 +346,10 @@
+          * is done. We don't support ICC state changes, therefore always
+          * force the ICC bits to zero.
+          */
++        if (getenv("QEMU_AHCI_LPM") && ((pr->cmd ^ val) & (3u << 26) || (val & PORT_CMD_ICC_MASK))) {
++            fprintf(stderr, "AHCI-LPM: port %d ALPE %d ASP %d ICC %x\n", port,
++                    !!(val & (1u << 26)), !!(val & (1u << 27)), (val >> 28) & 0xf);
++        }
+         pr->cmd = (pr->cmd & PORT_CMD_RO_MASK) |
+             (val & ~(PORT_CMD_RO_MASK | PORT_CMD_ICC_MASK));
+ 
+@@ -377,10 +387,21 @@
+         pr->scr_act |= val;
+         break;
+     case AHCI_PORT_REG_CMD_ISSUE:
++        if (ide_test_unplugged(&s->dev[port].port.ifs[0])) {
++            break;
++        }
+         pr->cmd_issue |= val;
+         check_cmd(s, port);
+         break;
+     default:
++        if (offset == 0x44 && getenv("QEMU_AHCI_LPM")) {
++            if ((test_devslp[port] ^ val) & 1) {
++                fprintf(stderr, "AHCI-LPM: port %d ADSE %d (engine %s) DITO %u\n", port, val & 1,
++                        (pr->cmd & PORT_CMD_START) ? "running" : "stopped", (val >> 15) & 0x3ff);
++            }
++            test_devslp[port] = val & ~2u;
++            break;
++        }
+         trace_ahci_port_write_unimpl(s, port, AHCIPortReg_lookup[regnum],
+                                      offset, val);
+         qemu_log_mask(LOG_UNIMP, "Attempted write to unimplemented register: "
+@@ -415,6 +436,9 @@
+         case AHCI_HOST_REG_VERSION:
+             val = s->control_regs.version;
+             break;
++        case AHCI_HOST_REG_CAP2:
++            val = getenv("QEMU_AHCI_LPM") ? ((1 << 3) | (1 << 4)) : 0;   /* SDS, SADM */
++            break;
+         default:
+             trace_ahci_mem_read_32_host_default(s, AHCIHostReg_lookup[regnum],
+                                                 addr);
+@@ -580,6 +604,9 @@
+                           (AHCI_NUM_COMMAND_SLOTS << 8) |
+                           (AHCI_SUPPORTED_SPEED_GEN1 << AHCI_SUPPORTED_SPEED) |
+                           HOST_CAP_NCQ | HOST_CAP_AHCI | HOST_CAP_64;
++    if (getenv("QEMU_AHCI_LPM")) {
++        s->control_regs.cap |= (1 << 26) | (1 << 13) | HOST_CAP_SSC;       /* SALP, PSC, SSC */
++    }
+ 
+     s->control_regs.impl = (1 << s->ports) - 1;
+ 
+@@ -912,10 +939,46 @@
+     return true;
+ }
+ 
++/* Test hook QEMU_AHCI_STRICT: a PRD entry as an HBA takes it, with bit 0
++   of the data base address and of the byte count ignored (AHCI 1.3,
++   4.2.3.3: DBA bit 0 reserved, DBC bit 0 must be 1); every entry that
++   breaks the rule is logged. */
++static bool ahci_strict(void)
++{
++    static int s = -1;
++    if (s < 0) {
++        s = getenv("QEMU_AHCI_STRICT") != NULL;
++    }
++    return s;
++}
++
+ static int prdt_tbl_entry_size(const AHCI_SG *tbl)
+ {
+     /* flags_size is zero-based */
+-    return (le32_to_cpu(tbl->flags_size) & AHCI_PRDT_SIZE_MASK) + 1;
++    uint32_t dbc = le32_to_cpu(tbl->flags_size) & AHCI_PRDT_SIZE_MASK;
++    if (ahci_strict()) {
++        dbc |= 1;
++    }
++    return dbc + 1;
++}
++
++static uint16_t ahci_strict_opts;
++
++static uint64_t prdt_tbl_entry_addr(const AHCI_SG *tbl)
++{
++    uint64_t a = le64_to_cpu(tbl->addr);
++    if (ahci_strict()) {
++        uint32_t dbc = le32_to_cpu(tbl->flags_size) & AHCI_PRDT_SIZE_MASK;
++        if ((a & 1) || !(dbc & 1)) {
++            static unsigned long n;
++            if (n++ < 200) {
++                fprintf(stderr, "AHCI-STRICT: PRD entry addr %" PRIx64 " count %u breaks word alignment (%s)\n",
++                        a, dbc + 1, (ahci_strict_opts & AHCI_CMD_WRITE) ? "write" : "read");
++            }
++        }
++        a &= ~1ULL;
++    }
++    return a;
+ }
+ 
+ /**
+@@ -936,6 +999,7 @@
+ {
+     uint16_t opts = le16_to_cpu(cmd->opts);
+     uint16_t prdtl = le16_to_cpu(cmd->prdtl);
++    ahci_strict_opts = opts;
+     uint64_t cfis_addr = le64_to_cpu(cmd->tbl_addr);
+     uint64_t prdt_addr = cfis_addr + 0x80;
+     dma_addr_t prdt_len = (prdtl * sizeof(AHCI_SG));
+@@ -993,12 +1057,12 @@
+ 
+         qemu_sglist_init(sglist, qbus->parent, (prdtl - off_idx),
+                          ad->hba->as);
+-        qemu_sglist_add(sglist, le64_to_cpu(tbl[off_idx].addr) + off_pos,
++        qemu_sglist_add(sglist, prdt_tbl_entry_addr(&tbl[off_idx]) + off_pos,
+                         MIN(prdt_tbl_entry_size(&tbl[off_idx]) - off_pos,
+                             limit));
+ 
+         for (i = off_idx + 1; i < prdtl && sglist->size < limit; i++) {
+-            qemu_sglist_add(sglist, le64_to_cpu(tbl[i].addr),
++            qemu_sglist_add(sglist, prdt_tbl_entry_addr(&tbl[i]),
+                             MIN(prdt_tbl_entry_size(&tbl[i]),
+                                 limit - sglist->size));
+         }
+diff -ruN a/hw/ide/core.c b/hw/ide/core.c
+--- a/hw/ide/core.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/ide/core.c	2026-11-02 22:03:16.181808962 +0300
+@@ -183,6 +183,10 @@
+         /* NCQ supported */
+         put_le16(p + 76, (1 << 8));
+     }
++    if (getenv("QEMU_AHCI_LPM")) {
++        put_le16(p + 76, lduw_le_p(p + 76) | (1 << 9));     /* HIPM */
++        put_le16(p + 78, (1 << 3) | (1 << 8));              /* DIPM, DevSleep */
++    }
+ 
+     put_le16(p + 80, 0xf0); /* ata3 -> ata6 supported */
+     put_le16(p + 81, 0x16); /* conforms to ata5 */
+@@ -1698,6 +1702,11 @@
+     case 0x42: /* enable Automatic Acoustic Mode */
+     case 0xc2: /* disable Automatic Acoustic Mode */
+         return true;
++    case 0x10: /* enable SATA feature (test patch) */
++    case 0x90:
++        if (!getenv("QEMU_AHCI_LPM")) goto abort_cmd;
++        fprintf(stderr, "AHCI-LPM: SATA feature %02x %s\n", s->nsector, s->feature == 0x10 ? "on" : "off");
++        return true;
+     case 0x03: /* set transfer mode */
+         {
+             uint8_t val = s->nsector & 0x07;
+@@ -2139,6 +2148,9 @@
+ 
+ void ide_bus_exec_cmd(IDEBus *bus, uint32_t val)
+ {
++    if (ide_test_unplugged(ide_bus_active_if(bus))) {
++        return;
++    }
+     IDEState *s;
+     bool complete;
+ 
+@@ -2206,6 +2218,15 @@
+     [ATA_IOPORT_RR_STATUS] = "Status"
+ };
+ 
++/* test hack: /tmp/hp/<drive serial> present = drive pulled out */
++bool ide_test_unplugged(IDEState *s)
++{
++    char p[160];
++    if (!s || !s->blk || !s->drive_serial_str[0]) return false;
++    snprintf(p, sizeof(p), "%s/%s", getenv("QEMU_HP_DIR") ? getenv("QEMU_HP_DIR") : "/tmp/hp", s->drive_serial_str);
++    return access(p, F_OK) == 0;
++}
++
+ uint32_t ide_ioport_read(void *opaque, uint32_t addr)
+ {
+     IDEBus *bus = opaque;
+@@ -2215,6 +2236,9 @@
+ 
+     reg_num = addr & 7;
+     hob = bus->cmd & (IDE_CTRL_HOB);
++    if (ide_test_unplugged(s) && reg_num != ATA_IOPORT_RR_DATA) {
++        return 0x7f;
++    }
+     switch (reg_num) {
+     case ATA_IOPORT_RR_DATA:
+         /*
+@@ -2301,6 +2325,8 @@
+     if ((!bus->ifs[0].blk && !bus->ifs[1].blk) ||
+         (s != bus->ifs && !s->blk)) {
+         ret = 0;
++    } else if (ide_test_unplugged(s)) {
++        ret = 0x7f;
+     } else {
+         ret = s->status;
+     }
+diff -ruN a/hw/ide/ich.c b/hw/ide/ich.c
+--- a/hw/ide/ich.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/ide/ich.c	2026-11-23 03:31:17.484349417 +0300
+@@ -104,6 +104,160 @@
+     ahci_init(&d->ahci, DEVICE(obj));
+ }
+ 
++
++/* ---- test model: Intel RST NVMe remapping (QEMU_AHCI_REMAP=n: the n-th
++   ich9-ahci). The ABAR grows to 512 KB: VSCAP (A4h) bit 0, REMAP_CAP
++   (800h) one bit per device, its class code at 880h + i * 80h, its
++   registers at 16 KB + i * 16 KB. The NVMe controllers go on the hidden
++   bus "<id>.remap" and get no configuration cycles from the guest; the
++   model gives them BAR0 and memory decoding itself. Their INTx goes
++   nowhere (the guest polls). After Linux include/linux/ahci-remap.h. */
++#include "hw/pci/pci_host.h"
++#include "hw/pci/pci_bus.h"
++#include "hw/sysbus.h"
++#include "qapi/error.h"
++
++typedef struct IchRemap {
++    PCIDevice *ahci;
++    MemoryRegion abar, regs, vscap, win, mem, io;
++    AddressSpace as;
++    PCIBus *bus;
++    PCIDevice *nvme[3];
++    int count;
++    bool setup;
++} IchRemap;
++
++#define TYPE_ICH_REMAP_HOST "ich-remap-host"
++static const TypeInfo ich_remap_host_info = {
++    .name = TYPE_ICH_REMAP_HOST,
++    .parent = TYPE_PCI_HOST_BRIDGE,
++};
++
++static void ich_remap_setup(IchRemap *r)
++{
++    int devfn;
++    if (r->setup) {
++        return;
++    }
++    r->setup = true;
++    r->count = 0;
++    for (devfn = 0; devfn < 256 && r->count < 3; devfn++) {
++        PCIDevice *d = r->bus->devices[devfn];
++        if (!d || pci_get_word(d->config + PCI_CLASS_DEVICE) != 0x0108) {
++            continue;
++        }
++        r->nvme[r->count] = d;
++        pci_host_config_write_common(d, PCI_BASE_ADDRESS_0, pci_config_size(d),
++                                     0x10000000u * (r->count + 1), 4);
++        pci_host_config_write_common(d, PCI_BASE_ADDRESS_1, pci_config_size(d), 0, 4);
++        pci_host_config_write_common(d, PCI_COMMAND, pci_config_size(d), 0x0006, 2);
++        r->count++;
++    }
++}
++
++static uint64_t ich_remap_regs_read(void *opaque, hwaddr addr, unsigned size)
++{
++    IchRemap *r = opaque;
++    hwaddr a = addr + 0x800;
++    ich_remap_setup(r);
++    if (a == 0x800) {
++        return (1u << r->count) - 1;
++    }
++    if (a >= 0x880 && a < 0x880 + 3 * 0x80 && ((a - 0x880) & 0x7f) == 0) {
++        int i = (a - 0x880) / 0x80;
++        return i < r->count ? 0x010802 : 0;
++    }
++    return 0;
++}
++
++static void ich_remap_regs_write(void *opaque, hwaddr addr, uint64_t v, unsigned size) { }
++
++static const MemoryRegionOps ich_remap_regs_ops = {
++    .read = ich_remap_regs_read, .write = ich_remap_regs_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8 },
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t ich_remap_vscap_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return addr == 4 ? 1 : 0;           /* A4h: remapping present */
++}
++
++static const MemoryRegionOps ich_remap_vscap_ops = {
++    .read = ich_remap_vscap_read, .write = ich_remap_regs_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++    .impl = { .min_access_size = 4, .max_access_size = 4 },
++};
++
++static uint64_t ich_remap_win_rw(IchRemap *r, hwaddr addr, uint64_t val, unsigned size, bool write)
++{
++    int i = addr / 0x4000;              /* the window starts at 16 KB */
++    uint8_t buf[8];
++    hwaddr a;
++    ich_remap_setup(r);
++    if (i >= r->count) {
++        return write ? 0 : ~0ull;
++    }
++    a = 0x10000000ull * (i + 1) + (addr & 0x3fff);
++    if (write) {
++        stn_le_p(buf, size, val);
++        address_space_write(&r->as, a, MEMTXATTRS_UNSPECIFIED, buf, size);
++        return 0;
++    }
++    address_space_read(&r->as, a, MEMTXATTRS_UNSPECIFIED, buf, size);
++    return ldn_le_p(buf, size);
++}
++
++static uint64_t ich_remap_win_read(void *o, hwaddr a, unsigned sz) { return ich_remap_win_rw(o, a, 0, sz, false); }
++static void ich_remap_win_write(void *o, hwaddr a, uint64_t v, unsigned sz) { ich_remap_win_rw(o, a, v, sz, true); }
++
++static const MemoryRegionOps ich_remap_win_ops = {
++    .read = ich_remap_win_read, .write = ich_remap_win_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8 },
++    .impl = { .min_access_size = 1, .max_access_size = 8 },
++};
++
++static void ich_remap_set_irq(void *opaque, int irq, int level) { }
++static int ich_remap_map_irq(PCIDevice *d, int pin) { return pin; }
++
++static MemoryRegion *ich_remap_init(PCIDevice *dev, MemoryRegion *ahci_mem)
++{
++    IchRemap *r = g_new0(IchRemap, 1);
++    DeviceState *host;
++    const char *id = DEVICE(dev)->id ? DEVICE(dev)->id : "ahci";
++    g_autofree char *busname = g_strdup_printf("%s.remap", id);
++
++    r->ahci = dev;
++    memory_region_init(&r->abar, OBJECT(dev), "ahci-remap-abar", 512 * 1024);
++    memory_region_add_subregion(&r->abar, 0, ahci_mem);
++    memory_region_init_io(&r->vscap, OBJECT(dev), &ich_remap_vscap_ops, r, "ahci-remap-vscap", 0x10);
++    memory_region_add_subregion_overlap(&r->abar, 0xa0, &r->vscap, 1);
++    memory_region_init_io(&r->regs, OBJECT(dev), &ich_remap_regs_ops, r, "ahci-remap-regs", 0x800);
++    memory_region_add_subregion_overlap(&r->abar, 0x800, &r->regs, 1);
++    memory_region_init_io(&r->win, OBJECT(dev), &ich_remap_win_ops, r, "ahci-remap-nvme", 3 * 0x4000);
++    memory_region_add_subregion(&r->abar, 0x4000, &r->win);
++
++    memory_region_init(&r->mem, OBJECT(dev), "ahci-remap-mem", UINT64_MAX);
++    memory_region_init(&r->io, OBJECT(dev), "ahci-remap-io", 0x10000);
++    address_space_init(&r->as, &r->mem, "ahci-remap");
++    host = qdev_new(TYPE_ICH_REMAP_HOST);
++    r->bus = pci_root_bus_new(host, busname, &r->mem, &r->io, 0, TYPE_PCI_BUS);
++    pci_bus_irqs(r->bus, ich_remap_set_irq, r, PCI_NUM_PINS);
++    pci_bus_map_irqs(r->bus, ich_remap_map_irq);
++    PCI_HOST_BRIDGE(host)->bus = r->bus;
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
++    return &r->abar;
++}
++
++static void ich_remap_register_types(void)
++{
++    type_register_static(&ich_remap_host_info);
++}
++type_init(ich_remap_register_types)
++
+ static void pci_ich9_ahci_realize(PCIDevice *dev, Error **errp)
+ {
+     struct AHCIPCIState *d;
+@@ -112,9 +266,32 @@
+     d = ICH9_AHCI(dev);
+     int ret;
+ 
+-    ahci_realize(&d->ahci, DEVICE(dev), pci_get_address_space(dev), 6);
++    ahci_realize(&d->ahci, DEVICE(dev), pci_get_address_space(dev),
++                 getenv("QEMU_AHCI_PORTS") ? atoi(getenv("QEMU_AHCI_PORTS")) : 6);
+ 
+     pci_config_set_prog_interface(dev->config, AHCI_PROGMODE_MAJOR_REV_1);
++    if (getenv("QEMU_AHCI_PROGIF0")) {
++        pci_config_set_prog_interface(dev->config, 0);
++    }
++    static int ahci_instance;
++    const char *ids = getenv(ahci_instance++ ? "QEMU_AHCI_IDS2" : "QEMU_AHCI_IDS");
++    if (ids) {
++        /* test hook: vendor:device:class (e.g. 8086:2822:010400, RST RAID
++           mode); QEMU_AHCI_IDS2 for a second ich9-ahci */
++        unsigned v = 0, d = 0, c = 0;
++        if (sscanf(ids, "%x:%x:%x", &v, &d, &c) == 3) {
++            pci_config_set_vendor_id(dev->config, v);
++            pci_config_set_device_id(dev->config, d);
++            pci_config_set_class(dev->config, c >> 8);
++            pci_config_set_prog_interface(dev->config, c & 0xff);
++        }
++    }
++    if (getenv("QEMU_AHCI_ICH8M")) {
++        /* test hack: ICH8M ID, prog-if 0 (hidden from SeaBIOS) */
++        pci_config_set_device_id(dev->config, 0x2829);
++        pci_set_word(dev->config + PCI_SUBSYSTEM_ID, 0x2829);
++        pci_config_set_prog_interface(dev->config, 0);
++    }
+ 
+     dev->config[PCI_CACHE_LINE_SIZE] = 0x08;  /* Cache line size */
+     dev->config[PCI_LATENCY_TIMER]   = 0x00;  /* Latency timer */
+@@ -127,8 +304,18 @@
+ 
+     pci_register_bar(dev, ICH9_IDP_BAR, PCI_BASE_ADDRESS_SPACE_IO,
+                      &d->ahci.idp);
+-    pci_register_bar(dev, ICH9_MEM_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY,
+-                     &d->ahci.mem);
++    {
++        static int remap_instance;
++        const char *rm = getenv("QEMU_AHCI_REMAP");
++        remap_instance++;
++        if (rm && atoi(rm) == remap_instance) {
++            pci_register_bar(dev, ICH9_MEM_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY,
++                             ich_remap_init(dev, &d->ahci.mem));
++        } else {
++            pci_register_bar(dev, ICH9_MEM_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY,
++                             &d->ahci.mem);
++        }
++    }
+ 
+     sata_cap_offset = pci_add_capability(dev, PCI_CAP_ID_SATA,
+                                           ICH9_SATA_CAP_OFFSET, SATA_CAP_SIZE,
+diff -ruN a/hw/ide/ichide.c b/hw/ide/ichide.c
+--- a/hw/ide/ichide.c	1970-01-01 02:00:00.000000000 +0200
++++ b/hw/ide/ichide.c	2026-11-16 02:25:31.101471974 +0300
+@@ -0,0 +1,555 @@
++/*
++ * Intel ICH/PCH IDE functions for driver tests: the ICH5 PATA (24DB) and
++ * SATA (24D1) functions with combined mode, and the 6/7-series PCH SATA
++ * controllers in IDE mode (1E00 ports 0-3, 1E08 ports 4-5).
++ *
++ * What the model keeps of the silicon:
++ *  - IDETIM decode enable (41h/43h bit 7) and the command register's I/O
++ *    enable gate a channel; a gated channel's ports are not decoded at all
++ *  - compatibility channels decode 1F0h/3F6h and 170h/376h only when the
++ *    function owns them ("legacy-mask"; ICH5 combined mode gives one legacy
++ *    channel to each function, by MAP at 90h of the SATA function)
++ *  - native channels decode BARs 0-3 and raise INTA; compatibility channels
++ *    raise ISA IRQ 14/15
++ *  - the board BIOS sets the decode enables of the channels in use
++ *    ("bios-decode"); SeaBIOS does that for the PIIX IDs only
++ *  - SATA ports: the task file of a port without a device reads 7Fh
++ *  - a disk stays busy after a software reset and after power-on for the
++ *    given time ("reset-busy-ms", "poweron-busy-ms"), as real drives do
++ *  - PCS (92h) shows the ports with a device as present and enabled
++ *
++ * Also a configurable stub function ("ich-stub"): the LPC bridge at 1F.0
++ * that makes device 31 multi-function, SMBus, a display controller with
++ * an I/O BAR, as on the boards (their BARs take I/O space next to the IDE
++ * ones).
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2 or later.
++ */
++
++#include "qemu/osdep.h"
++#include "hw/pci/pci.h"
++#include "hw/qdev-properties.h"
++#include "hw/isa/isa.h"
++#include "migration/vmstate.h"
++#include "qemu/module.h"
++#include "qemu/range.h"
++#include "qemu/timer.h"
++#include "qapi/error.h"
++#include "sysemu/dma.h"
++#include "hw/ide/pci.h"
++#include "hw/irq.h"
++
++#define TYPE_ICH_IDE "ich-ide"
++OBJECT_DECLARE_SIMPLE_TYPE(ICHIDEState, ICH_IDE)
++
++typedef struct ICHChannel {
++    struct ICHIDEState *s;
++    int ch;
++    MemoryRegion legacy_cmd;
++    MemoryRegion legacy_ctl;
++    bool legacy_added;
++    int64_t busy_until;
++    uint8_t ctl;
++    int level;
++} ICHChannel;
++
++struct ICHIDEState {
++    PCIIDEState parent_obj;
++
++    ICHChannel chan[2];
++    uint16_t device_id;
++    uint8_t revision;
++    uint32_t subsys;
++    uint8_t prog_if;
++    uint8_t legacy_mask;
++    uint8_t map;
++    bool bios_decode;
++    bool bios_dma;
++    bool keep_bars;
++    bool sata;
++    uint32_t reset_busy_ms;
++    uint32_t poweron_busy_ms;
++};
++
++static bool ich_native(ICHIDEState *s, int ch)
++{
++    return PCI_DEVICE(s)->config[PCI_CLASS_PROG] & (ch ? 4 : 1);
++}
++
++static bool ich_decode(ICHIDEState *s, int ch)
++{
++    uint8_t *c = PCI_DEVICE(s)->config;
++    return (c[ch ? 0x43 : 0x41] & 0x80) && (c[PCI_COMMAND] & PCI_COMMAND_IO);
++}
++
++static void ich_update_decode(ICHIDEState *s)
++{
++    PCIIDEState *d = PCI_IDE(s);
++    int ch;
++
++    for (ch = 0; ch < 2; ch++) {
++        bool native = ich_native(s, ch), dec = ich_decode(s, ch);
++        bool legacy = !native && dec && (s->legacy_mask & (1 << ch));
++        memory_region_set_enabled(&s->chan[ch].legacy_cmd, legacy);
++        memory_region_set_enabled(&s->chan[ch].legacy_ctl, legacy);
++        memory_region_set_enabled(&d->data_bar[ch], native && dec);
++        memory_region_set_enabled(&d->cmd_bar[ch], native && dec);
++    }
++}
++
++static bool ich_busy(ICHChannel *c)
++{
++    return c->busy_until && qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) < c->busy_until;
++}
++
++/* SATA: a port without a device has a task file reading 7Fh */
++static bool ich_absent(ICHChannel *c)
++{
++    IDEBus *bus = &PCI_IDE(c->s)->bus[c->ch];
++    return c->s->sata && !bus->ifs[bus->unit].blk;
++}
++
++static uint64_t ich_cmd_read(void *opaque, hwaddr addr, unsigned size)
++{
++    ICHChannel *c = opaque;
++    IDEBus *bus = &PCI_IDE(c->s)->bus[c->ch];
++
++    if (ich_busy(c)) {
++        return size == 1 ? 0x80 : (size == 2 ? 0x8080 : 0x80808080);
++    }
++    if (ich_absent(c)) {
++        return size == 1 ? 0x7f : (size == 2 ? 0x7f7f : 0x7f7f7f7f);
++    }
++    if (size == 1) {
++        return ide_ioport_read(bus, addr);
++    } else if (addr == 0) {
++        return size == 2 ? ide_data_readw(bus, addr) : ide_data_readl(bus, addr);
++    }
++    return ((uint64_t)1 << (size * 8)) - 1;
++}
++
++static void ich_cmd_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++    ICHChannel *c = opaque;
++    IDEBus *bus = &PCI_IDE(c->s)->bus[c->ch];
++
++    if (ich_busy(c)) {
++        return;
++    }
++    if (size == 1) {
++        ide_ioport_write(bus, addr, data);
++    } else if (addr == 0) {
++        if (size == 2) {
++            ide_data_writew(bus, addr, data);
++        } else {
++            ide_data_writel(bus, addr, data);
++        }
++    }
++}
++
++static const MemoryRegionOps ich_cmd_ops = {
++    .read = ich_cmd_read,
++    .write = ich_cmd_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++/* The control block: Offset is 0 for the legacy port (3F6h/376h), 2 in
++   the native 4-byte BAR */
++static uint64_t ich_ctl_read_at(ICHChannel *c, hwaddr off, unsigned size)
++{
++    IDEBus *bus = &PCI_IDE(c->s)->bus[c->ch];
++
++    if (off != 0 || size != 1) {
++        return ((uint64_t)1 << (size * 8)) - 1;
++    }
++    if (ich_busy(c)) {
++        return 0x80;
++    }
++    if (ich_absent(c)) {
++        return 0x7f;
++    }
++    return ide_status_read(bus, 0);
++}
++
++static void ich_ctl_write_at(ICHChannel *c, hwaddr off, uint64_t data, unsigned size)
++{
++    IDEBus *bus = &PCI_IDE(c->s)->bus[c->ch];
++
++    if (off != 0 || size != 1) {
++        return;
++    }
++    /* SRST released: the drives run their diagnostics */
++    if ((c->ctl & 0x04) && !(data & 0x04) && c->s->reset_busy_ms) {
++        c->busy_until = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + c->s->reset_busy_ms;
++    }
++    c->ctl = data;
++    ide_ctrl_write(bus, 0, data);
++}
++
++static uint64_t ich_legacy_ctl_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return ich_ctl_read_at(opaque, addr, size);
++}
++
++static void ich_legacy_ctl_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++    ich_ctl_write_at(opaque, addr, data, size);
++}
++
++static const MemoryRegionOps ich_legacy_ctl_ops = {
++    .read = ich_legacy_ctl_read,
++    .write = ich_legacy_ctl_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static uint64_t ich_bar_ctl_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return ich_ctl_read_at(opaque, addr - 2, size);
++}
++
++static void ich_bar_ctl_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++    ich_ctl_write_at(opaque, addr - 2, data, size);
++}
++
++static const MemoryRegionOps ich_bar_ctl_ops = {
++    .read = ich_bar_ctl_read,
++    .write = ich_bar_ctl_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++/* Bus master: as the PIIX */
++static uint64_t ich_bmdma_read(void *opaque, hwaddr addr, unsigned size)
++{
++    BMDMAState *bm = opaque;
++
++    if (size != 1) {
++        return ((uint64_t)1 << (size * 8)) - 1;
++    }
++    switch (addr & 3) {
++    case 0:
++        return bm->cmd;
++    case 2:
++        return bm->status;
++    default:
++        return 0xff;
++    }
++}
++
++static void ich_bmdma_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    BMDMAState *bm = opaque;
++
++    if (size != 1) {
++        return;
++    }
++    switch (addr & 3) {
++    case 0:
++        bmdma_cmd_writeb(bm, val);
++        break;
++    case 2:
++        bmdma_status_writeb(bm, val);
++        break;
++    }
++}
++
++static const MemoryRegionOps ich_bmdma_ops = {
++    .read = ich_bmdma_read,
++    .write = ich_bmdma_write,
++};
++
++static void ich_set_irq(void *opaque, int n, int level)
++{
++    ICHIDEState *s = opaque;
++    PCIIDEState *d = PCI_IDE(s);
++    int i, pci = 0;
++
++    s->chan[n].level = level;
++    if (!ich_native(s, n)) {
++        qemu_set_irq(d->isa_irq[n], level);
++    }
++    for (i = 0; i < 2; i++) {
++        if (ich_native(s, i) && s->chan[i].level) {
++            pci = 1;
++        }
++    }
++    pci_set_irq(PCI_DEVICE(s), pci);
++}
++
++static void ich_ide_reset(DeviceState *dev)
++{
++    ICHIDEState *s = ICH_IDE(dev);
++    PCIIDEState *d = PCI_IDE(dev);
++    PCIDevice *pd = PCI_DEVICE(dev);
++    uint8_t *conf = pd->config;
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        ide_bus_reset(&d->bus[i]);
++        s->chan[i].ctl = 0;
++        s->chan[i].level = 0;
++        s->chan[i].busy_until = s->poweron_busy_ms ?
++            qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->poweron_busy_ms : 0;
++    }
++    pci_set_word(conf + PCI_COMMAND, 0);
++    pci_set_word(conf + PCI_STATUS, PCI_STATUS_DEVSEL_MEDIUM | PCI_STATUS_FAST_BACK);
++    conf[PCI_CLASS_PROG] = s->prog_if;
++    memset(conf + 0x40, 0, 0x60);
++    if (s->bios_decode) {
++        /* What the board's BIOS leaves: the decode enable of every channel
++           this function has (combined mode: only its own legacy channel) */
++        for (i = 0; i < 2; i++) {
++            if ((s->prog_if & (i ? 4 : 1)) || (s->legacy_mask & (1 << i))) {
++                conf[i ? 0x43 : 0x41] = 0x80;
++            }
++        }
++    }
++    if (s->bios_dma) {
++        /* The BIOS marks the drives it set up for DMA (bus master status
++           bits 5/6), as SeaBIOS does not */
++        for (i = 0; i < 2; i++) {
++            if (d->bus[i].ifs[0].blk) {
++                d->bmdma[i].status |= 0x20;
++            }
++            if (d->bus[i].ifs[1].blk) {
++                d->bmdma[i].status |= 0x40;
++            }
++        }
++    }
++    conf[0x90] = s->map;
++    if (s->sata) {
++        uint16_t pcs = 0;
++        int ch, u;
++        /* ports: ICH5 P0 = primary master, P1 = secondary master
++           (combined mode P0/P1 = master/slave); PCH 1E00 P0/P2 primary,
++           P1/P3 secondary */
++        for (ch = 0; ch < 2; ch++) {
++            for (u = 0; u < 2; u++) {
++                if (d->bus[ch].ifs[u].blk) {
++                    int port = (s->map >= 4) ? u : (ch + 2 * u);
++                    pcs |= (1 << port) | (0x100 << port);
++                }
++            }
++        }
++        pci_set_word(conf + 0x92, pcs);
++    }
++    ich_update_decode(s);
++}
++
++static void ich_ide_cfg_write(PCIDevice *pd, uint32_t addr, uint32_t val, int len)
++{
++    /* SeaBIOS moves the BARs 0-3 of a native-mode IDE function other than
++       the PIIX to 1F0h/3F4h/170h/374h after it allocated them; a board's
++       BIOS keeps them where it put them. */
++    if (ICH_IDE(pd)->keep_bars && len == 4 && addr >= PCI_BASE_ADDRESS_0 && addr <= PCI_BASE_ADDRESS_3) {
++        uint32_t a = val & ~3u, cur = pci_get_long(pd->config + addr) & ~3u;
++        if ((a == 0x1f0 || a == 0x3f4 || a == 0x170 || a == 0x374) && cur != 0 && cur != 0xfffffffcu) {
++            val = cur | 1;
++        }
++    }
++    pci_default_write_config(pd, addr, val, len);
++    if (ranges_overlap(addr, len, PCI_COMMAND, 2) ||
++        ranges_overlap(addr, len, PCI_CLASS_PROG, 1) ||
++        ranges_overlap(addr, len, 0x40, 4)) {
++        ich_update_decode(ICH_IDE(pd));
++    }
++}
++
++static void ich_ide_realize(PCIDevice *dev, Error **errp)
++{
++    ICHIDEState *s = ICH_IDE(dev);
++    PCIIDEState *d = PCI_IDE(dev);
++    DeviceState *ds = DEVICE(dev);
++    uint8_t *conf = dev->config;
++    MemoryRegion *io = pci_address_space_io(dev);
++    int i;
++
++    pci_config_set_device_id(conf, s->device_id);
++    pci_config_set_revision(conf, s->revision);
++    pci_set_long(conf + PCI_SUBSYSTEM_VENDOR_ID, s->subsys);
++    pci_config_set_interrupt_pin(conf, 1);
++    /* only the programmable bits (0 and 2) of the programming interface */
++    dev->wmask[PCI_CLASS_PROG] = ((s->prog_if & 2) ? 1 : 0) | ((s->prog_if & 8) ? 4 : 0);
++    dev->wmask[0x90] = 0;
++    dev->wmask[0x92] = 0x0f;
++    dev->wmask[0x93] = 0;
++
++    for (i = 0; i < 2; i++) {
++        ICHChannel *c = &s->chan[i];
++        c->s = s;
++        c->ch = i;
++        memory_region_init_io(&d->data_bar[i], OBJECT(d), &ich_cmd_ops, c, "ich-ide-cmd", 8);
++        pci_register_bar(dev, 2 * i, PCI_BASE_ADDRESS_SPACE_IO, &d->data_bar[i]);
++        memory_region_init_io(&d->cmd_bar[i], OBJECT(d), &ich_bar_ctl_ops, c, "ich-ide-ctl", 4);
++        pci_register_bar(dev, 2 * i + 1, PCI_BASE_ADDRESS_SPACE_IO, &d->cmd_bar[i]);
++
++        memory_region_init_io(&c->legacy_cmd, OBJECT(d), &ich_cmd_ops, c, "ich-ide-legacy", 8);
++        memory_region_add_subregion_overlap(io, i ? 0x170 : 0x1f0, &c->legacy_cmd, 1);
++        memory_region_init_io(&c->legacy_ctl, OBJECT(d), &ich_legacy_ctl_ops, c, "ich-ide-legacy-ctl", 1);
++        memory_region_add_subregion_overlap(io, i ? 0x376 : 0x3f6, &c->legacy_ctl, 1);
++    }
++
++    memory_region_init(&d->bmdma_bar, OBJECT(d), "ich-bmdma-container", 16);
++    for (i = 0; i < 2; i++) {
++        BMDMAState *bm = &d->bmdma[i];
++        memory_region_init_io(&bm->extra_io, OBJECT(d), &ich_bmdma_ops, bm, "ich-bmdma", 4);
++        memory_region_add_subregion(&d->bmdma_bar, i * 8, &bm->extra_io);
++        memory_region_init_io(&bm->addr_ioport, OBJECT(d), &bmdma_addr_ioport_ops, bm, "bmdma", 4);
++        memory_region_add_subregion(&d->bmdma_bar, i * 8 + 4, &bm->addr_ioport);
++    }
++    pci_register_bar(dev, 4, PCI_BASE_ADDRESS_SPACE_IO, &d->bmdma_bar);
++
++    qdev_init_gpio_in(ds, ich_set_irq, 2);
++    for (i = 0; i < 2; i++) {
++        d->isa_irq[i] = isa_get_irq(NULL, 14 + i);
++        ide_bus_init(&d->bus[i], sizeof(d->bus[i]), ds, i, MAX_IDE_DEVS);
++        ide_bus_init_output_irq(&d->bus[i], qdev_get_gpio_in(ds, i));
++        bmdma_init(&d->bus[i], &d->bmdma[i], d);
++        ide_bus_register_restart_cb(&d->bus[i]);
++    }
++}
++
++static void ich_ide_exitfn(PCIDevice *dev)
++{
++    ICHIDEState *s = ICH_IDE(dev);
++    PCIIDEState *d = PCI_IDE(dev);
++    MemoryRegion *io = pci_address_space_io(dev);
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        memory_region_del_subregion(io, &s->chan[i].legacy_cmd);
++        memory_region_del_subregion(io, &s->chan[i].legacy_ctl);
++        memory_region_del_subregion(&d->bmdma_bar, &d->bmdma[i].extra_io);
++        memory_region_del_subregion(&d->bmdma_bar, &d->bmdma[i].addr_ioport);
++    }
++}
++
++static Property ich_ide_props[] = {
++    DEFINE_PROP_UINT16("device-id", ICHIDEState, device_id, 0x24db),
++    DEFINE_PROP_UINT8("revision", ICHIDEState, revision, 0x02),
++    DEFINE_PROP_UINT32("subsys", ICHIDEState, subsys, 0),
++    DEFINE_PROP_UINT8("prog-if", ICHIDEState, prog_if, 0x8a),
++    DEFINE_PROP_UINT8("legacy-mask", ICHIDEState, legacy_mask, 3),
++    DEFINE_PROP_UINT8("map", ICHIDEState, map, 0),
++    DEFINE_PROP_BOOL("bios-decode", ICHIDEState, bios_decode, true),
++    DEFINE_PROP_BOOL("bios-dma", ICHIDEState, bios_dma, true),
++    DEFINE_PROP_BOOL("keep-bars", ICHIDEState, keep_bars, true),
++    DEFINE_PROP_BOOL("sata", ICHIDEState, sata, false),
++    DEFINE_PROP_UINT32("reset-busy-ms", ICHIDEState, reset_busy_ms, 0),
++    DEFINE_PROP_UINT32("poweron-busy-ms", ICHIDEState, poweron_busy_ms, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void ich_ide_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    dc->reset = ich_ide_reset;
++    dc->vmsd = &vmstate_ide_pci;
++    device_class_set_props(dc, ich_ide_props);
++    k->config_write = ich_ide_cfg_write;
++    k->realize = ich_ide_realize;
++    k->exit = ich_ide_exitfn;
++    k->vendor_id = PCI_VENDOR_ID_INTEL;
++    k->device_id = 0x24db;
++    k->class_id = PCI_CLASS_STORAGE_IDE;
++    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
++}
++
++static const TypeInfo ich_ide_info = {
++    .name          = TYPE_ICH_IDE,
++    .parent        = TYPE_PCI_IDE,
++    .instance_size = sizeof(ICHIDEState),
++    .class_init    = ich_ide_class_init,
++};
++
++/* ------------------------------------------------------------------ */
++/* Stub function: LPC bridge, SMBus, display controller                */
++
++#define TYPE_ICH_STUB "ich-stub"
++OBJECT_DECLARE_SIMPLE_TYPE(ICHStubState, ICH_STUB)
++
++struct ICHStubState {
++    PCIDevice parent_obj;
++    uint16_t vendor_id;
++    uint16_t device_id;
++    uint8_t revision;
++    uint32_t class_code;
++    uint32_t io_size;
++    uint32_t subsys;
++    MemoryRegion io;
++};
++
++static uint64_t ich_stub_read(void *opaque, hwaddr addr, unsigned size)
++{
++    return 0;
++}
++
++static void ich_stub_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
++{
++}
++
++static const MemoryRegionOps ich_stub_ops = {
++    .read = ich_stub_read,
++    .write = ich_stub_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void ich_stub_realize(PCIDevice *dev, Error **errp)
++{
++    ICHStubState *s = ICH_STUB(dev);
++    uint8_t *conf = dev->config;
++
++    pci_config_set_vendor_id(conf, s->vendor_id);
++    pci_config_set_device_id(conf, s->device_id);
++    pci_config_set_revision(conf, s->revision);
++    pci_config_set_prog_interface(conf, s->class_code & 0xff);
++    pci_config_set_class(conf, s->class_code >> 8);
++    pci_set_long(conf + PCI_SUBSYSTEM_VENDOR_ID, s->subsys);
++    if (s->io_size) {
++        memory_region_init_io(&s->io, OBJECT(s), &ich_stub_ops, s, "ich-stub-io", s->io_size);
++        pci_register_bar(dev, 4, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
++    }
++}
++
++static Property ich_stub_props[] = {
++    DEFINE_PROP_UINT16("vendor-id", ICHStubState, vendor_id, 0x8086),
++    DEFINE_PROP_UINT16("device-id", ICHStubState, device_id, 0x24d0),
++    DEFINE_PROP_UINT8("revision", ICHStubState, revision, 0x02),
++    DEFINE_PROP_UINT32("class", ICHStubState, class_code, 0x060100),
++    DEFINE_PROP_UINT32("io-size", ICHStubState, io_size, 0),
++    DEFINE_PROP_UINT32("subsys", ICHStubState, subsys, 0),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void ich_stub_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    device_class_set_props(dc, ich_stub_props);
++    k->realize = ich_stub_realize;
++    k->vendor_id = PCI_VENDOR_ID_INTEL;
++    k->device_id = 0x24d0;
++    k->class_id = PCI_CLASS_BRIDGE_ISA;
++}
++
++static const TypeInfo ich_stub_info = {
++    .name          = TYPE_ICH_STUB,
++    .parent        = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(ICHStubState),
++    .class_init    = ich_stub_class_init,
++    .interfaces = (InterfaceInfo[]) {
++        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++        { },
++    },
++};
++
++static void ich_ide_register_types(void)
++{
++    type_register_static(&ich_ide_info);
++    type_register_static(&ich_stub_info);
++}
++
++type_init(ich_ide_register_types)
+diff -ruN a/hw/ide/meson.build b/hw/ide/meson.build
+--- a/hw/ide/meson.build	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/ide/meson.build	2026-11-16 00:54:57.283511686 +0300
+@@ -7,7 +7,7 @@
+ system_ss.add(when: 'CONFIG_IDE_MACIO', if_true: files('macio.c'))
+ system_ss.add(when: 'CONFIG_IDE_MMIO', if_true: files('mmio.c'))
+ system_ss.add(when: 'CONFIG_IDE_PCI', if_true: files('pci.c'))
+-system_ss.add(when: 'CONFIG_IDE_PIIX', if_true: files('piix.c', 'ioport.c'))
++system_ss.add(when: 'CONFIG_IDE_PIIX', if_true: files('piix.c', 'ioport.c', 'ichide.c'))
+ system_ss.add(when: 'CONFIG_IDE_QDEV', if_true: files('qdev.c'))
+ system_ss.add(when: 'CONFIG_IDE_SII3112', if_true: files('sii3112.c'))
+ system_ss.add(when: 'CONFIG_IDE_VIA', if_true: files('via.c'))
+diff -ruN a/hw/ide/piix.c b/hw/ide/piix.c
+--- a/hw/ide/piix.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/ide/piix.c	2026-11-13 22:28:47.381530048 +0300
+@@ -49,6 +49,9 @@
+         break;
+     case 2:
+         val = bm->status;
++        if (getenv("QEMU_IDE_SIMPLEX")) {
++            val |= 0x80;
++        }
+         break;
+     default:
+         val = 0xff;
+@@ -133,8 +136,14 @@
+     int ret;
+ 
+     ide_bus_init(&d->bus[i], sizeof(d->bus[i]), DEVICE(d), i, 2);
+-    ret = ide_init_ioport(&d->bus[i], NULL, port_info[i].iobase,
+-                          port_info[i].iobase2);
++    /* Test hook (QEMU_IDE_DISABLE): a channel turned off decodes nothing
++       (its decode enable was made read-only 0 in realize) */
++    if (!(PCI_DEVICE(d)->wmask[i ? 0x43 : 0x41] & 0x80)) {
++        ret = 0;
++    } else {
++        ret = ide_init_ioport(&d->bus[i], NULL, port_info[i].iobase,
++                              port_info[i].iobase2);
++    }
+     if (ret) {
+         error_setg_errno(errp, -ret, "Failed to realize %s port %u",
+                          object_get_typename(OBJECT(d)), i);
+@@ -153,7 +162,38 @@
+     PCIIDEState *d = PCI_IDE(dev);
+     uint8_t *pci_conf = dev->config;
+ 
++    /* Test hooks per instance: the first PIIX function QEMU_IDE_IDS and
++       QEMU_IDE_DISABLE, a second one (-device piix3-ide) QEMU_IDE_IDS2 and
++       QEMU_IDE_DISABLE2: two functions with one legacy channel each, as an
++       Intel ICH in combined mode */
++    static int instance;
++    const char *ids = getenv(instance ? "QEMU_IDE_IDS2" : "QEMU_IDE_IDS");
++    const char *dis = getenv(instance ? "QEMU_IDE_DISABLE2" : "QEMU_IDE_DISABLE");
++    instance++;
++
+     pci_conf[PCI_CLASS_PROG] = 0x80; // legacy ATA mode
++    if (ids) {
++        unsigned v = 0, dv = 0, r = 0;
++        if (sscanf(ids, "%x:%x:%x", &v, &dv, &r) >= 2) {
++            pci_config_set_vendor_id(pci_conf, v);
++            pci_config_set_device_id(pci_conf, dv);
++            pci_conf[PCI_REVISION_ID] = r;
++        }
++    }
++
++    /* Test hook: QEMU_IDE_DISABLE=1 (primary) or 2 (secondary) keeps that
++       channel's IDETIM decode enable (bit 15 of 40h/42h) at 0, as a BIOS
++       that turned the channel off (or an ICH in combined mode) leaves it */
++    if (ids) {
++        /* SeaBIOS turns the decode enables on for the PIIX3/PIIX4 IDs only;
++           with other IDs do it here, as the BIOS of such a board does */
++        pci_conf[0x41] |= 0x80; pci_conf[0x43] |= 0x80;
++    }
++    if (dis) {
++        int ch = atoi(dis);
++        if (ch & 1) { dev->wmask[0x41] &= ~0x80; pci_conf[0x41] &= ~0x80; }
++        if (ch & 2) { dev->wmask[0x43] &= ~0x80; pci_conf[0x43] &= ~0x80; }
++    }
+ 
+     bmdma_setup_bar(d);
+     pci_register_bar(dev, 4, PCI_BASE_ADDRESS_SPACE_IO, &d->bmdma_bar);
+diff -ruN a/hw/isa/piix.c b/hw/isa/piix.c
+--- a/hw/isa/piix.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/isa/piix.c	2026-11-16 02:26:00.569328368 +0300
+@@ -346,10 +346,12 @@
+     irq = object_property_get_uint(OBJECT(&d->rtc), "irq", &error_fatal);
+     isa_connect_gpio_out(ISA_DEVICE(&d->rtc), 0, irq);
+ 
+-    /* IDE */
+-    qdev_prop_set_int32(DEVICE(&d->ide), "addr", dev->devfn + 1);
+-    if (!qdev_realize(DEVICE(&d->ide), BUS(pci_bus), errp)) {
+-        return;
++    /* IDE (test hook QEMU_NO_PIIX_IDE: none, for an ICH IDE model at 1F.x) */
++    if (!(getenv("QEMU_NO_PIIX_IDE") && *getenv("QEMU_NO_PIIX_IDE"))) {
++        qdev_prop_set_int32(DEVICE(&d->ide), "addr", dev->devfn + 1);
++        if (!qdev_realize(DEVICE(&d->ide), BUS(pci_bus), errp)) {
++            return;
++        }
+     }
+ 
+     /* USB */
+@@ -462,7 +464,9 @@
+ {
+     PIIXState *d = PIIX_PCI_DEVICE(obj);
+ 
+-    object_initialize_child(obj, "ide", &d->ide, TYPE_PIIX3_IDE);
++    if (!(getenv("QEMU_NO_PIIX_IDE") && *getenv("QEMU_NO_PIIX_IDE"))) {
++        object_initialize_child(obj, "ide", &d->ide, TYPE_PIIX3_IDE);
++    }
+ }
+ 
+ static void piix3_class_init(ObjectClass *klass, void *data)
+diff -ruN a/hw/nvme/ctrl.c b/hw/nvme/ctrl.c
+--- a/hw/nvme/ctrl.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/nvme/ctrl.c	2026-11-23 00:17:43.227242363 +0300
+@@ -247,8 +247,57 @@
+     [NVME_COMMAND_SET_PROFILE]      = true,
+     [NVME_FDP_MODE]                 = true,
+     [NVME_FDP_EVENTS]               = true,
++    [0x0c]                          = true,     /* test: APST (QEMU_NVME_APST) */
++    [0x0d]                          = true,     /* test: HMB (QEMU_NVME_HMB) */
+ };
+ 
++/* Test patch: host memory buffer and APST accepted and checked */
++static inline uint16_t nvme_h2c(NvmeCtrl *n, void *ptr, uint32_t len, NvmeRequest *req);
++static uint32_t test_hmb_on, test_hmb_size, test_apst_on;
++
++static uint16_t test_set_hmb(NvmeCtrl *n, NvmeRequest *req)
++{
++    NvmeCmd *cmd = &req->cmd;
++    uint32_t dw11 = le32_to_cpu(cmd->cdw11), hsize = le32_to_cpu(cmd->cdw12);
++    uint64_t list = le32_to_cpu(cmd->cdw13) | ((uint64_t)le32_to_cpu(cmd->cdw14) << 32);
++    uint32_t cnt = le32_to_cpu(cmd->cdw15), i, sum = 0, bad = 0;
++    uint8_t pat[16], back[16];
++
++    if (!getenv("QEMU_NVME_HMB")) return NVME_INVALID_FIELD | NVME_DNR;
++    if (!(dw11 & 1)) { test_hmb_on = 0; fprintf(stderr, "NVME-HMB: disabled\n"); return NVME_SUCCESS; }
++    for (i = 0; i < cnt; i++) {
++        struct { uint64_t badd; uint32_t bsize; uint32_t rsvd; } d;
++        uint64_t last;
++        if (pci_dma_read(PCI_DEVICE(n), list + i * 16, &d, 16)) { bad++; break; }
++        d.badd = le64_to_cpu(d.badd); d.bsize = le32_to_cpu(d.bsize);
++        if (d.badd & 0xfff || d.bsize == 0) bad++;
++        sum += d.bsize;
++        memset(pat, 0xA5 ^ i, 16);
++        last = d.badd + (uint64_t)d.bsize * 4096 - 16;
++        pci_dma_write(PCI_DEVICE(n), d.badd, pat, 16); pci_dma_write(PCI_DEVICE(n), last, pat, 16);
++        pci_dma_read(PCI_DEVICE(n), last, back, 16);
++        if (memcmp(pat, back, 16)) bad++;
++    }
++    fprintf(stderr, "NVME-HMB: enable size %u pages, %u descriptors, sum %u, %u bad, list %llx\n",
++            hsize, cnt, sum, bad, (unsigned long long)list);
++    if (bad || sum != hsize) return NVME_INVALID_FIELD | NVME_DNR;
++    test_hmb_on = 1; test_hmb_size = hsize;
++    return NVME_SUCCESS;
++}
++
++static uint16_t test_set_apst(NvmeCtrl *n, NvmeRequest *req)
++{
++    uint32_t dw11 = le32_to_cpu(req->cmd.cdw11);
++    uint64_t tab[32];
++    uint16_t status;
++    if (!getenv("QEMU_NVME_APST")) return NVME_INVALID_FIELD | NVME_DNR;
++    status = nvme_h2c(n, (uint8_t *)tab, sizeof(tab), req);
++    if (status) return status;
++    test_apst_on = dw11 & 1;
++    fprintf(stderr, "NVME-APST: %s, entry0 %016llx\n", test_apst_on ? "on" : "off", (unsigned long long)le64_to_cpu(tab[0]));
++    return NVME_SUCCESS;
++}
++
+ static const uint32_t nvme_feature_cap[NVME_FID_MAX] = {
+     [NVME_TEMPERATURE_THRESHOLD]    = NVME_FEAT_CAP_CHANGE,
+     [NVME_ERROR_RECOVERY]           = NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
+@@ -260,6 +309,8 @@
+     [NVME_COMMAND_SET_PROFILE]      = NVME_FEAT_CAP_CHANGE,
+     [NVME_FDP_MODE]                 = NVME_FEAT_CAP_CHANGE,
+     [NVME_FDP_EVENTS]               = NVME_FEAT_CAP_CHANGE | NVME_FEAT_CAP_NS,
++    [0x0c]                          = NVME_FEAT_CAP_CHANGE,
++    [0x0d]                          = NVME_FEAT_CAP_CHANGE,
+ };
+ 
+ static const uint32_t nvme_cse_acs[256] = {
+@@ -876,7 +927,17 @@
+ static uint16_t nvme_map_prp(NvmeCtrl *n, NvmeSg *sg, uint64_t prp1,
+                              uint64_t prp2, uint32_t len)
+ {
+-    hwaddr trans_len = n->page_size - (prp1 % n->page_size);
++    hwaddr trans_len;
++    /* Test hook QEMU_NVME_STRICT: PRP1 bits 1:0 ignored, as a controller
++       that takes the dword alignment of NVMe 1.4, 4.3 for granted; logged */
++    if (getenv("QEMU_NVME_STRICT") && (prp1 & 3)) {
++        static unsigned long cnt;
++        if (cnt++ < 200) {
++            fprintf(stderr, "NVME-STRICT: PRP1 %" PRIx64 " len %u not dword aligned\n", prp1, len);
++        }
++        prp1 &= ~3ULL;
++    }
++    trans_len = n->page_size - (prp1 % n->page_size);
+     trans_len = MIN(len, trans_len);
+     int num_prps = (len >> n->page_bits) + 1;
+     uint16_t status;
+@@ -5983,6 +6044,12 @@
+         goto out;
+     case NVME_TIMESTAMP:
+         return nvme_get_feature_timestamp(n, req);
++    case 0x0c:
++        result = test_apst_on;
++        goto out;
++    case 0x0d:
++        result = test_hmb_on;
++        goto out;
+     case NVME_HOST_BEHAVIOR_SUPPORT:
+         return nvme_c2h(n, (uint8_t *)&n->features.hbs,
+                         sizeof(n->features.hbs), req);
+@@ -6294,6 +6361,10 @@
+         return NVME_CMD_SEQ_ERROR | NVME_DNR;
+     case NVME_FDP_EVENTS:
+         return nvme_set_feature_fdp_events(n, ns, req);
++    case 0x0c:
++        return test_set_apst(n, req);
++    case 0x0d:
++        return test_set_hmb(n, req);
+     default:
+         return NVME_FEAT_NOT_CHANGEABLE | NVME_DNR;
+     }
+@@ -7077,6 +7148,8 @@
+ 
+ static void nvme_ctrl_reset(NvmeCtrl *n, NvmeResetType rst)
+ {
++    if (test_hmb_on) fprintf(stderr, "NVME-HMB: dropped by reset\n");
++    test_hmb_on = 0; test_apst_on = 0;
+     PCIDevice *pci_dev = PCI_DEVICE(n);
+     NvmeSecCtrlEntry *sctrl;
+     NvmeNamespace *ns;
+@@ -7512,11 +7585,21 @@
+     }
+ }
+ 
++static bool nvme_hp_gone(void)
++{
++    char p[160];
++    snprintf(p, sizeof(p), "%s/nvctrl", getenv("QEMU_HP_DIR") ? getenv("QEMU_HP_DIR") : "/tmp/hp");
++    return access(p, F_OK) == 0;
++}
++
+ static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
+ {
+     NvmeCtrl *n = (NvmeCtrl *)opaque;
+     uint8_t *ptr = (uint8_t *)&n->bar;
+ 
++    if (nvme_hp_gone()) {
++        return ~0ULL;
++    }
+     trace_pci_nvme_mmio_read(addr, size);
+ 
+     if (unlikely(addr & (sizeof(uint32_t) - 1))) {
+@@ -7713,6 +7796,9 @@
+ {
+     NvmeCtrl *n = (NvmeCtrl *)opaque;
+ 
++    if (nvme_hp_gone()) {
++        return;
++    }
+     trace_pci_nvme_mmio_write(addr, data, size);
+ 
+     if (pci_is_vf(PCI_DEVICE(n)) && !nvme_sctrl(n)->scs &&
+@@ -8236,6 +8322,18 @@
+     id->psd[0].mp = cpu_to_le16(0x9c4);
+     id->psd[0].enlat = cpu_to_le32(0x10);
+     id->psd[0].exlat = cpu_to_le32(0x4);
++    if (getenv("QEMU_NVME_HMB")) {
++        id->hmpre = cpu_to_le32(atoi(getenv("QEMU_NVME_HMB")) / 4);
++        id->hmmin = cpu_to_le32(atoi(getenv("QEMU_NVME_HMB")) / 8);
++    }
++    if (getenv("QEMU_NVME_APST")) {
++        id->apsta = 1;
++        id->npss = 2;
++        id->psd[1].mp = cpu_to_le16(0x100); id->psd[1].enlat = cpu_to_le32(1000); id->psd[1].exlat = cpu_to_le32(2000);
++        id->psd[1].reserved = cpu_to_le16(0x0200);
++        id->psd[2].mp = cpu_to_le16(0x10); id->psd[2].enlat = cpu_to_le32(5000); id->psd[2].exlat = cpu_to_le32(20000);
++        id->psd[2].reserved = cpu_to_le16(0x0200);
++    }
+ 
+     if (n->subsys) {
+         id->cmic |= NVME_CMIC_MULTI_CTRL;
+diff -ruN a/hw/nvme/nvme.h b/hw/nvme/nvme.h
+--- a/hw/nvme/nvme.h	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/nvme/nvme.h	2026-11-02 12:09:05.687277886 +0300
+@@ -611,9 +611,14 @@
+ 
+ static inline NvmeNamespace *nvme_ns(NvmeCtrl *n, uint32_t nsid)
+ {
++    char hp[160];
+     if (!nsid || nsid > NVME_MAX_NAMESPACES) {
+         return NULL;
+     }
++    snprintf(hp, sizeof(hp), "%s/ns%u", getenv("QEMU_HP_DIR") ? getenv("QEMU_HP_DIR") : "/tmp/hp", nsid);
++    if (access(hp, F_OK) == 0) {
++        return NULL;
++    }
+ 
+     return n->namespaces[nsid];
+ }
+diff -ruN a/hw/pci-host/intel_vmd.c b/hw/pci-host/intel_vmd.c
+--- a/hw/pci-host/intel_vmd.c	1970-01-01 02:00:00.000000000 +0200
++++ b/hw/pci-host/intel_vmd.c	2026-11-23 08:22:55.425012093 +0300
+@@ -0,0 +1,264 @@
++/*
++ * Intel Volume Management Device (VMD) test model
++ *
++ * A PCI endpoint (class 01:04) that hides a PCI domain of its own:
++ *   BAR0 (CFGBAR)  ECAM of the domain, bus "bus-start" at offset 0
++ *   BAR2 (MEMBAR1) window on the domain's memory space
++ *   BAR4 (MEMBAR2) window on the domain's memory space from offset 0x2000
++ *   40h VMCAP (bus restriction capability), 44h VMCONFIG (bits 9:8 bus
++ *   start: 0, 128, 224; bit 1 MSI remap off), 70h VMLOCK
++ * The domain's devices are reached only through the BARs: the firmware does
++ * not see them, so their BARs and the bridges in it start unprogrammed, as
++ * under a legacy BIOS. Their INTx goes nowhere (the real VMD routes only
++ * MSI/MSI-X); their bus mastering reaches system memory.
++ * Devices go on the bus "<id>.0": -device intel-vmd,id=vmd
++ * -device pci-bridge,id=vb,chassis_nr=9,bus=vmd.0 -device nvme,bus=vb,...
++ * (endpoints may also sit on vmd.0 itself, e.g. ich9-ahci,bus=vmd.0,addr=0x17)
++ * Modeled on Linux drivers/pci/controller/vmd.c.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "hw/pci/pci_device.h"
++#include "hw/pci/msix.h"
++#include "hw/pci/pci_bus.h"
++#include "hw/pci/pci_host.h"
++#include "hw/qdev-properties.h"
++#include "hw/sysbus.h"
++#include "exec/address-spaces.h"
++#include "qom/object.h"
++
++PCIBus *pci_find_bus_nr(PCIBus *bus, int bus_num);   /* hw/pci/pci-internal.h */
++
++#define TYPE_INTEL_VMD "intel-vmd"
++#define TYPE_INTEL_VMD_HOST "intel-vmd-host"
++#define TYPE_INTEL_VMD_BUS "intel-vmd-bus"
++
++OBJECT_DECLARE_SIMPLE_TYPE(IntelVMDState, INTEL_VMD)
++
++struct IntelVMDState {
++    PCIDevice parent_obj;
++    MemoryRegion cfgbar, membar1, membar2, membar2c;
++    MemoryRegion mem, io;
++    AddressSpace child_as;
++    PCIBus *bus;
++    uint16_t device_id;
++    uint8_t bus_start;
++    uint32_t cfgbar_mb, membar1_mb;
++    bool intx;
++    uint32_t msix_vectors;
++};
++
++/* the domain's root bus: no parent device (so that endpoints may sit on it,
++   as the SATA controller does on real hardware), its first bus number kept here */
++typedef struct IntelVMDBus {
++    PCIBus parent_obj;
++    uint8_t bus_start;
++} IntelVMDBus;
++
++static int vmd_bus_num(PCIBus *bus)
++{
++    return ((IntelVMDBus *)bus)->bus_start;
++}
++
++static void vmd_bus_class_init(ObjectClass *klass, void *data)
++{
++    PCIBusClass *pbc = PCI_BUS_CLASS(klass);
++    pbc->bus_num = vmd_bus_num;
++}
++
++static const TypeInfo vmd_bus_info = {
++    .name = TYPE_INTEL_VMD_BUS,
++    .parent = TYPE_PCI_BUS,
++    .instance_size = sizeof(IntelVMDBus),
++    .class_init = vmd_bus_class_init,
++};
++
++static void vmd_host_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    dc->user_creatable = false;
++}
++
++static const TypeInfo vmd_host_info = {
++    .name = TYPE_INTEL_VMD_HOST,
++    .parent = TYPE_PCI_HOST_BRIDGE,
++    .class_init = vmd_host_class_init,
++};
++
++static PCIDevice *vmd_cfg_dev(IntelVMDState *s, hwaddr addr)
++{
++    PCIBus *b = pci_find_bus_nr(s->bus, s->bus_start + (int)(addr >> 20));
++    if (!b || (s->bus_start + (addr >> 20)) > 255) {
++        return NULL;
++    }
++    return b->devices[(addr >> 12) & 0xff];
++}
++
++static uint64_t vmd_cfg_read(void *opaque, hwaddr addr, unsigned size)
++{
++    IntelVMDState *s = opaque;
++    PCIDevice *d = vmd_cfg_dev(s, addr);
++    if (!d) {
++        return size == 4 ? 0xffffffffu : (1u << (size * 8)) - 1;
++    }
++    return pci_host_config_read_common(d, addr & 0xfff, pci_config_size(d), size);
++}
++
++static void vmd_cfg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    IntelVMDState *s = opaque;
++    PCIDevice *d = vmd_cfg_dev(s, addr);
++    if (d) {
++        pci_host_config_write_common(d, addr & 0xfff, pci_config_size(d), val, size);
++    }
++}
++
++static const MemoryRegionOps vmd_cfg_ops = {
++    .read = vmd_cfg_read,
++    .write = vmd_cfg_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 4 },
++    .impl = { .min_access_size = 1, .max_access_size = 4 },
++};
++
++static uint64_t vmd_win_rw(IntelVMDState *s, int bar, hwaddr addr, uint64_t val,
++                           unsigned size, bool write)
++{
++    PCIDevice *pd = PCI_DEVICE(s);
++    pcibus_t base = pci_get_bar_addr(pd, bar);
++    uint8_t buf[8];
++    if (base == PCI_BAR_UNMAPPED) {
++        return ~0ull;
++    }
++    if (write) {
++        stn_le_p(buf, size, val);
++        address_space_write(&s->child_as, base + addr, MEMTXATTRS_UNSPECIFIED, buf, size);
++        return 0;
++    }
++    if (address_space_read(&s->child_as, base + addr, MEMTXATTRS_UNSPECIFIED, buf, size) != MEMTX_OK) {
++        return ~0ull;
++    }
++    return ldn_le_p(buf, size);
++}
++
++static uint64_t vmd_m1_read(void *o, hwaddr a, unsigned sz) { return vmd_win_rw(o, 2, a, 0, sz, false); }
++static void vmd_m1_write(void *o, hwaddr a, uint64_t v, unsigned sz) { vmd_win_rw(o, 2, a, v, sz, true); }
++static uint64_t vmd_m2_read(void *o, hwaddr a, unsigned sz) { return vmd_win_rw(o, 4, a + 0x2000, 0, sz, false); }
++static void vmd_m2_write(void *o, hwaddr a, uint64_t v, unsigned sz) { vmd_win_rw(o, 4, a + 0x2000, v, sz, true); }
++
++static const MemoryRegionOps vmd_m1_ops = {
++    .read = vmd_m1_read, .write = vmd_m1_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8 },
++    .impl = { .min_access_size = 1, .max_access_size = 8 },
++};
++
++static const MemoryRegionOps vmd_m2_ops = {
++    .read = vmd_m2_read, .write = vmd_m2_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 1, .max_access_size = 8 },
++    .impl = { .min_access_size = 1, .max_access_size = 8 },
++};
++
++static void vmd_set_irq(void *opaque, int irq, int level)
++{
++    /* INTx of the domain's devices is not routed */
++}
++
++static int vmd_map_irq(PCIDevice *d, int pin)
++{
++    return pin;
++}
++
++static void vmd_realize(PCIDevice *pd, Error **errp)
++{
++    IntelVMDState *s = INTEL_VMD(pd);
++    DeviceState *host;
++    const char *id = DEVICE(pd)->id ? DEVICE(pd)->id : "vmd";
++    g_autofree char *busname = g_strdup_printf("%s.0", id);
++    uint16_t cfg = s->bus_start >= 224 ? 2 : s->bus_start >= 128 ? 1 : 0;
++
++    s->bus_start = cfg == 2 ? 224 : cfg == 1 ? 128 : 0;
++    pci_config_set_vendor_id(pd->config, PCI_VENDOR_ID_INTEL);
++    pci_config_set_device_id(pd->config, s->device_id);
++    pci_config_set_class(pd->config, 0x0104);
++    pci_config_set_prog_interface(pd->config, 0);
++    pci_config_set_interrupt_pin(pd->config, s->intx ? 1 : 0);   /* test: an INTA# pin */
++    pci_set_word(pd->config + 0x40, 1);                 /* VMCAP: bus restriction */
++    pci_set_word(pd->config + 0x44, cfg << 8);          /* VMCONFIG */
++    pci_set_word(pd->wmask + 0x44, 0x0302);
++    pci_set_long(pd->config + 0x70, 0);                 /* VMLOCK */
++
++    memory_region_init(&s->mem, OBJECT(s), "vmd-domain-mem", UINT64_MAX);
++    memory_region_init(&s->io, OBJECT(s), "vmd-domain-io", 0x10000);
++    address_space_init(&s->child_as, &s->mem, "vmd-domain");
++
++    memory_region_init_io(&s->cfgbar, OBJECT(s), &vmd_cfg_ops, s, "vmd-cfgbar",
++                          (uint64_t)s->cfgbar_mb << 20);
++    memory_region_init_io(&s->membar1, OBJECT(s), &vmd_m1_ops, s, "vmd-membar1",
++                          (uint64_t)s->membar1_mb << 20);
++    /* MEMBAR2: the VMD's own MSI-X table and PBA first (as on hardware), the
++       domain's window from 2000h */
++    memory_region_init(&s->membar2c, OBJECT(s), "vmd-membar2", 1 << 20);
++    memory_region_init_io(&s->membar2, OBJECT(s), &vmd_m2_ops, s, "vmd-membar2-window", (1 << 20) - 0x2000);
++    memory_region_add_subregion(&s->membar2c, 0x2000, &s->membar2);
++    pci_register_bar(pd, 0, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, &s->cfgbar);
++    pci_register_bar(pd, 2, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, &s->membar1);
++    pci_register_bar(pd, 4, PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64, &s->membar2c);
++    if (s->msix_vectors &&
++        msix_init(pd, s->msix_vectors, &s->membar2c, 4, 0, &s->membar2c, 4, 0x1000, 0x80, errp) < 0) {
++        return;
++    }
++
++    host = qdev_new(TYPE_INTEL_VMD_HOST);
++    s->bus = pci_root_bus_new(host, busname, &s->mem, &s->io, 0, TYPE_INTEL_VMD_BUS);
++    ((IntelVMDBus *)s->bus)->bus_start = s->bus_start;
++    pci_bus_irqs(s->bus, vmd_set_irq, s, PCI_NUM_PINS);
++    pci_bus_map_irqs(s->bus, vmd_map_irq);
++    PCI_HOST_BRIDGE(host)->bus = s->bus;
++    sysbus_realize_and_unref(SYS_BUS_DEVICE(host), &error_fatal);
++}
++
++static Property vmd_props[] = {
++    DEFINE_PROP_UINT16("device-id", IntelVMDState, device_id, 0x9a0b),
++    DEFINE_PROP_UINT8("bus-start", IntelVMDState, bus_start, 224),
++    DEFINE_PROP_UINT32("cfgbar-mb", IntelVMDState, cfgbar_mb, 32),
++    DEFINE_PROP_UINT32("membar1-mb", IntelVMDState, membar1_mb, 32),
++    DEFINE_PROP_BOOL("intx", IntelVMDState, intx, false),
++    DEFINE_PROP_UINT32("msix-vectors", IntelVMDState, msix_vectors, 32),
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void vmd_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    k->realize = vmd_realize;
++    k->vendor_id = PCI_VENDOR_ID_INTEL;
++    k->device_id = 0x9a0b;
++    k->class_id = 0x0104;
++    device_class_set_props(dc, vmd_props);
++    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
++}
++
++static const TypeInfo vmd_info = {
++    .name = TYPE_INTEL_VMD,
++    .parent = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(IntelVMDState),
++    .class_init = vmd_class_init,
++    .interfaces = (InterfaceInfo[]) {
++        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
++        { },
++    },
++};
++
++static void vmd_register_types(void)
++{
++    type_register_static(&vmd_bus_info);
++    type_register_static(&vmd_host_info);
++    type_register_static(&vmd_info);
++}
++
++type_init(vmd_register_types)
+diff -ruN a/hw/pci-host/meson.build b/hw/pci-host/meson.build
+--- a/hw/pci-host/meson.build	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/pci-host/meson.build	2026-11-23 02:15:15.611772722 +0300
+@@ -7,7 +7,7 @@
+ pci_ss.add(when: ['CONFIG_PCI_EXPRESS_GENERIC_BRIDGE', 'CONFIG_ACPI'], if_true: files('gpex-acpi.c'))
+ pci_ss.add(when: 'CONFIG_PCI_EXPRESS_Q35', if_true: files('q35.c'))
+ pci_ss.add(when: 'CONFIG_PCI_EXPRESS_XILINX', if_true: files('xilinx-pcie.c'))
+-pci_ss.add(when: 'CONFIG_PCI_I440FX', if_true: files('i440fx.c'))
++pci_ss.add(when: 'CONFIG_PCI_I440FX', if_true: files('i440fx.c', 'intel_vmd.c'))
+ pci_ss.add(when: 'CONFIG_PCI_SABRE', if_true: files('sabre.c'))
+ pci_ss.add(when: 'CONFIG_XEN_IGD_PASSTHROUGH', if_true: files('xen_igd_pt.c'))
+ pci_ss.add(when: 'CONFIG_REMOTE_PCIHOST', if_true: files('remote.c'))
+diff -ruN a/hw/sd/sdhci-pci.c b/hw/sd/sdhci-pci.c
+--- a/hw/sd/sdhci-pci.c	2024-03-04 20:48:15.000000000 +0300
++++ b/hw/sd/sdhci-pci.c	2026-11-23 03:04:34.695981414 +0300
+@@ -43,6 +43,16 @@
+     s->irq = pci_allocate_irq(dev);
+     s->dma_as = pci_get_address_space(dev);
+     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->iomem);
++    {
++        /* test hook: vendor:device:revision of a vendor's SDHCI (quirk paths) */
++        const char *ids = getenv("QEMU_SDHCI_IDS");
++        unsigned v, d, r;
++        if (ids && sscanf(ids, "%x:%x:%x", &v, &d, &r) == 3) {
++            pci_config_set_vendor_id(dev->config, v);
++            pci_config_set_device_id(dev->config, d);
++            pci_config_set_revision(dev->config, r);
++        }
++    }
+ }
+ 
+ static void sdhci_pci_exit(PCIDevice *dev)
+diff -ruN a/include/hw/ide/internal.h b/include/hw/ide/internal.h
+--- a/include/hw/ide/internal.h	2024-03-04 20:48:15.000000000 +0300
++++ b/include/hw/ide/internal.h	2026-11-02 07:55:14.402095413 +0300
+@@ -626,6 +626,7 @@
+ void ide_bus_register_restart_cb(IDEBus *bus);
+ 
+ void ide_bus_exec_cmd(IDEBus *bus, uint32_t val);
++bool ide_test_unplugged(IDEState *s);
+ 
+ void ide_transfer_start(IDEState *s, uint8_t *buf, int size,
+                         EndTransferFunc *end_transfer_func);
+diff -ruN a/pc-bios/meson.build b/pc-bios/meson.build
+--- a/pc-bios/meson.build	2024-03-04 20:48:16.000000000 +0300
++++ b/pc-bios/meson.build	2026-11-02 07:56:04.569315122 +0300
+@@ -1,5 +1,5 @@
+ roms = []
+-if unpack_edk2_blobs
++if false
+   fds = [
+     'edk2-aarch64-code.fd',
+     'edk2-arm-code.fd',

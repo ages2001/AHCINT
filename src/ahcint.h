@@ -73,7 +73,7 @@ VOID  ScsiPortWriteRegisterUlong(PULONG Register, ULONG Value);
 #define AHCI_DRIVER_NAME        "AHCINT"
 #endif
 
-#define AHCI_DRIVER_VERSION     0x01070000  /* 1.7.0.0 */
+#define AHCI_DRIVER_VERSION     0x01080000  /* 1.8 */
 
 /* ------------------------------------------------------------------ */
 /* Debug output                                                        */
@@ -111,7 +111,7 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define AHCI_PORT_OF(srb)               ((ULONG)(srb)->PathId * AHCI_TARGETS_PER_BUS + (srb)->TargetId)
 #define AHCI_PATH_OF_PORT(port)         ((UCHAR)((port) / AHCI_TARGETS_PER_BUS))
 #define AHCI_TARGET_OF_PORT(port)       ((UCHAR)((port) % AHCI_TARGETS_PER_BUS))
-#define AHCI_MAX_TRANSFER               0x20000     /* 128 KB: NT 3.1-4.0, 9x, dump stack */
+#define AHCI_MAX_TRANSFER               0x20000     /* 128 KB: 9x, dump stack, MAXXFER=128 */
 #define AHCI_SECTOR_SIZE                512         /* default logical sector */
 #define AHCI_MAX_SECTOR_SIZE            4096        /* largest logical sector taken */
 
@@ -120,7 +120,7 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 #define AHCI_PRDT_ENTRIES               40
 #define AHCI_CMDTBL_SIZE                (0x80 + AHCI_PRDT_ENTRIES * 16)    /* 768 */
 
-/* 2000/XP/x64: 512 KB per request (129 pages), command tables of 2304 bytes */
+/* NT 3.1-4.0 and 2000/XP/x64: 512 KB per request (129 pages), command tables of 2304 bytes */
 #define AHCI_MAX_TRANSFER_LARGE         0x80000
 #define AHCI_MAX_PHYS_BREAKS_LARGE      128
 #define AHCI_PRDT_ENTRIES_LARGE         136
@@ -135,6 +135,9 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 /* Per-port driver-owned DMA buffer: IDENTIFY data, ATAPI REQUEST SENSE /
    MODE SENSE, READ LOG EXT. */
 #define AHCI_BOUNCE_SIZE                512
+/* Adapter bounce buffer for data buffers at odd addresses (a PRD entry
+   takes word-aligned addresses only): Windows 9x passes them on */
+#define AHCI_XBOUNCE_SIZE               (64UL * 1024)
 
 /* Sense kept for the next REQUEST SENSE: fixed (18) or descriptor format */
 #define AHCI_SENSE_MAX                  32
@@ -144,6 +147,7 @@ ULONG __cdecl DbgPrint(PCH Format, ...);
 /* ------------------------------------------------------------------ */
 
 #define PCI_CLASS_MASS_STORAGE          0x01
+#define PCI_SUBCLASS_IDE                0x01
 #define PCI_SUBCLASS_AHCI               0x06
 #define PCI_PROGIF_AHCI                 0x01
 #define AHCI_ABAR_INDEX                 5           /* BAR5 = ABAR */
@@ -612,7 +616,26 @@ typedef struct _AHCI_SRB_IO_CONTROL {
 #define AHCI_IOCTL_POWER_UP             0x00000011  /* reinitialize the HBA */
 #define AHCI_IOCTL_TRIM_MODE_ON         0x00000020  /* 4 KB pattern after the header */
 #define AHCI_IOCTL_TRIM_MODE_OFF        0x00000021
+#define AHCI_IOCTL_TRIM_STATUS          0x00000022  /* AHCI_TRIM_STATUS after the header */
 #define AHCI_TRIM_PATTERN_SIZE          4096
+
+/* TRIM_STATUS: in the address of a disk, out whether its pattern writes
+   become TRIMs and the adapter's byte counts since TRIM_MODE_ON */
+typedef struct _AHCI_TRIM_STATUS {
+    UCHAR PathId;
+    UCHAR TargetId;
+    UCHAR Lun;
+    UCHAR Flags;                        /* AHCI_TRIM_STATUS_xxx */
+    ULONG BlockSize;                    /* bytes per logical block of the disk */
+    ULONG TrimmedLow;                   /* pattern writes trimmed */
+    ULONG TrimmedHigh;
+    ULONG WrittenLow;                   /* pattern writes the medium got as data */
+    ULONG WrittenHigh;
+} AHCI_TRIM_STATUS, *PAHCI_TRIM_STATUS;
+
+#define AHCI_TRIM_STATUS_PRESENT        0x01        /* a disk at that address */
+#define AHCI_TRIM_STATUS_CAN_TRIM       0x02        /* its pattern writes become TRIMs */
+#define AHCI_TRIM_STATUS_MODE_ON        0x04
 
 #define AHCI_INFO_ASYNC                 0x00000001  /* NCQ with interrupts active */
 #define AHCI_INFO_POWERED_DOWN          0x00000002
@@ -834,6 +857,8 @@ typedef struct _AHCI_PORT_INFO {
 /* NCQ in use: needs the interrupt path */
 #define AHCI_NCQ_ON(h)          ((h)->AsyncMode && (h)->NcqAllowed)
 
+#include "vmdcore.h"                    /* Intel VMD domain (NT 3.1-4.0) */
+
 typedef struct _HW_DEVICE_EXTENSION {
     PUCHAR                  AbarMapped;
     ULONG                   PciBus;
@@ -856,6 +881,8 @@ typedef struct _HW_DEVICE_EXTENSION {
     ULONG                   TimerUsec;      /* interval of the timer armed */
     ULONG                   HpElapsed;      /* microseconds since the last hot-plug check */
     BOOLEAN                 DumpMode;       /* crash dump / hibernation */
+    BOOLEAN                 RaidMode;       /* RAID class code: disks of a RAID volume are left alone */
+    BOOLEAN                 RaidDisks;      /* "RAIDDISKS=1": show them anyway */
     BOOLEAN                 CheckState;     /* verify the HBA before the next request */
     ULONG                   MissedInterrupts;
 
@@ -872,6 +899,9 @@ typedef struct _HW_DEVICE_EXTENSION {
     UCHAR                   PortSlot[MAX_SUPPORTED_PORTS];
 
     PUCHAR                  DmaArea;
+    PUCHAR                  XBounce;        /* AHCI_XBOUNCE_SIZE, none in the dump stack */
+    ULONG                   XBouncePhysical;
+    ULONG                   XBouncePhysicalUpper;
     ULONG                   DmaLength;
     SCSI_PHYSICAL_ADDRESS   DmaAreaPhysical;
 
@@ -883,7 +913,17 @@ typedef struct _HW_DEVICE_EXTENSION {
     UCHAR                   SpinDown;       /* SPINDOWN=n: standby timer, IDLE count (0 = off) */
     BOOLEAN                 StandbyAtShutdown; /* STANDBY=1: spin down on SRB_FUNCTION_SHUTDOWN */
     BOOLEAN                 TrimMode;       /* TRIM_MODE_ON: pattern writes become TRIMs */
+    ULONG                   TrimmedBytes[2];    /* since TRIM_MODE_ON: low, high */
+    ULONG                   TrimWrittenBytes[2];
     PUCHAR                  TrimPattern;    /* NULL in the dump instance */
+    /* An HBA behind an Intel VMD (NT 3.1-4.0): its configuration space in
+       the VMD's domain (ahcimain.c, vmdcore.h); NULL otherwise */
+    PUCHAR                  VmdChildCfg;
+    ULONG                   VmdHostBus;     /* the VMD function */
+    ULONG                   VmdHostSlot;
+    INTERFACE_TYPE          VmdMapType;     /* how its memory is mapped */
+    ULONG                   VmdMapBus;
+    VMD_DOMAIN              Vmd;
     ULONGLONG               Pool[1];
 } HW_DEVICE_EXTENSION, *PHW_DEVICE_EXTENSION;
 
@@ -903,6 +943,7 @@ typedef struct _ATA_REQUEST {
     BOOLEAN   IsWrite;
     BOOLEAN   IsAtapi;
     BOOLEAN   UseBounce;        /* data in the port's BounceBuffer */
+    BOOLEAN   UseXBounce;       /* data through the adapter's XBounce (odd buffer) */
     BOOLEAN   Is48Bit;          /* ATA only */
     BOOLEAN   RawDevice;        /* Device register as given (pass-through) */
     UCHAR     Pmp;
@@ -953,6 +994,8 @@ static __inline void CopyMemoryBytes(PVOID dst, PVOID src, ULONG len) {
 #define AHCI_SLOT_TABLE(pi, slot)       ((pi)->CommandTables + (slot) * (pi)->TableSize)
 #define AHCI_PORTINFO(hw, port)         (&(hw)->Ports[(hw)->PortSlot[port]])
 #define AHCI_DEVICE_OF(hw, port, lun)   (&(hw)->Devices[AHCI_PORTINFO(hw, port)->DeviceIndex[lun]])
+/* TRIM mode turns this disk's pattern writes into DATA SET MANAGEMENT TRIM */
+#define AHCI_CAN_TRIM(hw, dev)          ((dev)->Trim && (hw)->TrimAllowed)
 
 /* ------------------------------------------------------------------ */
 /* Cross-file prototypes                                               */

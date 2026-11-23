@@ -242,7 +242,13 @@ AhciStartCommand(
     /* Data */
     prdtEntries = 0;
     if (Req->DataBufferLen > 0) {
-        if (Req->UseBounce) {
+        if (Req->UseXBounce) {
+            prdt[0].DataBaseAddress = HwInit->XBouncePhysical;
+            prdt[0].DataBaseAddressUpper = HwInit->XBouncePhysicalUpper;
+            prdt[0].Reserved = 0;
+            prdt[0].ByteCountInterrupt = Req->DataBufferLen - 1;
+            prdtEntries = 1;
+        } else if (Req->UseBounce) {
             prdt[0].DataBaseAddress = pi->BouncePhysical;
             prdt[0].DataBaseAddressUpper = pi->BouncePhysicalUpper;
             prdt[0].Reserved = 0;
@@ -335,6 +341,24 @@ AhciRunCommand(
     ULONG timeoutUsec;
     ULONG ci, portIs, tfd;
     ULONG result;
+    BOOLEAN copyBack = FALSE;
+
+    /* A buffer at an odd address goes through the adapter's bounce buffer:
+       a PRD entry would put the data one byte off (AHCI 1.3, 4.2.3.3) */
+    if (!Req->UseBounce && !Req->UseXBounce && Req->DataBufferLen > 0 &&
+        ((ULONG_PTR)Req->DataBuffer & 1)) {
+        if (HwInit->XBounce == NULL || Req->DataBufferLen > AHCI_XBOUNCE_SIZE || (Req->DataBufferLen & 1)) {
+            AHCI_DBG((AHCI_PFX "Port %lu: %lu bytes at odd address %p, no bounce\n",
+                      Port, Req->DataBufferLen, Req->DataBuffer));
+            return AHCI_CMD_BAD_BUFFER;
+        }
+        if (Req->IsWrite) {
+            CopyMemoryBytes(HwInit->XBounce, Req->DataBuffer, Req->DataBufferLen);
+        } else {
+            copyBack = TRUE;
+        }
+        Req->UseXBounce = TRUE;
+    }
 
     result = AhciStartCommand(HwInit, Port, Srb, Req);
     if (result != AHCI_CMD_OK) return result;
@@ -374,8 +398,12 @@ AhciRunCommand(
         AHCI_POLL_STEP(elapsed, 3);
     }
 
-    return AhciFinishCommand(HwInit, Port, Req->Pmp, (UCHAR)(Req->IsAtapi ? Req->Cdb[0] : Req->Command),
-                             result, portIs, ci, tfd, (BOOLEAN)(elapsed >= timeoutUsec));
+    result = AhciFinishCommand(HwInit, Port, Req->Pmp, (UCHAR)(Req->IsAtapi ? Req->Cdb[0] : Req->Command),
+                               result, portIs, ci, tfd, (BOOLEAN)(elapsed >= timeoutUsec));
+    if (copyBack && result == AHCI_CMD_OK) {
+        CopyMemoryBytes(Req->DataBuffer, HwInit->XBounce, Req->DataBufferLen);
+    }
+    return result;
 }
 
 /* A command for an SRB, completed by the interrupt where there is one:
@@ -395,7 +423,8 @@ AhciRunAsync(
     PAHCI_PORT_INFO pi = AHCI_PORTINFO(HwInit, Port);
     ULONG result;
 
-    if (!HwInit->AsyncMode || HwInit->DumpMode || Srb == NULL || Req->UseBounce) {
+    if (!HwInit->AsyncMode || HwInit->DumpMode || Srb == NULL || Req->UseBounce ||
+        (Req->DataBufferLen > 0 && ((ULONG_PTR)Req->DataBuffer & 1))) {
         return AhciRunCommand(HwInit, Port, Srb, Req);
     }
     result = AhciStartCommand(HwInit, Port, Srb, Req);

@@ -890,13 +890,23 @@ AhciTrim(IN PHW_DEVICE_EXTENSION HwInit, IN ULONG Port, IN ULONG Lun, IN AHCI_LB
     return AHCI_CMD_OK;
 }
 
-/* TRIM mode: the write's data is the pattern, repeated from the first byte */
+/* A 64-bit byte count kept as two ULONGs */
+static VOID
+AhciAddBytes(IN OUT PULONG Pair, IN ULONG Bytes)
+{
+    Pair[0] += Bytes;
+    if (Pair[0] < Bytes) Pair[1]++;
+}
+
+/* TRIM mode: the write's data is the pattern, repeated from the first byte.
+   Any length: a file system splits a write at fragment boundaries, and
+   TRIMNT's pattern repeats every 512 bytes, so every piece still matches. */
 static BOOLEAN
 AhciIsTrimPattern(IN PHW_DEVICE_EXTENSION HwInit, IN PUCHAR Data, IN ULONG Length)
 {
     ULONG i, j;
 
-    if (Data == NULL || Length < AHCI_TRIM_PATTERN_SIZE) return FALSE;
+    if (Data == NULL || Length == 0 || HwInit->TrimPattern == NULL) return FALSE;
     for (i = 0; i < Length; i += AHCI_TRIM_PATTERN_SIZE) {
         for (j = 0; j < AHCI_TRIM_PATTERN_SIZE && i + j < Length; j += 4) {
             if (*(ULONG UNALIGNED *)(Data + i + j) != *(ULONG UNALIGNED *)(&HwInit->TrimPattern[j])) return FALSE;
@@ -1059,6 +1069,7 @@ AhciAtaReadWrite(
     ATA_REQUEST req;
     ULONG result;
     UCHAR status;
+    BOOLEAN oddBuffer;
 
     /* A zero transfer length in READ/WRITE(10)/(16) moves nothing; ATA
        would read 0 as 256/65536 sectors, so never send it. */
@@ -1079,11 +1090,16 @@ AhciAtaReadWrite(
     }
     if (!IsWrite) Fua = FALSE;
 
-    /* TRIM mode: a write of the pattern becomes a TRIM of its sectors */
-    if (IsWrite && HwInit->TrimMode && dev->Trim && HwInit->TrimAllowed &&
-        AhciIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * dev->SectorSize)) {
-        AhciCompleteResult(HwInit, Port, Srb, AhciTrim(HwInit, Port, Srb->Lun, Lba, Count));
-        return;
+    /* TRIM mode: a write of the pattern becomes a TRIM of its sectors; on
+       a disk without TRIM it is written and counted */
+    if (IsWrite && HwInit->TrimMode && AhciIsTrimPattern(HwInit, (PUCHAR)Srb->DataBuffer, Count * dev->SectorSize)) {
+        if (AHCI_CAN_TRIM(HwInit, dev)) {
+            result = AhciTrim(HwInit, Port, Srb->Lun, Lba, Count);
+            if (result == AHCI_CMD_OK) AhciAddBytes(HwInit->TrimmedBytes, Count * dev->SectorSize);
+            AhciCompleteResult(HwInit, Port, Srb, result);
+            return;
+        }
+        AhciAddBytes(HwInit->TrimWrittenBytes, Count * dev->SectorSize);
     }
 
     /* From here in ATA sectors (4K=1: eight per block) */
@@ -1091,27 +1107,36 @@ AhciAtaReadWrite(
     Count <<= dev->LbaShift;
 
     /* A disk without LBA48 takes 256 sectors per command: a larger request
-       (up to 512 KB on 2000/XP) in pieces, by Fast Polling */
-    if (!dev->Lba48 && Count > ATA_LBA28_MAX_SECTORS) {
+       (up to 512 KB on 2000/XP) in pieces, by Fast Polling. So does a
+       buffer at an odd address (Windows 9x passes such buffers on), in
+       pieces of the adapter's bounce buffer. */
+    oddBuffer = (BOOLEAN)(((ULONG_PTR)Srb->DataBuffer & 1) != 0 && HwInit->XBounce != NULL);
+    if ((!dev->Lba48 && Count > ATA_LBA28_MAX_SECTORS) || oddBuffer) {
         ULONG done = 0, piece, bytes = dev->SectorSize >> dev->LbaShift;
+        ULONG maxPiece = dev->Lba48 ? ATA_LBA48_MAX_SECTORS : ATA_LBA28_MAX_SECTORS;
         AHCI_LBA lba = Lba;
 
         result = AHCI_CMD_OK;
         while (done < Count && result == AHCI_CMD_OK) {
             piece = Count - done;
-            if (piece > ATA_LBA28_MAX_SECTORS) piece = ATA_LBA28_MAX_SECTORS;
-            if (!AhciLbaFits28(lba, piece)) {
+            if (piece > maxPiece) piece = maxPiece;
+            if (oddBuffer && piece * bytes > AHCI_XBOUNCE_SIZE) piece = AHCI_XBOUNCE_SIZE / bytes;
+            ZeroMemoryBytes(&req, sizeof(req));
+            if (AhciLbaFits28(lba, piece) && piece <= ATA_LBA28_MAX_SECTORS) {
+                req.Command = IsWrite ? IDE_COMMAND_WRITE_DMA : IDE_COMMAND_READ_DMA;
+            } else if (dev->Lba48) {
+                req.Is48Bit = TRUE;
+                req.Command = IsWrite ? IDE_COMMAND_WRITE_DMA_EXT : IDE_COMMAND_READ_DMA_EXT;
+            } else {
                 AhciInvalidField(dev, Srb);
                 return;
             }
-            ZeroMemoryBytes(&req, sizeof(req));
             req.Pmp = dev->Pmp;
             req.DataBuffer = (PUCHAR)Srb->DataBuffer + done * bytes;
             req.DataBufferLen = piece * bytes;
             req.IsWrite = IsWrite;
             req.Lba = lba;
             req.SectorCount = piece;
-            req.Command = IsWrite ? IDE_COMMAND_WRITE_DMA : IDE_COMMAND_READ_DMA;
             result = AhciRunCommand(HwInit, Port, Srb, &req);
             AhciLbaAdd(&lba, piece);
             done += piece;
@@ -1977,6 +2002,28 @@ AhciSmartVersion(IN PHW_DEVICE_EXTENSION HwInit, IN PAHCI_SRB_IO_CONTROL Ctl, IN
     Ctl->ReturnCode = 0;
 }
 
+static VOID
+AhciTrimStatus(IN PHW_DEVICE_EXTENSION HwInit, IN OUT PAHCI_TRIM_STATUS St)
+{
+    ULONG port = (ULONG)St->PathId * AHCI_TARGETS_PER_BUS + St->TargetId;
+
+    St->Flags = (UCHAR)(HwInit->TrimMode ? AHCI_TRIM_STATUS_MODE_ON : 0);
+    St->BlockSize = 0;
+    if (St->TargetId < AHCI_TARGETS_PER_BUS && port < HwInit->MaxPorts && AHCI_PORTINFO(HwInit, port)->Implemented &&
+        St->Lun < AHCI_PORTINFO(HwInit, port)->DeviceCount) {
+        PAHCI_DEVICE dev = AHCI_DEVICE_OF(HwInit, port, St->Lun);
+        if (dev->Present && !dev->IsAtapi) {
+            St->Flags |= AHCI_TRIM_STATUS_PRESENT;
+            if (AHCI_CAN_TRIM(HwInit, dev) && HwInit->TrimPattern != NULL) St->Flags |= AHCI_TRIM_STATUS_CAN_TRIM;
+            St->BlockSize = dev->SectorSize;
+        }
+    }
+    St->TrimmedLow = HwInit->TrimmedBytes[0];
+    St->TrimmedHigh = HwInit->TrimmedBytes[1];
+    St->WrittenLow = HwInit->TrimWrittenBytes[0];
+    St->WrittenHigh = HwInit->TrimWrittenBytes[1];
+}
+
 VOID
 AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
 {
@@ -2057,10 +2104,19 @@ AhciProcessIoControl(IN PHW_DEVICE_EXTENSION HwInit, IN PSCSI_REQUEST_BLOCK Srb)
                 break;
             }
             CopyMemoryBytes(HwInit->TrimPattern, (PUCHAR)ctl + ctl->HeaderLength, AHCI_TRIM_PATTERN_SIZE);
+            HwInit->TrimmedBytes[0] = HwInit->TrimmedBytes[1] = 0;
+            HwInit->TrimWrittenBytes[0] = HwInit->TrimWrittenBytes[1] = 0;
             HwInit->TrimMode = TRUE;
             break;
         case AHCI_IOCTL_TRIM_MODE_OFF:
             HwInit->TrimMode = FALSE;
+            break;
+        case AHCI_IOCTL_TRIM_STATUS:
+            if (available >= sizeof(AHCI_TRIM_STATUS)) {
+                AhciTrimStatus(HwInit, (PAHCI_TRIM_STATUS)((PUCHAR)ctl + ctl->HeaderLength));
+            } else {
+                ctl->ReturnCode = 1;
+            }
             break;
         default:
             Srb->SrbStatus = SRB_STATUS_INVALID_REQUEST;
