@@ -1,6 +1,6 @@
-# AHCINT — SATA AHCI Driver for Windows 95/98/Me and Windows NT 3.1 to XP x64
+# AHCINT — SATA AHCI Driver for Windows 95/98/Me and Windows NT 3.1 to 7 x64
 
-**AHCINT** is a SCSI miniport driver for AHCI SATA controllers. It lets Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP and Server 2003 (x86 and x64) install on, boot from and use SATA disks and optical drives behind an AHCI controller — hardware these systems were never written for, and that Microsoft only supported from Windows Vista on.
+**AHCINT** is a SCSI miniport driver for AHCI SATA controllers. It lets Windows 95, 98 and Me, Windows NT 3.1, 3.50, 3.51 and 4.0, and Windows 2000, XP, Server 2003, Vista and 7 (x86 and x64) install on, boot from and use SATA disks and optical drives behind an AHCI controller — hardware these systems were never written for, and that Microsoft only supported from Windows Vista on.
 
 | | |
 |---|---|
